@@ -1,0 +1,56 @@
+# Local credentials, caches and extracted native application files
+**/.private/
+**/.tools/
+**/.native-src/
+**/node_modules/
+**/.gradle/
+**/.cache/
+.playwright-mcp/
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+*.pass
+ai-remote-desktop.json
+relay.json
+
+# Generated applications, runtime copies and databases
+**/dist/
+**/build/
+*.exe
+*.apk
+*.zip
+*.tar
+*.tgz
+*.tar.gz
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.jsonl
+*.bak
+*.tmp
+
+# Local dispatch/deployment records and debugging scratch files
+/tooling/
+/docs/tasks/
+/desktop/docs/evidence/
+/desktop/*REPORT.md
+/relay/DELIVERY_REPORT.md
+/mobile/BUILD_REPORT.md
+/desktop/worker-proof.txt
+/mobile/tests/_*.js
+
+# Editor/OS state
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

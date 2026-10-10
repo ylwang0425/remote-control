@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Remote — 本机桥接状态（AI 工作台）</title>
+<style>
+  :root { color-scheme: light dark; --fg:#111; --muted:#666; --line:#d5d7db; --ok:#137333; --bad:#b3261e; --warn:#8a5300; --soft:#f5f6f8; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8eaed; --muted:#9aa0a6; --line:#3c4043; --ok:#81c995; --bad:#f28b82; --warn:#fdd663; --soft:#1f2225; } }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--fg); margin: 0; padding: 24px 20px 48px; max-width: 880px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 26px 0 8px; color: var(--muted); font-weight: 600; letter-spacing: .02em; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .sub code { color: var(--fg); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { width: 128px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom: 0; }
+  .card { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line); font-size: 13px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  code, .code { font-family: ui-monospace, Consolas, monospace; font-size: 14px; overflow-wrap: anywhere; }
+  #code { font-size: 22px; letter-spacing: 1px; font-weight: 600; overflow-wrap: normal; }
+  button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .box { border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-top: 8px; }
+  .box ol { margin: 0; padding-left: 20px; }
+  .box li + li { margin-top: 6px; }
+  .hidden { display: none; }
+  @media (max-width: 480px) {
+    body { padding: 16px 12px 32px; }
+    th, td { padding: 7px 8px; }
+    th { width: 96px; }
+    .box { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+  <h1>AI Remote — 本机桥接状态</h1>
+  <p class="sub">这个页面只在本机 <code>127.0.0.1</code> 上打开，用来看中继链路的状态、生成一个手机配对码。它不能在这台电脑上执行任何东西。</p>
+
+  <h2>怎么用（三步）</h2>
+  <div class="box">
+    <ol>
+      <li>保持这台电脑上的 <strong>Codex Desktop</strong>、<strong>DSH Desktop</strong> 和本桥接程序<strong>一直开着</strong>；电脑睡眠、程序退出都会让手机那边断掉。</li>
+      <li>手机打开 <span class="code">https://101.43.98.18</span>，用下面生成的配对码<strong>配对一次</strong>即可，之后不用再配。</li>
+      <li>配对后手机能看会话列表与消息，并按下面「手机能做什么」里列出的能力操作。</li>
+    </ol>
+  </div>
+
+  <h2>中继链路</h2>
+  <div class="card">
+    <table>
+      <tr><th>连接状态</th><td id="link">检查中…</td></tr>
+      <tr><th>这台电脑</th><td id="client">—</td></tr>
+      <tr><th>中继地址</th><td id="relay" class="code">—</td></tr>
+      <tr><th>能力</th><td id="caps">—</td></tr>
+    </table>
+  </div>
+
+  <h2>会话来源</h2>
+  <div class="card">
+    <table>
+      <tr><th>Codex Desktop</th><td id="codex">—</td></tr>
+      <tr><th>DSH Desktop</th><td id="dsh">—</td></tr>
+    </table>
+  </div>
+
+  <h2>配一台手机</h2>
+  <div class="box">
+    <div id="pairIdle">
+      <button id="pair">生成配对码</button>
+      <p class="note">配对码只能用一次，5 分钟内有效。它只在这里显示，不写日志、不落盘。</p>
+    </div>
+    <div id="pairShown" class="hidden">
+      <div id="code" class="code">—</div>
+      <p class="note">到期时间 <span id="expires">—</span>。在手机上的 AI Remote 里输入这个码，或打开下面的链接。</p>
+      <div id="url" class="code">—</div>
+    </div>
+    <div id="pairError" class="hidden bad"></div>
+  </div>
+
+  <h2>手机能做什么</h2>
+  <p class="note">手机通过中继只能调用这套固定操作：看会话列表（sessions.list）、读某条会话的消息（session.read）、发一条消息（session.send）、停止正在跑的会话（session.stop）、回答会话里的提问（session.answer）、批准权限请求（session.approve）、列模型（models.list）、新建会话（session.create）。除此之外没有别的入口。其中每一项都要这台电脑<strong>如实上报了对应能力</strong>才会在手机上可用；没上报的操作不会显示成按钮，也不会假装成功。</p>
+
+  <h2>Codex 的真实限制</h2>
+  <p class="note">Codex 走的是本机 app-tools 管道，能力有限，以下三件事<strong>如实不可用</strong>：</p>
+  <ul class="note">
+    <li><strong>停止</strong>：管道的工具目录里没有 interrupt / cancel / stop 之类的接口，所以上报 <span class="code">stop:codex = false</span>，手机上不会出现 Codex 会话的停止按钮，也不会假报成功。</li>
+    <li><strong>回答提问</strong>：这条通道没有把答案交回原生提问调用的入口，所以上报 <span class="code">session.answer:codex = false</span>。</li>
+    <li><strong>批准权限</strong>：Codex 的 app-tools 管道没有权限批准这类交互面，所以上报 <span class="code">session.approve:codex = false</span>。</li>
+  </ul>
+  <p class="note">DSH 那边这些能力是单独判定的，以本页「能力」一行的实际显示为准，并以中继原样透传的能力位为准。其它没测到的能力位一律按 false 上报，页面不会把「没测过」说成「可以」。</p>
+
+  <h2>这个页面做不到什么</h2>
+  <p class="note">没有 shell、没有命令框、没有文件浏览器，也没有任何绕开上述固定操作去触碰会话的通道。这里的每一个写操作都需要只有本页面能读到的令牌（CSRF）。</p>
+
+<script>
+  // CSRF 令牌由本页面下发，只有同源读取者才拿得到，这就是那个写接口的防线。
+  const CSRF = "__CSRF_TOKEN__";
+
+  function set(id, value, className) {
+    const el = document.getElementById(id);
+    el.textContent = value;
+    el.className = className || '';
+  }
+
+  /** 只拼接真正测到的片段。 */
+  function parts(list) {
+    return list.filter((part) => typeof part === 'string' && part.length > 0);
+  }
+
+  /** 手机可选的操作，以及对应的能力位。 */
+  const OPERATIONS = [
+    { key: 'sessions.list', label: '看会话列表' },
+    { key: 'session.read', label: '读消息' },
+    { key: 'session.send', label: '发消息' },
+    { key: 'session.stop', label: '停止' },
+    { key: 'session.answer', label: '回答提问' },
+    { key: 'session.approve', label: '批准权限' },
+    { key: 'models.list', label: '列模型' },
+    { key: 'session.create', label: '新建会话' },
+  ];
+
+  /** 只有能力位真的是 true 才算「可用」；缺失按 false 读。 */
+  function describeOperations(caps) {
+    return OPERATIONS
+      .filter((op) => caps[op.key] === true)
+      .map((op) => op.label)
+      .join('、');
+  }
+
+  function toolLabel(tool) {
+    if (tool === 'codex') return 'Codex';
+    if (tool === 'dsh') return 'DSH';
+    return String(tool);
+  }
+
+  /** 逐工具列出停止 / 回答 / 批准这三项是否被本机上报为可用。 */
+  function describePerTool(caps) {
+    const tools = Array.isArray(caps.tools)
+      ? caps.tools.filter((tool) => tool === 'codex' || tool === 'dsh')
+      : [];
+    return tools.map((tool) => {
+      const flags = parts([
+        '停止 ' + (caps['stop:' + tool] === true ? '可用' : '不可用'),
+        '回答 ' + (caps['session.answer:' + tool] === true ? '可用' : '不可用'),
+        '批准 ' + (caps['session.approve:' + tool] === true ? '可用' : '不可用'),
+      ]);
+      return toolLabel(tool) + '（' + flags.join('，') + '）';
+    }).join('；');
+  }
+
+  function describeLinks(bridge) {
+    const caps = bridge.capabilities || {};
+    const tools = Array.isArray(caps.tools) ? caps.tools.map(toolLabel) : [];
+    const toolText = tools.length > 0 ? tools.join('、') : '无';
+    // 能力位只在链路真的连上（即中继回过 hello）之后才算测到。
+    if (!bridge.connected) {
+      return {
+        text: '会话来源：' + toolText + '；中继链路未连上，实际能力等链路恢复后再确认',
+        className: 'warn',
+      };
+    }
+    const ops = describeOperations(caps);
+    const perTool = describePerTool(caps);
+    return {
+      text: '会话来源：' + toolText + '；可用操作：' + (ops || '无') + (perTool ? '；' + perTool : ''),
+      className: '',
+    };
+  }
+
+  function describeCodex(codex) {
+    if (!codex || codex.available !== true) {
+      return { text: '未连接 — ' + ((codex && codex.reason) || '还没有 Codex app-tools 管道应答'), className: 'bad' };
+    }
+    const extra = parts([
+      Number.isFinite(codex.tools) ? String(codex.tools) + ' 个工具' : '',
+      Number.isFinite(codex.threads) ? String(codex.threads) + ' 条会话' : '',
+    ]);
+    return { text: extra.length > 0 ? '已连接 — ' + extra.join('，') : '已连接', className: 'ok' };
+  }
+
+  function describeDsh(dsh) {
+    if (!dsh || dsh.available !== true) {
+      return { text: '未连接 — ' + ((dsh && dsh.reason) || '还没有本机后端应答'), className: 'bad' };
+    }
+    const extra = parts([
+      Number.isFinite(dsh.port) ? '端口 ' + String(dsh.port) : '',
+      Number.isFinite(dsh.pid) ? 'pid ' + String(dsh.pid) : '',
+      Number.isFinite(dsh.sessions) ? String(dsh.sessions) + ' 条会话' : '',
+    ]);
+    return { text: extra.length > 0 ? '已连接 — ' + extra.join('，') : '已连接', className: 'ok' };
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch('/api/status', { headers: { Accept: 'application/json' } });
+      const state = await response.json();
+      const bridge = state.bridge || {};
+      set('link', bridge.connected ? '已连接' : '尚未连接', bridge.connected ? 'ok' : 'warn');
+      set('client', bridge.clientName || '—');
+      set('relay', bridge.relayUrl || '—');
+      const links = describeLinks(bridge);
+      set('caps', links.text, links.className);
+      const codex = describeCodex(state.codex);
+      set('codex', codex.text, codex.className);
+      const dsh = describeDsh(state.dsh);
+      set('dsh', dsh.text, dsh.className);
+    } catch (error) {
+      set('link', '本机页面连不上自己的服务', 'bad');
+    }
+  }
+
+  document.getElementById('pair').addEventListener('click', async () => {
+    const button = document.getElementById('pair');
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/pair', { method: 'POST', headers: { 'X-CSRF-Token': CSRF } });
+      const body = await response.json();
+      if (!body.ok) throw new Error((body.error && body.error.message) || '中继没有应答');
+      document.getElementById('pairIdle').classList.add('hidden');
+      document.getElementById('pairShown').classList.remove('hidden');
+      document.getElementById('code').textContent = body.code;
+      document.getElementById('expires').textContent = body.expiresAt;
+      document.getElementById('url').textContent = body.url;
+      setTimeout(() => {
+        document.getElementById('pairShown').classList.add('hidden');
+        document.getElementById('pairIdle').classList.remove('hidden');
+        button.disabled = false;
+      }, 300000);
+    } catch (error) {
+      document.getElementById('pairError').classList.remove('hidden');
+      document.getElementById('pairError').textContent = String(error.message || error);
+      button.disabled = false;
+    }
+  });
+
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>

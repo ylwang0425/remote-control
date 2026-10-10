@@ -1,0 +1,149 @@
+package protocol
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
+
+// FrameType is the value of a frame's `type` field (contract §8.3).
+type FrameType string
+
+const (
+	FrameHello       FrameType = "hello"
+	FrameHelloOK     FrameType = "hello.ok"
+	FramePing        FrameType = "ping"
+	FramePong        FrameType = "pong"
+	FramePairCreate  FrameType = "pair.create"
+	FramePairCreated FrameType = "pair.created"
+	FramePairUsed    FrameType = "pair.used"
+	FrameRequest     FrameType = "request"
+	FrameResponse    FrameType = "response"
+)
+
+// Capabilities is the bridge's declaration from §9.5. A key that is absent
+// reads as false — there is no default-allow.
+//
+// The last six are additive: a desktop that does not send them is simply not
+// offering those methods, and an older relay ignores keys it does not know. The
+// wire version stays 1 for exactly that reason.
+//
+// The three per-tool pairs are deliberately three separate booleans rather than
+// one "supports answering" bit, because the two tools genuinely differ: DSH has
+// a native question-answer call and a native permission-approval transport,
+// while Codex has neither, and a model-selection send works on both but through
+// different native mechanisms. Collapsing them would make the relay — or, worse,
+// the phone — infer which of them is really available, and an inferred
+// capability is how a button appears that cannot work.
+//
+// These fields describe the desktop's OWN declaration. Nothing here is ever
+// derived by the relay from the tool name, from a session, or from a version
+// number: an absent key is false, and a false key means the phone must show the
+// real pending state plus an instruction to act at the computer, never a
+// button.
+type Capabilities struct {
+	SessionsList  bool     `json:"sessions.list"`
+	SessionRead   bool     `json:"session.read"`
+	SessionSend   bool     `json:"session.send"`
+	SessionStop   bool     `json:"session.stop"`
+	ModelsList    bool     `json:"models.list"`
+	SessionCreate bool     `json:"session.create"`
+	StopCodex     bool     `json:"stop:codex"`
+	StopDSH       bool     `json:"stop:dsh"`
+	Tools         []string `json:"tools"`
+
+	// SendModelCodex / SendModelDSH: session.send can carry a model choice.
+	SendModelCodex bool `json:"session.send:model:codex"`
+	SendModelDSH   bool `json:"session.send:model:dsh"`
+	// AnswerCodex / AnswerDSH: session.answer can answer a real pending
+	// question. Codex has no native answer call today, so a desktop that can
+	// answer questions sends AnswerDSH only.
+	AnswerCodex bool `json:"session.answer:codex"`
+	AnswerDSH   bool `json:"session.answer:dsh"`
+	// ApproveCodex / ApproveDSH: session.approve can answer a genuine native
+	// permission request. Absent means the phone shows the real pending
+	// approval with an instruction to act at the computer.
+	ApproveCodex bool `json:"session.approve:codex"`
+	ApproveDSH   bool `json:"session.approve:dsh"`
+}
+
+// Frame carries every field any frame in §8.3 may use. One struct keeps the
+// relay free of per-direction types while the JSON tags stay authoritative.
+type Frame struct {
+	Type FrameType `json:"type"`
+
+	Version      int           `json:"version"`
+	ClientName   string        `json:"clientName"`
+	Capabilities *Capabilities `json:"capabilities"`
+
+	ID         string `json:"id"`
+	Code       string `json:"code"`
+	ExpiresAt  string `json:"expiresAt"`
+	URL        string `json:"url"`
+	CodeID     string `json:"codeId"`
+	DeviceName string `json:"deviceName"`
+	At         string `json:"at"`
+
+	Method    string          `json:"method"`
+	Params    json.RawMessage `json:"params"`
+	TimeoutMs int             `json:"timeoutMs"`
+
+	OK     *bool           `json:"ok"`
+	Result json.RawMessage `json:"result"`
+	Error  *ErrorBody      `json:"error"`
+}
+
+// ParseFrame decodes one text frame. It fails only for the cases §8.5 calls a
+// protocol error: not JSON, not an object, or no string `type`. An unknown
+// type parses fine and is the caller's cue to ignore the frame.
+func ParseFrame(data []byte) (*Frame, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, errors.New("empty frame")
+	}
+	if trimmed[0] != '{' {
+		return nil, errors.New("frame is not a json object")
+	}
+	// Decode into a map first so a `type` that is present but not a string is a
+	// protocol error rather than a silently empty type.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return nil, fmt.Errorf("frame is not valid json: %w", err)
+	}
+	rawType, ok := raw["type"]
+	if !ok {
+		return nil, errors.New("frame has no type field")
+	}
+	var frameType string
+	if err := json.Unmarshal(rawType, &frameType); err != nil || frameType == "" {
+		return nil, errors.New("frame type is not a non-empty string")
+	}
+	var f Frame
+	if err := json.Unmarshal(trimmed, &f); err != nil {
+		return nil, fmt.Errorf("frame fields are malformed: %w", err)
+	}
+	return &f, nil
+}
+
+// ValidateHello applies §8.4.1. An empty `tools` list is deliberately valid:
+// §9.5 wants a machine with no configured session source to look like "paired
+// but empty", never like a failed connection.
+func (f *Frame) ValidateHello() error {
+	if f.Version != Version {
+		return fmt.Errorf("hello version %d is not supported (want %d)", f.Version, Version)
+	}
+	if f.Capabilities == nil {
+		return errors.New("hello has no capabilities object")
+	}
+	name := strings.TrimSpace(f.ClientName)
+	if name == "" {
+		return errors.New("hello clientName is blank")
+	}
+	if utf8.RuneCountInString(f.ClientName) > 64 {
+		return errors.New("hello clientName is longer than 64 characters")
+	}
+	return nil
+}

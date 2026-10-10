@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew the AI remote relay IP-address certificate
+Documentation=https://101.43.98.18/
+
+[Service]
+Type=oneshot
+# Certbot's own systemd timer already renews hourly. This unit exists to renew
+# the IP-address certificate with the settings it actually needs, and to reload
+# Caddy only when something really changed — a reload on every run would drop
+# WebSocket bridges for no reason.
+ExecStart=/usr/local/sbin/ai-remote-renew-cert.sh

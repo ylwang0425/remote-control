@@ -1,0 +1,54 @@
+[Unit]
+Description=AI remote relay (phone <-> desktop broker)
+Documentation=https://101.43.98.18/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-remote
+Group=ai-remote
+WorkingDirectory=/opt/ai-remote
+ExecStart=/opt/ai-remote/ai-remote-relay --config /etc/ai-remote-relay/relay.json
+
+# The relay only ever listens on loopback; Caddy terminates TLS in front of it.
+Restart=on-failure
+RestartSec=3
+
+# --- Resource ceiling -------------------------------------------------------
+# The box is 2 cores / 2 GB and also runs Caddy, so the relay is capped well
+# below what the machine has. MemoryMax kills the unit rather than letting it
+# take the machine down with it.
+MemoryMax=256M
+MemoryHigh=192M
+CPUQuota=150%
+
+# --- Hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# The relay holds a credential file and a database, so only its own state and
+# log directories are writable.
+ReadWritePaths=/var/lib/ai-remote-relay /var/log/ai-remote-relay
+ReadOnlyPaths=/etc/ai-remote-relay /opt/ai-remote
+
+# --- Log limits -------------------------------------------------------------
+# journald keeps this unit's own output bounded, on top of the application's
+# own size-capped log file (logMaxBytes / logMaxFiles in the config).
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=500
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-remote-relay
+
+[Install]
+WantedBy=multi-user.target

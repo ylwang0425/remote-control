@@ -1,0 +1,1128 @@
+/* app.css — mobile AI workbench styling. No framework, no CDN, no build step.
+ *
+ * One neutral palette with a single accent, a light and a dark scheme, tap
+ * targets at >=44px, and notch/keyboard safe areas so the composer is never
+ * covered. Nothing wider than the viewport: anything that can be wide scrolls
+ * inside its own box. */
+
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #eceef2;
+  --text: #16181d;
+  --muted: #6b7280;
+  --border: #dcdfe5;
+  --accent: #2f6df6;
+  --accent-text: #ffffff;
+  --danger: #d1332e;
+  --ok: #1a8f4c;
+  --warn: #b26a06;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --tap: 44px;
+  --shadow: 0 1px 2px rgba(16, 18, 22, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101216;
+    --surface: #191c21;
+    --surface-2: #22262d;
+    --text: #e8ebf0;
+    --muted: #98a1ae;
+    --border: #2b3038;
+    --accent: #4c86ff;
+    --accent-text: #ffffff;
+    --danger: #f0605a;
+    --ok: #45c07c;
+    --warn: #e0a03a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  }
+}
+
+/* An explicit choice from 设置 wins over the system scheme. The attribute is set
+   by prefs.applyTheme(); 'auto' removes it and the media query above applies. */
+:root[data-theme='light'] {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #eceef2;
+  --text: #16181d;
+  --muted: #6b7280;
+  --border: #dcdfe5;
+  --accent: #2f6df6;
+  --accent-text: #ffffff;
+  --danger: #d1332e;
+  --ok: #1a8f4c;
+  --warn: #b26a06;
+  --shadow: 0 1px 2px rgba(16, 18, 22, 0.06);
+}
+
+:root[data-theme='dark'] {
+  --bg: #101216;
+  --surface: #191c21;
+  --surface-2: #22262d;
+  --text: #e8ebf0;
+  --muted: #98a1ae;
+  --border: #2b3038;
+  --accent: #4c86ff;
+  --accent-text: #ffffff;
+  --danger: #f0605a;
+  --ok: #45c07c;
+  --warn: #e0a03a;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+* { box-sizing: border-box; }
+
+/* The `hidden` attribute must always win.
+   Rules below set `display` (`.notice` is flex, the screens are blocks), and a
+   `display` declaration in a stylesheet beats the user-agent's
+   `[hidden] { display: none }`. That is how a notice marked hidden stayed on
+   screen with its 重试 button showing. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+/* The app fills exactly ONE visible page and never scrolls as a page: the
+   header and the nav hold their natural height, #screens is the only element
+   that scrolls (see "viewport shell" below). Without this the body grew to its
+   content and the whole document scrolled behind a second inner scroller.
+   100dvh is the visible height while the URL bar or the keyboard is up; the
+   bare 100% line above stays as the fallback for WebViews without dvh. */
+body {
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior-y: none;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC",
+        "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The app bar and the nav are the two fixed rows of the shell: `flex: none`
+   so neither can be squashed by the scrolling view underneath them. */
+#appbar {
+  flex: none;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+#appbar-title { font-size: 17px; margin: 0; font-weight: 600; }
+
+/* The app bar's right-hand cluster: the new-chat action and the connection
+   badge. Grouped so the action never floats away from the badge on a wide
+   phone, and `flex: 0 0 auto` so a long title cannot squash them. */
+.appbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+/* The new-chat action.
+   It is a single compact header control instead of a full-width footer button:
+   it stays reachable while the list scrolls, and it costs the list no vertical
+   space. The target is >= 44px in BOTH directions -- a real tap target, not a
+   padded illusion -- while the painted pill is only as wide as it needs. */
+.icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  width: var(--tap);
+  padding: 0;
+  font-size: 20px;
+  line-height: 1;
+  border-radius: 999px;
+  color: var(--accent-text);
+  background: var(--accent);
+  border: 1px solid transparent;
+}
+
+.icon-action:active { filter: brightness(0.94); }
+
+.icon-action-glyph { display: block; transform: translateY(-1px); }
+
+.badge {
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+
+/* --- workbench tabs ------------------------------------------------------ */
+
+.tabbar {
+  flex: none;
+  position: sticky;
+  top: 0;
+  z-index: 9;
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: var(--tap);
+  padding: 6px 10px;
+  font-size: 15px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-active {
+  color: var(--text);
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.tab-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 16px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+/* `main` is the one vertical scroller for every screen (list, settings,
+   pairing, new session, detail). `min-height: 0` is what lets it really be
+   constrained by the two shell rows above and below it instead of growing to
+   its content; `padding-bottom` is the safe-area floor so the last row of a
+   long list can always be scrolled clear of the nav bar and the notch. */
+main {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.screen {
+  padding: 16px;
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 24px);
+}
+
+.lead { color: var(--muted); margin: 4px 0 16px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+
+.field-label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 12px 0 6px;
+}
+
+.field {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 10px 12px;
+  font-size: 16px; /* >=16px stops iOS/WebView from zooming on focus */
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+}
+
+.field:focus { border-color: var(--accent); }
+
+.code-field {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 1px;
+}
+
+button {
+  min-height: var(--tap);
+  padding: 10px 18px;
+  font-size: 16px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+button:disabled { opacity: 0.5; cursor: default; }
+
+button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+button.danger { background: var(--danger); color: #fff; border-color: transparent; }
+button.big { width: 100%; margin-top: 20px; }
+button.wide { width: 100%; margin-top: 20px; }
+
+.error-text { color: var(--danger); font-size: 14px; margin: 12px 0 0; min-height: 1em; }
+
+.notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 16px 0;
+  padding: 12px;
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+
+.notice-error { background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: var(--danger); }
+.notice-warn { background: color-mix(in srgb, var(--warn) 14%, var(--surface)); color: var(--warn); }
+
+.notice span { flex: 1 1 auto; min-width: 0; }
+
+/* The retry control must keep its label on one line: as a flex item it was
+   shrinking until "重试" wrapped one character per line. */
+.notice button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  padding: 8px 16px;
+  min-height: var(--tap);
+}
+
+/* --- filters and the session list --------------------------------------- */
+
+/* The whole toolbar above the list is one visual group: a soft surface with a
+   hairline edge, so search + tool filter + project filter read as one control
+   panel instead of three loose rows. */
+.list-tools {
+  margin-bottom: 12px;
+  padding: 10px 10px 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.list-tools .chip-row:last-child { margin-bottom: 8px; }
+.list-tools .field { background: var(--bg); }
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.chip {
+  min-height: 36px;
+  padding: 6px 12px;
+  font-size: 14px;
+  line-height: 1.3;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-active {
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.chip-quiet { background: var(--surface-2); }
+
+.task-summary {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.session-list { list-style: none; margin: 0; padding: 0; }
+
+.session-item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 10px;
+  min-height: var(--tap);
+  box-shadow: var(--shadow);
+}
+
+.session-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.session-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+
+.pin-button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  width: 36px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+}
+
+.pin-on { color: var(--warn); }
+
+.needs-input {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  padding: 2px 8px;
+  font-size: 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  color: var(--accent);
+}
+
+.session-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 13px; color: var(--muted); }
+
+.session-meta > * { min-width: 0; overflow-wrap: anywhere; }
+
+/* The tool accent. A small coloured dot plus the product name, so the tool a
+   session belongs to is readable at a glance without shouting. */
+.tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tool::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: 0 0 auto;
+}
+
+.tool-codex::before { background: var(--accent); }
+.tool-dsh::before { background: var(--ok); }
+
+.project-cue {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+
+.status-working { background: color-mix(in srgb, var(--accent) 18%, var(--surface)); color: var(--accent); }
+.status-idle { background: var(--surface-2); }
+.status-stopped { background: color-mix(in srgb, var(--warn) 18%, var(--surface)); color: var(--warn); }
+.status-error { background: color-mix(in srgb, var(--danger) 18%, var(--surface)); color: var(--danger); }
+
+/* --- detail -------------------------------------------------------------- */
+
+.detail-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.detail-title { font-size: 18px; margin: 0 0 4px; word-break: break-word; }
+.detail-head .detail-title { margin: 0; font-size: 17px; }
+
+.message-list {
+  list-style: none;
+  margin: 16px 0;
+  padding: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+}
+
+.msg {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.msg-role { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.msg-text { white-space: pre-wrap; word-break: break-word; }
+.msg-time { font-size: 11px; color: var(--muted); margin-top: 6px; text-align: right; }
+
+.msg-user { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+
+/* --- pending panels: questions and permission approvals ------------------ */
+
+.pending-panel {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.pending-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.pending-list { list-style: none; margin: 0; padding: 0; }
+
+/* A question or approval batch can be long. It scrolls inside itself (so the
+   composer below it stays on screen), while the panel itself keeps its own
+   bounding box: the last 同意 / 拒绝 / 选项 control is always reachable.
+   The cap is a fraction of the viewport, not a fixed height, so it also holds
+   when the on-screen keyboard has shrunk the viewport. */
+#approvals-list,
+#questions-list {
+  max-height: 45vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.pending-card {
+  padding: 10px 0;
+  border-top: 1px dashed var(--border);
+}
+.pending-card:first-child { border-top: 0; padding-top: 0; }
+
+.pending-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; margin-bottom: 6px; }
+
+.pending-tool {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.pending-call { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+.pending-reason {
+  margin: 0 0 6px;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.pending-hint { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+.pending-note { margin: 8px 0 0; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+.pending-actions { display: flex; gap: 10px; }
+.pending-actions button { flex: 1 1 0; min-width: 0; }
+
+.question { margin-bottom: 12px; }
+.question-header { margin: 0 0 2px; font-size: 12px; color: var(--muted); }
+.question-text { margin: 0 0 8px; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; white-space: pre-wrap; }
+.question-detail { margin: 0 0 8px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.question-options { display: flex; flex-direction: column; gap: 8px; }
+
+.option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 15px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  white-space: normal;
+}
+
+.option-active {
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+  border-color: var(--accent);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.option-label { overflow-wrap: anywhere; }
+.option-desc { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+.question-custom { margin-top: 8px; }
+
+/* --- composer ------------------------------------------------------------ */
+
+.composer {
+  position: sticky;
+  bottom: 0;
+  flex: none;
+  padding-top: 8px;
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+  background: var(--bg);
+}
+
+.composer-actions { display: flex; gap: 10px; margin-top: 10px; }
+.composer-actions button { flex: 1 1 0; }
+
+textarea.field { resize: vertical; min-height: var(--tap); }
+
+.model-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.model-chip-label { font-size: 12px; color: var(--muted); }
+
+.model-chip {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  /* A long model + provider label wraps instead of being clipped: the user has
+     to be able to read which model the next message will use. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* The selected chip carries BOTH `chip-quiet` and `chip-active` (app.js sets
+   'chip chip-quiet model-chip' + ' chip-active'). Those two are single class
+   selectors of equal specificity, and `.chip-quiet` is declared last, so its
+   `background: var(--surface-2)` beat `.chip-active`'s accent background while
+   `.chip-active` kept supplying `color: var(--accent-text)` (#ffffff). Result:
+   white text on #eceef2 — unreadable in light theme. Two classes outrank one,
+   so the selected model chip gets the accent background here and stays paired
+   with the theme's own accent foreground in both schemes. */
+.model-chip.chip-active {
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: transparent;
+}
+
+/* The next-message model catalog is an ANCHORED POPOVER, not a block in the
+   chat column. It used to be an in-flow block inside #composer, so opening it
+   added ~44vh of flex content to #detail-screen: the reading column below the
+   picker was pushed past the shell, and #detail-screen (overflow: hidden)
+   silently scrolled its own hidden overflow, shifting the header away. A real
+   native catalog (7 Codex models) grows further.
+
+   It is absolutely positioned against #composer, which is `position: sticky`
+   and therefore the containing block. `bottom: calc(100% + 8px)` pins the
+   popover's bottom edge one gap above the composer's TOP edge, so the whole
+   composer (chip row, textarea, send buttons) stays uncovered and a tap on the
+   chip in the .model-chip-row toggles the menu exactly as before. Being out of
+   flow, opening it changes NO height anywhere: the composer keeps its flex
+   height, #detail-screen keeps scrollHeight == clientHeight, the header stays
+   put and the message list keeps the same scroll position.
+   `left: 0; right: 0; max-width: none` makes the popover span the composer's
+   own width, so it lines up with the controls underneath it instead of hanging
+   past them.
+   Absolute (not fixed) is also what keeps it tied to the composer when the
+   on-screen keyboard shrinks the viewport and the sticky composer moves: a
+   fixed box anchored to the visual/layout viewport bottom is what produced the
+   old overlay, because `bottom: 12px` measured from the viewport bottom, not
+   from the composer's top edge. */
+.picker {
+  position: absolute;
+  z-index: 18;              /* above the composer, below the sheet backdrop (20) */
+  left: 0;
+  right: 0;
+  /* One 8px gap above the composer's top edge: never covers the chip, the
+     textarea or the send button, and never moves any of them. */
+  bottom: calc(100% + 8px);
+  max-width: none;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 10px 28px rgba(12, 14, 18, 0.22);
+  /* The full catalog scrolls inside the popover. The vh line is the fallback
+     for WebViews without dynamic viewport units; the dvh line is what keeps
+     the popover inside the visible area once the keyboard is up. The 320px
+     ceiling leaves the header, the chip row and the send button their room on
+     a tall phone; the floor is applied by the short-viewport block below.
+     The `calc(100vh - 440px)` term is the viewport reserve: on a mid-height
+     viewport the popover and the composer together may not claim more than the
+     viewport minus the header and the reading column, so the popover shrinks
+     instead of pushing its first options above the header. It is a no-op on
+     tall phones (at 844px it resolves to 404px, so the 320px ceiling still
+     wins) and never applies below 600px, where the short-viewport block below
+     hands the detail screen back to normal flow. */
+  max-height: min(44vh, 320px, calc(100vh - 440px));
+  max-height: min(44dvh, 320px, calc(100dvh - 440px));
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* Deliberately NO position/z-index here. #detail-screen must stay a static,
+   non-positioned box: z-index or a transform on it would create a stacking
+   context, and inside that context the popover's z-index: 18 would be painted
+   under the app bar (z-index: 10) instead of over it. Because the section
+   stays static, the popover competes with the app bar at the root level and
+   wins, which is what keeps it visible if the two ever overlap. */
+
+.picker-list { display: flex; flex-direction: column; gap: 6px; }
+
+.picker-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  white-space: normal;
+}
+
+.picker-row-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  font-weight: 600;
+}
+
+.picker-row-label { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+/* The native model description is secondary help: it must never compete with
+   the model id above it on a narrow phone. */
+.picker-row-desc { flex: 1 1 100%; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.picker-row-provider { flex: 0 0 auto; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+.picker-effort { margin-top: 8px; }
+
+/* --- sheets -------------------------------------------------------------- */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgba(12, 14, 18, 0.42);
+}
+
+.sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 21;
+  max-height: 76vh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+}
+
+.sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.sheet-title { font-weight: 600; }
+
+.sheet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sheet-row { border-bottom: 1px solid var(--border); }
+
+.sheet-row-button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 10px 4px;
+  text-align: left;
+  font-size: 15px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  white-space: normal;
+}
+
+.sheet-row-active .sheet-row-button { color: var(--accent); font-weight: 600; }
+.sheet-row-name { overflow-wrap: anywhere; }
+.sheet-row-path {
+  font-size: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+/* Tool cues on a project row: which tools really map to this directory. */
+.sheet-row-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.tool-cue {
+  font-size: 11px;
+  line-height: 16px;
+  padding: 0 8px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.sheet-row-active .tool-cue { background: transparent; }
+
+/* --- settings groups ----------------------------------------------------- */
+
+.settings-group {
+  margin: 18px 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+#settings-screen > .settings-group:first-child { margin-top: 0; }
+
+/* Signing out is a destructive-ish action: it sits last, full width, separated
+   from the reversible preferences above it. */
+#logout-button { width: 100%; margin-top: 12px; }
+
+/* ===========================================================================
+   Chat front end — activity folding, Markdown, code and the new-session panel.
+   Tuned for a 360 / 390 / 430px viewport: nothing may push the page sideways,
+   so anything that can be wider than the screen scrolls INSIDE its own box.
+   =========================================================================== */
+
+html { overflow-x: hidden; }
+img, table, pre, blockquote { max-width: 100%; }
+
+/* --- viewport shell ------------------------------------------------------
+   One page, one scroller. #appbar and .tabbar are fixed-height flex items on
+   the shell, so they are always on screen; `main` is the single vertical
+   scroller and pays for the vertical scrollbar with its own padding, so no
+   screen has to compute a viewport height of its own. */
+main {
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+}
+
+/* --- conversation ------------------------------------------------------- */
+
+.msg-text {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Markdown inside a message: tightened so a dense reply still reads well on a
+   narrow screen. */
+.msg-text > *:first-child { margin-top: 0; }
+.msg-text > *:last-child { margin-bottom: 0; }
+.msg-text p { margin: 0 0 8px; }
+.msg-text h1, .msg-text h2, .msg-text h3,
+.msg-text h4, .msg-text h5, .msg-text h6 {
+  margin: 12px 0 6px;
+  line-height: 1.3;
+  font-size: 1.05em;
+}
+.msg-text h1 { font-size: 1.2em; }
+.msg-text ul, .msg-text ol { margin: 6px 0 8px; padding-left: 22px; }
+.msg-text li { margin: 2px 0; }
+.msg-text blockquote {
+  margin: 8px 0;
+  padding: 2px 0 2px 10px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.msg-text hr { border: 0; border-top: 1px solid var(--border); margin: 12px 0; }
+.msg-text a { color: var(--accent); text-decoration: none; }
+.msg-text code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+/* A table scrolls sideways inside itself rather than widening the page. */
+.msg-text table {
+  display: block;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 0.94em;
+}
+.msg-text th, .msg-text td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  white-space: nowrap;   /* keeps cells readable; the table scrolls, not wraps */
+}
+.msg-text th { background: var(--surface-2); font-weight: 600; }
+
+/* --- code blocks: readable, copyable, never page-wide ------------------- */
+
+.code-block { position: relative; margin: 8px 0; }
+
+.code-block pre,
+.msg-text pre {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;              /* long lines scroll here, not the page */
+  -webkit-overflow-scrolling: touch;
+  tab-size: 4;
+}
+.code-block pre code,
+.msg-text pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.9em;
+  line-height: 1.45;
+  white-space: pre;              /* keep the author's line breaks */
+}
+
+.copy-code {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  min-height: 32px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.9;
+}
+
+.copy-shim { position: fixed; left: -9999px; top: 0; }
+
+/* --- activity blocks: folded tool/system runs --------------------------- */
+
+.activity-item { margin: 10px 0; }
+
+.activity {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.activity-summary {
+  cursor: pointer;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--tap);
+}
+.activity-summary::-webkit-details-marker { display: none; }
+.activity-summary::before {
+  content: "▸";
+  font-size: 11px;
+  color: var(--muted);
+  transition: transform 0.12s ease;
+}
+.activity[open] > .activity-summary::before { transform: rotate(90deg); }
+.activity[open] > .activity-summary { border-bottom: 1px solid var(--border); }
+
+.activity-body {
+  padding: 8px 12px 10px;
+  background: var(--surface);
+}
+
+.activity-row { padding: 6px 0; border-top: 1px dashed var(--border); }
+.activity-row:first-child { border-top: 0; padding-top: 0; }
+
+.activity-role {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-bottom: 4px;
+}
+
+/* Tool output is machine text, not prose: monospace and wrappable, with its
+   own scroll for long lines so a diff cannot widen the page. */
+.activity-text {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 46vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  color: var(--text);
+}
+.activity-text .code-block { margin: 6px 0; }
+
+/* --- new-session panel -------------------------------------------------- */
+
+.choice-row { display: flex; gap: 10px; }
+.choice-row .choice { flex: 1 1 0; min-width: 0; }
+.choice-active { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
+
+.truncated-note { margin: 4px 0 0; }
+
+#model-select, #effort-select, #project-select { width: 100%; max-width: 100%; }
+
+#new-screen .field-label { margin-top: 16px; }
+#new-screen #new-submit { margin-top: 20px; }
+
+/* The detail screen IS the chat scroller's frame: it fills the box `main`
+   hands it (no viewport maths of its own), the reading column above it stays
+   at its natural height, and only #message-list is allowed to be short and
+   scroll. That is what stops the page and the list from scrolling at once and
+   keeps the composer on screen above the keyboard. */
+#detail-screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Everything above the reading column, and the composer below it, keeps its
+   natural height. A permission / question panel is the one exception: it may
+   be shrunk (never grown) so that a big batch cannot push the composer or the
+   panel's own last control out of reach. Its list scrolls instead. */
+#detail-screen > .detail-head,
+#detail-screen > #detail-title,
+#detail-screen > #detail-tool,
+#detail-screen > #detail-truncated,
+#detail-screen > #detail-partial,
+#detail-screen > #detail-error { flex: none; }
+
+#detail-screen > .pending-panel {
+  flex: 0 1 auto;
+  min-height: 0;
+}
+
+/* The message list owns the chat's vertical scrolling: it takes the height
+   that is left and scrolls inside itself, however long the Markdown is. Its
+   horizontal twin lives with the table/code rules further up. The floor keeps
+   the conversation readable (and scrollable) even while a pending panel is on
+   screen; it costs nothing in an ordinary chat, where the list is taller. */
+.message-list {
+  flex: 1 1 auto;
+  min-height: min(22vh, 180px);
+  overflow-x: hidden;
+}
+
+/* Long Windows paths and long model labels wrap instead of widening a control. */
+#project-select, #cwd-input, #model-select, #detail-tool, .model-chip {
+  overflow-wrap: anywhere;
+}
+
+/* --- short viewports: never clip the composer ---------------------------
+   The fixed shell above assumes there is room for the reading column, the
+   header and the composer at once. On a phone whose VISIBLE height is small
+   (the on-screen keyboard can leave well under 600px, and a landscape phone is
+   shorter still) that assumption stops holding: the flex column would have to
+   squeeze the composer, and #detail-screen's `overflow: hidden` would hide the
+   send button for good.
+   Height-driven, never width-driven: a narrow phone in portrait keeps the
+   fixed shell, and the pinned 390x844 layout is untouched because 844px is far
+   above this threshold. Below it the detail screen is handed back to normal
+   document flow -- `height: auto` plus natural flex sizing -- so main scrolls
+   and every control (header, composer, send) stays reachable by scrolling
+   instead of disappearing. A short screen then scrolls a little; it never
+   loses a control. The threshold sits above the height at which an in-app
+   native viewport plus the on-screen keyboard can make header + detail heading
+   + composer + message list taller than the viewport itself, which is the case
+   the anchored absolute popover cannot absorb. */
+@media (max-height: 600px) {
+  #detail-screen {
+    height: auto;
+    min-height: 0;
+    /* No clipping box, so a tall composer or message list is only ever
+       scrolled, never cut off. */
+    overflow: visible;
+  }
+
+  /* The conversation and the panels take their natural height and main does
+     the scrolling. The floor is dropped so the message list cannot force the
+     composer out of the shell. */
+  .message-list { flex: none; min-height: 0; }
+
+  #detail-screen > .pending-panel { flex: none; }
+
+  /* The reading column still scrolls inside itself when a long batch of
+     questions would otherwise dominate the screen. */
+  #approvals-list,
+  #questions-list { max-height: 40vh; }
+
+  /* Keep the popover clear of the fixed header on a very short screen. */
+  .picker { max-height: min(38dvh, 240px); }
+
+  /* No room for an anchored popover at all: once this block applies the
+     keyboard is up or the viewport is short, and a popover pinned above a
+     sticky composer would either collide with the header or hide the fields it
+     is supposed to offer.
+     So the two boxes give up positioning and go back into normal flow: the
+     picker becomes an in-flow block INSIDE #composer, directly under the chip
+     row, and the composer stops sticking. Because #detail-screen is already
+     `height: auto; overflow: visible` above, main scrolls the whole document
+     and every field (chip row, catalog, effort, textarea, send) is reachable
+     by scrolling -- the catalog simply grows the page instead of floating over
+     it. Height-driven only: the 844px portrait shell never enters this block. */
+  .picker {
+    position: static;
+    bottom: auto;
+    left: auto;
+    right: auto;
+    max-width: none;
+    margin-top: 8px;
+  }
+
+  .composer { position: static; }
+}

@@ -1,0 +1,27 @@
+# Caddyfile.bootstrap — the HTTP-only Caddyfile used for one purpose: letting
+# certbot's HTTP-01 webroot challenge be answered before any certificate exists.
+#
+# managed-by: ai-remote-relay
+#
+# The full Caddyfile names TLS files at /etc/ssl/ai-remote/, which do not exist
+# on a first install, so Caddy cannot load it yet. install-centos.sh installs
+# this file, starts Caddy, obtains the certificate, then installs the full
+# Caddyfile. On a host that already has a valid certificate this file is never
+# used.
+
+{
+	admin 127.0.0.1:2019
+	auto_https off
+}
+
+http://101.43.98.18 {
+	handle /.well-known/acme-challenge/* {
+		root * /var/www/certbot
+		file_server
+	}
+
+	handle {
+		# Nothing else is served over plain HTTP while the relay has no TLS.
+		respond "certificate not installed yet" 503
+	}
+}

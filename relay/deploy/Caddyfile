@@ -1,0 +1,98 @@
+# Caddyfile — https://101.43.98.18 in front of the relay.
+#
+# managed-by: ai-remote-relay
+#
+# That marker is load-bearing. install-centos.sh replaces /etc/caddy/Caddyfile
+# only when the existing file carries this marker, or when it is still the stock
+# Caddyfile the package ships. Any other content means somebody else is using
+# Caddy on this host, and the installer refuses rather than take their service
+# down.
+#
+# R19 item 3: Caddy and the relay run on the SAME host and Caddy reaches the
+# relay over loopback. That is what makes the relay's X-Forwarded-For rule
+# sound: the header is trusted only when the TCP peer is 127.0.0.1, which is
+# exactly where Caddy is.
+#
+# The certificate is an IP-address certificate (no DNS name exists) issued by
+# Let's Encrypt's shortlived profile through certbot's HTTP-01 webroot
+# challenge. Caddy therefore does NOT manage certificates itself — automatic
+# HTTPS is off and the TLS files are named explicitly. install-centos.sh renews
+# them with certbot and reloads this service.
+
+{
+	# Keep Caddy's own administrative API on loopback.
+	admin 127.0.0.1:2019
+
+	# Certbot owns certificate issuance. With automatic HTTPS left on, Caddy
+	# would try to obtain its own certificate for a bare IP address and fail
+	# noisily on every start.
+	auto_https off
+
+	# A client that connects to a bare IP address sends NO SNI. `curl
+	# https://101.43.98.18` (no -k), most phone download managers and every TLS
+	# scanner do exactly that. With no server name Caddy cannot match a site
+	# block and the handshake dies with a TLS "internal error" alert instead of
+	# serving the certificate — observed on the real host as:
+	#     TLSv1.3 (IN), TLS alert, internal error (592)
+	# `default_sni` makes a name-less handshake fall back to this IP's site, and
+	# therefore to this IP's certificate.
+	#
+	# This is known Caddy behaviour with IP-address certificates, not a relay
+	# bug: the relay never sees the TLS layer at all.
+	default_sni 101.43.98.18
+
+	servers {
+		trusted_proxies static 127.0.0.1
+	}
+}
+
+# Plain HTTP exists for one reason: answering the ACME HTTP-01 challenge. Every
+# other request is redirected to HTTPS. Caddy serves the challenge from the same
+# webroot certbot writes to.
+http://101.43.98.18 {
+	handle /.well-known/acme-challenge/* {
+		root * /var/www/certbot
+		file_server
+	}
+
+	handle {
+		redir https://{host}{uri} permanent
+	}
+}
+
+https://101.43.98.18 {
+	tls /etc/ssl/ai-remote/fullchain.pem /etc/ssl/ai-remote/privkey.pem
+
+	reverse_proxy 127.0.0.1:8080 {
+		# ⚠️ LOAD-BEARING — do not delete. The relay rate-limits per client IP
+		# and trusts X-Forwarded-For only when the TCP peer is loopback. Caddy is
+		# on loopback, so this line is what makes that header truthful. Delete it
+		# and every request arrives from 127.0.0.1: one client's flood would
+		# exhaust the bucket for everybody, and the limit would protect nothing.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+
+		# The bridge is a long-lived WebSocket; do not cut it short.
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+
+	# There is deliberately no file_server here. The relay serves its own site
+	# from /opt/ai-remote/web and its APK whitelist from /opt/ai-remote/downloads,
+	# and the two route families must never fall back into each other (R19
+	# item 1). A second file server on this host is exactly how that fallback
+	# starts.
+
+	encode zstd gzip
+
+	log {
+		output file /var/log/caddy/ai-remote-access.log {
+			roll_size 10MiB
+			roll_keep 3
+			roll_keep_for 168h
+		}
+		format json
+	}
+}

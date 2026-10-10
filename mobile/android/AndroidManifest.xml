@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AI 远程控制 — Android shell.
+
+  The app is a thin WebView shell around the same static page that lives in
+  mobile/web/ and is served from https://101.43.98.18/. It holds no secrets and
+  opens no native bridge: the page is public, and the only thing worth
+  protecting is the rc_session cookie, which the WebView's own (persistent)
+  cookie store holds.
+
+  Closed by default:
+    - only android.permission.INTERNET is requested; there is no file-content
+      permission of any kind (no READ_EXTERNAL_STORAGE / WRITE_* /
+      MANAGE_EXTERNAL_STORAGE)
+    - usesCleartextTraffic="false" plus res/xml/network_security_config.xml, so
+      an http:// URL can never load
+    - allowBackup="false": the cookie jar is never copied off the device
+    - debuggable="false": a release build cannot be attached to a debugger
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.airemote.app"
+    android:versionCode="1"
+    android:versionName="1.0.0">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <uses-sdk
+        android:minSdkVersion="26"
+        android:targetSdkVersion="35" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@drawable/ic_launcher"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:debuggable="false"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name="com.airemote.app.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

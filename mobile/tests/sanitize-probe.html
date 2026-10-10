@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>sanitize probe</title>
+</head>
+<body>
+<!--
+  Real-DOM sanitising probe.
+
+  This page is served by mobile/tests/mock-server.js at /__sanitize and is driven
+  by a real browser. It runs the actual shipping render path
+  (marked -> DOMPurify -> fragment) against hostile input in a real DOM, and
+  reports what survived.
+
+  It exists because the Node test harness has no DOM, so this class of test can
+  only be honest when it runs in a browser.
+-->
+<pre id="results">running</pre>
+<div id="stage" style="display:none"></div>
+
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script src="/js/core.js"></script>
+<script src="/js/markdown.js"></script>
+<script>
+(function () {
+  'use strict';
+  window.__pwned = 0;
+
+  var results = [];
+
+  /** Render hostile input through the shipping path and describe what survived. */
+  function probe(name, input, check) {
+    var stage = document.getElementById('stage');
+    var host = document.createElement('div');
+    stage.appendChild(host);
+    var ok = false;
+    var detail = '';
+    try {
+      var used = window.RCMarkdown.renderInto(host, input);
+      var outcome = check(host);
+      ok = outcome.ok;
+      detail = (used ? '' : '[fell back to plain text] ') + outcome.detail;
+    } catch (err) {
+      detail = 'threw: ' + err.message;
+    }
+    results.push({ name: name, pass: ok, detail: detail, html: host.innerHTML });
+    host.parentNode.removeChild(host);
+  }
+
+  var DANGEROUS = ['script', 'iframe', 'form', 'input', 'style', 'svg', 'object', 'embed', 'button', 'textarea', 'select', 'img'];
+
+  function noneOf(host, tags) {
+    var found = [];
+    tags.forEach(function (tag) {
+      if (host.querySelectorAll(tag).length > 0) found.push(tag);
+    });
+    return found.length
+      ? { ok: false, detail: 'survived: ' + found.join(',') }
+      : { ok: true, detail: 'no dangerous element survived' };
+  }
+
+  function noEventAttrs(host) {
+    var bad = [];
+    Array.prototype.forEach.call(host.querySelectorAll('*'), function (el) {
+      Array.prototype.forEach.call(el.attributes, function (attr) {
+        if (/^on/i.test(attr.name)) bad.push(el.tagName + '@' + attr.name);
+      });
+    });
+    return bad.length ? { ok: false, detail: 'handler survived: ' + bad.join(',') }
+      : { ok: true, detail: 'no event-handler attribute survived' };
+  }
+
+  // --- payloads -----------------------------------------------------------
+  probe('script tag', '<script>window.__pwned = 1<\/script>', function (h) { return noneOf(h, DANGEROUS); });
+  probe('img onerror', '<img src=x onerror="window.__pwned=1">', function (h) { return noneOf(h, ['img']); });
+  probe('iframe javascript url', '<iframe src="javascript:window.__pwned=1"></iframe>', function (h) { return noneOf(h, ['iframe']); });
+  probe('form + input', '<form action="javascript:window.__pwned=1"><input name="x" value="y"></form>', function (h) { return noneOf(h, ['form', 'input']); });
+  probe('svg onload', '<svg onload="window.__pwned=1"></svg>', function (h) { return noneOf(h, ['svg']); });
+  probe('style tag', '<style>body{background:url("javascript:window.__pwned=1")}</style>', function (h) { return noneOf(h, ['style']); });
+  probe('div onclick', '<div onclick="window.__pwned=1">click</div>', function (h) { return noEventAttrs(h); });
+  probe('a javascript: href', '[x](javascript:window.__pwned=1)', function (h) {
+    var a = h.querySelector('a');
+    if (!a) return { ok: true, detail: 'no anchor rendered' };
+    return a.hasAttribute('href')
+      ? { ok: false, detail: 'href survived: ' + a.getAttribute('href') }
+      : { ok: true, detail: 'href stripped' };
+  });
+  probe('a data: href', '[x](data:text/html,<script>window.__pwned=1<\/script>)', function (h) {
+    var a = h.querySelector('a');
+    if (!a) return { ok: true, detail: 'no anchor rendered' };
+    return a.hasAttribute('href') ? { ok: false, detail: 'href survived' } : { ok: true, detail: 'href stripped' };
+  });
+  probe('a java\\tscript: href', '[x](\u006a\u0061\u0076\u0061\u0009script:window.__pwned=1)', function (h) {
+    var a = h.querySelector('a');
+    if (!a) return { ok: true, detail: 'no anchor rendered' };
+    return a.hasAttribute('href') ? { ok: false, detail: 'href survived (control char bypass)' } : { ok: true, detail: 'href stripped' };
+  });
+  probe('a file: href', '[x](file:///etc/passwd)', function (h) {
+    var a = h.querySelector('a');
+    if (!a) return { ok: true, detail: 'no anchor rendered' };
+    return a.hasAttribute('href') ? { ok: false, detail: 'href survived' } : { ok: true, detail: 'href stripped' };
+  });
+
+  // --- the normal things must still work ----------------------------------
+  probe('table survives', '| a | b |\n| - | - |\n| 1 | 2 |', function (h) {
+    return h.querySelectorAll('table').length === 1
+      ? { ok: true, detail: 'table kept' } : { ok: false, detail: 'table lost' };
+  });
+  probe('code fence survives', '```js\nconst a = 1;\n```', function (h) {
+    return h.querySelectorAll('pre code').length >= 1
+      ? { ok: true, detail: 'pre>code kept' } : { ok: false, detail: 'pre>code lost' };
+  });
+  probe('copy button added to code', '```\nx\n```', function (h) {
+    return h.querySelectorAll('.copy-code').length === 1
+      ? { ok: true, detail: 'copy control present' } : { ok: false, detail: 'no copy control' };
+  });
+  probe('template braces in code are NOT eaten', '```\n{{ handlebars }}\n```', function (h) {
+    var text = h.textContent || '';
+    return text.indexOf('{{ handlebars }}') !== -1
+      ? { ok: true, detail: 'code text intact' }
+      : { ok: false, detail: 'SAFE_FOR_TEMPLATES ate the braces: ' + text };
+  });
+  probe('safe https link survives', '[x](https://example.com/a)', function (h) {
+    var a = h.querySelector('a');
+    if (!a || !a.hasAttribute('href')) return { ok: false, detail: 'safe link lost' };
+    return a.getAttribute('rel') === 'noopener noreferrer'
+      ? { ok: true, detail: 'href + rel kept' }
+      : { ok: false, detail: 'rel missing: ' + a.getAttribute('rel') };
+  });
+  probe('headings/lists/quote survive', '# H\n\n- a\n- b\n\n> q', function (h) {
+    var good = h.querySelectorAll('h1').length === 1 && h.querySelectorAll('li').length === 2 && h.querySelectorAll('blockquote').length === 1;
+    return good ? { ok: true, detail: 'h1/li/blockquote kept' } : { ok: false, detail: 'structure lost' };
+  });
+
+  var summary = {
+    // marked's UMD build does not expose `version` at run time; its version is
+    // pinned by the vendored file banner and by mobile/tests/source-guards.test.js.
+    versions: {
+      markedLoaded: typeof window.marked === 'object' && typeof window.marked.parse === 'function',
+      dompurify: (window.DOMPurify && window.DOMPurify.version) || '?'
+    },
+    pwned: window.__pwned,
+    total: results.length,
+    failed: results.filter(function (r) { return !r.pass; }).length,
+    results: results
+  };
+  document.getElementById('results').textContent = JSON.stringify(summary, null, 1);
+})();
+</script>
+</body>
+</html>

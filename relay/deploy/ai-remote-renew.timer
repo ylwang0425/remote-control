@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily check that the AI remote relay certificate is still valid
+Documentation=https://101.43.98.18/
+
+[Timer]
+# Twice a day, at a scattered minute, so a renewal never lands on the same
+# second as every other certbot on the internet.
+OnCalendar=*-*-* 03,15:17:00
+RandomizedDelaySec=1800
+Persistent=true
+Unit=ai-remote-renew.service
+
+[Install]
+WantedBy=timers.target

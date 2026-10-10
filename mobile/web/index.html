@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover + the CSS safe-area insets keep the composer above the
+     keyboard and the notch. The Android shell also sets adjustResize. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>AI 工作台</title>
+<!-- No build step, no CDN: every asset is a relative path next to this file, so
+     the same directory works at the root of https://101.43.98.18/ and under any
+     sub-path. marked + DOMPurify are vendored under vendor/ for offline use.
+     See docs/design/api/protocol-v1.md for the wire contract. -->
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<header id="appbar">
+  <h1 id="appbar-title">AI 工作台</h1>
+  <div id="appbar-actions" class="appbar-actions">
+    <!-- The new-chat action. It used to be a full-width footer button that ate
+         the bottom of the list; as a header action it is always reachable and
+         costs no list space. Marked aria-hidden because the button itself
+         already carries the accessible name. -->
+    <button id="new-session-button" class="icon-action" type="button" aria-label="新建会话">
+      <span class="icon-action-glyph" aria-hidden="true">＋</span>
+    </button>
+    <span id="conn-badge" class="badge">连接中…</span>
+  </div>
+</header>
+
+<!-- The workbench switcher. It is the same three views everywhere: no route, no
+     separate screen, so a filter the user chose is not lost by navigating. -->
+<nav id="tabbar" class="tabbar" hidden>
+  <button id="tab-chats" class="tab tab-active" type="button" data-tab="chats">会话</button>
+  <button id="tab-tasks" class="tab" type="button" data-tab="tasks">任务<span id="tab-tasks-badge" class="tab-badge" hidden></span></button>
+  <button id="tab-settings" class="tab" type="button" data-tab="settings">设置</button>
+</nav>
+
+<main id="screens">
+
+  <!-- Connection/authorisation notice. It lives OUTSIDE the screens on purpose:
+       a fresh device that cannot reach the server still has to see the pairing
+       form, so this notice is shown above whichever screen is active. -->
+  <div id="notice" class="notice notice-error" hidden>
+    <span id="notice-text"></span>
+    <button id="notice-retry" class="secondary" type="button">重试</button>
+  </div>
+
+  <section id="loading-screen" class="screen">
+    <p class="muted">正在连接…</p>
+  </section>
+
+  <!-- ============================ pairing ============================ -->
+  <section id="pair-screen" class="screen" hidden>
+    <p class="lead">在电脑端生成配对码，然后在这里输入。</p>
+    <label class="field-label" for="pair-code-input">配对码</label>
+    <input id="pair-code-input" class="field code-field" type="text"
+           inputmode="text" autocomplete="one-time-code" autocapitalize="characters"
+           spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX">
+    <label class="field-label" for="pair-name-input">设备名称</label>
+    <input id="pair-name-input" class="field" type="text" maxlength="64"
+           autocomplete="off" placeholder="例如 Pixel 8">
+    <button id="pair-submit" class="primary big" type="button">配对</button>
+    <p id="pair-error" class="error-text" role="alert"></p>
+  </section>
+
+  <!-- ============ workbench: 会话 / 任务 / 设置 ======================= -->
+  <section id="list-screen" class="screen" hidden>
+    <div class="list-tools">
+      <input id="search-input" class="field" type="search" autocomplete="off"
+             placeholder="搜索标题 / 状态 / 目录">
+      <div id="tool-filter" class="chip-row" role="group" aria-label="工具筛选"></div>
+      <div class="chip-row">
+        <button id="project-filter-button" class="chip" type="button">全部项目</button>
+        <button id="filter-clear-button" class="chip chip-quiet" type="button" hidden>清除筛选</button>
+      </div>
+    </div>
+    <p id="task-summary" class="task-summary" hidden></p>
+    <p id="list-empty" class="muted" hidden>没有匹配的会话</p>
+    <ul id="session-list" class="session-list"></ul>
+  </section>
+
+  <!-- ============================= detail ============================ -->
+  <section id="detail-screen" class="screen" hidden>
+    <div class="detail-head">
+      <button id="detail-back" class="secondary" type="button">返回</button>
+      <span id="detail-status" class="status"></span>
+    </div>
+    <h2 id="detail-title" class="detail-title"></h2>
+    <p id="detail-tool" class="muted small"></p>
+    <!-- Optional historyTruncated hint. Deliberately OUTSIDE #message-list so
+         showing/hiding it can never move the reading position. It is a note,
+         not an error: no error styling, no dialog, nothing disabled. -->
+    <p id="detail-truncated" class="muted small truncated-note" hidden></p>
+    <!-- Partial-success notice: the session exists, but something after the
+         creation did not finish. Retrying happens IN this session. -->
+    <div id="detail-partial" class="notice notice-warn" hidden>
+      <span id="detail-partial-text"></span>
+      <button id="detail-partial-retry" class="secondary" type="button">重发首条消息</button>
+    </div>
+
+    <!-- Permission approvals. Each card is one genuine native request; the two
+         buttons submit exactly one explicit decision for that one request. -->
+    <div id="approvals-panel" class="pending-panel" hidden>
+      <p class="pending-title">电脑请求权限</p>
+      <ul id="approvals-list" class="pending-list"></ul>
+    </div>
+
+    <!-- Questions the AI asked. Labels and options are the desktop's own. -->
+    <div id="questions-panel" class="pending-panel" hidden>
+      <p class="pending-title">AI 在等你回答</p>
+      <p id="questions-unsupported" class="muted small" hidden></p>
+      <ul id="questions-list" class="pending-list"></ul>
+    </div>
+
+    <p id="detail-error" class="error-text" role="alert" hidden></p>
+    <ol id="message-list" class="message-list"></ol>
+    <div id="composer" class="composer">
+      <div id="model-chip-row" class="model-chip-row">
+        <span class="model-chip-label">下条消息模型</span>
+        <button id="model-chip-button" class="chip chip-quiet model-chip" type="button">沿用当前模型</button>
+        <button id="model-reset-button" class="chip chip-quiet" type="button" hidden>取消模型选择</button>
+      </div>
+      <div id="model-picker" class="picker" hidden>
+        <div id="model-picker-list" class="picker-list" role="radiogroup" aria-label="下条消息模型"></div>
+        <div id="model-picker-effort" class="picker-effort" hidden>
+          <label class="field-label" for="model-picker-effort-select">思考强度</label>
+          <select id="model-picker-effort-select" class="field"></select>
+        </div>
+        <p id="model-picker-note" class="muted small" hidden></p>
+      </div>
+      <textarea id="send-input" class="field" rows="1" maxlength="16384"
+                placeholder="继续这个会话…"></textarea>
+      <div class="composer-actions">
+        <button id="send-button" class="primary" type="button">发送</button>
+        <button id="stop-button" class="danger" type="button" hidden>停止</button>
+      </div>
+      <p id="stop-reason" class="muted small" hidden></p>
+    </div>
+  </section>
+
+  <!-- =========================== new session ========================= -->
+  <section id="new-screen" class="screen" hidden>
+    <div class="detail-head">
+      <button id="new-back" class="secondary" type="button">返回</button>
+      <h2 class="detail-title">新建会话</h2>
+    </div>
+
+    <p class="field-label">工具</p>
+    <div id="tool-choices" class="choice-row"></div>
+
+    <p id="new-availability" class="notice notice-error" hidden></p>
+
+    <label class="field-label" for="model-select">模型</label>
+    <select id="model-select" class="field" disabled></select>
+
+    <div id="effort-row" hidden>
+      <label class="field-label" for="effort-select">思考强度</label>
+      <select id="effort-select" class="field"></select>
+    </div>
+
+    <div id="project-row" hidden>
+      <label class="field-label" for="project-select">项目（可选）</label>
+      <select id="project-select" class="field"></select>
+    </div>
+
+    <!-- Free-text working directory: DSH only. Codex has no cwd in its native
+         API -- its directory comes from a real project id in the catalog -- so
+         this row is never shown for Codex. -->
+    <div id="cwd-row" hidden>
+      <label class="field-label" for="cwd-input">工作目录（可选，绝对路径）</label>
+      <input id="cwd-input" class="field" type="text" autocomplete="off"
+             spellcheck="false" placeholder="D:\work\project">
+    </div>
+
+    <label class="field-label" for="new-text">首条消息（可选）</label>
+    <textarea id="new-text" class="field" rows="3" maxlength="16384"
+              placeholder="可以留空，创建后再发"></textarea>
+    <p id="new-text-hint" class="muted small" hidden></p>
+
+    <button id="new-submit" class="primary big" type="button" disabled>创建并打开</button>
+    <p id="new-error" class="error-text" role="alert"></p>
+  </section>
+
+  <!-- ============================= settings ========================== -->
+  <!-- Not a separate screen: the settings tab lives inside #list-screen's view,
+       so opening it never abandons a filter or a list refresh. -->
+  <section id="settings-screen" class="screen" hidden>
+    <p class="settings-group">外观</p>
+    <div id="theme-choices" class="chip-row" role="group" aria-label="外观"></div>
+    <p class="muted small">跟随系统时用浅色或深色，也可以固定其中一种。选择会保存在这台手机上。</p>
+
+    <p class="settings-group">筛选记忆</p>
+    <p id="prefs-summary" class="muted small"></p>
+    <div class="chip-row">
+      <button id="prefs-reset-button" class="chip chip-quiet" type="button">清除筛选记忆</button>
+    </div>
+
+    <p class="settings-group">置顶会话</p>
+    <p id="pins-summary" class="muted small"></p>
+    <div class="chip-row">
+      <button id="pins-clear-button" class="chip chip-quiet" type="button">取消全部置顶</button>
+    </div>
+
+    <p class="settings-group">账号</p>
+    <!-- Signing out lives HERE and nowhere else. The id is the one this control
+         has always had, so existing behaviour and any bookmark of it survive;
+         it is no longer a footer button taking up room under the chat list. -->
+    <button id="logout-button" class="secondary" type="button">退出登录</button>
+    <p id="settings-version" class="muted small"></p>
+  </section>
+
+</main>
+
+<!-- ===================== bottom sheets (project picker) =============== -->
+<div id="sheet-backdrop" class="sheet-backdrop" hidden></div>
+<div id="project-sheet" class="sheet" hidden role="dialog" aria-label="选择项目">
+  <div class="sheet-head">
+    <span class="sheet-title">选择项目</span>
+    <button id="project-sheet-close" class="secondary" type="button">关闭</button>
+  </div>
+  <input id="project-search-input" class="field" type="search" autocomplete="off" placeholder="搜索项目 / 路径">
+  <ul id="project-sheet-list" class="sheet-list"></ul>
+  <p id="project-sheet-empty" class="muted small" hidden>没有匹配的项目</p>
+</div>
+
+<noscript><p class="error-text">本应用需要启用 JavaScript。</p></noscript>
+
+<!-- Vendored offline: no CDN is contacted at run time. -->
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="js/core.js"></script>
+<script src="js/prefs.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/api.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/app.js"></script>
+<script>
+  // Boot the UI. Everything below this line is the same code the unit tests
+  // drive (mobile/tests/app.test.js).
+  (function () {
+    var storage = null;
+    try {
+      storage = window.localStorage || null;
+    } catch (err) {
+      // A WebView with DOM storage disabled throws on access; preferences are
+      // then simply not remembered for this visit.
+      storage = null;
+    }
+    var app = window.RCApp.createApp({
+      document: document,
+      window: window,
+      storage: storage,
+      api: window.RCApi.createApi({ fetch: window.fetch.bind(window) })
+    });
+    window.__rcApp = app;
+    app.start();
+  })();
+</script>
+</body>
+</html>

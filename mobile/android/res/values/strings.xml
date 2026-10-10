@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AI 远程控制</string>
+    <string name="offline_message">网络不可用，或连接不到服务器。\n请检查网络后重试。</string>
+    <string name="retry">重试</string>
+</resources>
