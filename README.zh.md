@@ -1,6 +1,6 @@
 # AI Remote — 手机 AI 工作台
 
-在 Android 手机上统一操作 Windows 电脑中已打开的 Codex Desktop 与 DSH Desktop：继续已有聊天、按已有项目新建会话、选择真实模型、查看任务状态，并处理工具实际提供的待回答事项。
+在 Android 手机上统一操作 Windows 电脑中已打开的 Codex Desktop 与 DSH Desktop，并读取 WorkBuddy 的本地聊天：继续已有聊天、按已有项目新建会话、选择真实模型、查看任务状态，并处理工具实际提供的待回答事项。
 
 [English](README.md)
 
@@ -14,7 +14,7 @@
 - 轮询保留草稿、焦点与光标；短视口下可滚动到模型、思考强度与发送控件。
 - 电脑端输入姓名并保存独立电脑编号；管理员通过一次性登记码接入其他电脑。
 - 独立管理员登录，按人员查看在线／离线电脑和可用 AI 工具，指定电脑打开工作台；普通配对只访问自己的电脑。
-- WorkBuddy 提供官方手机端接入说明入口，当前版本尚未接入统一工作台的聊天控制。
+- WorkBuddy 的本地会话和消息进入同一个工作台，支持 Markdown 与折叠工具记录；目前为只读接入。
 
 ## 技术结构
 
@@ -135,7 +135,8 @@ Remove-Item Env:GOOS,Env:GOARCH,Env:CGO_ENABLED
 - Codex 读取原生最近 10 轮窗口，另有消息条数与帧预算限制，不是完整历史导出。
 - DSH 原生选模型操作同时保存以后会话的默认模型。
 - 原生权限提交链路有自动化测试；本机当前审批设置下尚未完成真实手动权限批准验收。
-- WorkBuddy 5.7.7 的本机 SDK 需要原生受信扩展上下文，未找到可自行安装授权的本地扩展通道。当前提供[官方手机端接入说明](https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice)，需要电脑与官方手机 App 登录同一账号；不向它发送本工作台的凭据，也不伪造可控制能力。
+- WorkBuddy 读取当前 Windows 用户的 `.workbuddy/workbuddy.db` 本机会话信息和 `projects` 下的 JSONL 消息。可用 `WORKBUDDY_CONFIG_DIR` 或私密配置中的 `workbuddy.configDir` 指定自己的数据目录；不会修改原库，不会把云端或未知账号目录当成本地历史。读取有字节、条数和帧预算限制，截断会明确标记。
+- WorkBuddy 续聊、新建、模型选择、停止、提问和授权暂未接入，手机标注「只读」。需要这些操作时可按[官方手机端说明](https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice)使用同一账号的官方 App。已用本机 1 条真实会话验证用户消息、AI 回复、公网读取与手机 Markdown 展示；显示遵循原生历史投影规则，自动注入的系统提醒不会混入用户消息正文。其他边界使用隔离的原生格式样例验证，不写入用户原库。
 - 尚未在实体 Android 手机上完成安装、软键盘及系统安全区测试。
 
 服务器凭据、本机配置、原生工具提取文件、日志、部署记录、二进制和签名材料均排除在源码仓库之外。浏览器第三方库说明见 [mobile/web/vendor](mobile/web/vendor/README.md)。

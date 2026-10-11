@@ -1886,3 +1886,122 @@ test('an explicitly unavailable WorkBuddy adapter shows the backend reason and s
   assert.equal(methods.includes('models.list'), false);
   assert.equal(methods.includes('session.create'), false);
 });
+
+test('read-only WorkBuddy history stays browsable without send, stop, model, create, answer or approval actions', async () => {
+  const capabilities = {
+    'sessions.list': true,
+    'session.read': true,
+    'session.send': true,
+    'session.send:workbuddy': false,
+    'session.stop': true,
+    'stop:workbuddy': false,
+    'models.list': true,
+    'models.list:workbuddy': false,
+    'session.create': true,
+    'session.create:workbuddy': false,
+    'session.answer': true,
+    'session.answer:workbuddy': false,
+    'session.approve': true,
+    'session.approve:workbuddy': false,
+    tools: ['workbuddy']
+  };
+  const read = {
+    id: 'saved-chat', tool: 'workbuddy', title: 'Saved WorkBuddy chat', status: 'working', canStop: true,
+    messages: [
+      { id: 'wb-user', role: 'user', text: '整理这段历史记录', timestamp: '2026-10-11T08:00:00Z' },
+      { id: 'wb-answer', role: 'assistant', text: '已完成 **整理**。', timestamp: '2026-10-11T08:00:03Z' },
+      { id: 'wb-tool', role: 'tool', text: '读取本地会话记录', timestamp: '2026-10-11T08:00:02Z' }
+    ],
+    pendingQuestions: [], pendingApprovals: []
+  };
+  const computer = {
+    clientId: 'workbuddy-readonly-pc', ownerName: 'Jo', clientName: 'Laptop', online: true,
+    capabilities,
+    tools: [{ id: 'workbuddy', available: true }]
+  };
+  const targets = {
+    [computer.clientId]: {
+      sessions: [{ id: read.id, tool: 'workbuddy', title: read.title, status: 'working' }],
+      capabilities,
+      read
+    }
+  };
+  const instance = await enterAdmin({ defaults: {
+    adminComputers: ok({ computers: [computer] }),
+    adminRpc: adminRpcFixture(targets)
+  } });
+  const { doc, app, api } = instance;
+  const open = byAttr(doc, 'data-client-id', computer.clientId)[0];
+  const card = harness.queryAll(doc.getElementById('admin-computer-list'),
+    (node) => node.classList.contains('admin-computer-card'))[0];
+  assert.ok(card);
+  assert.match(card.textContent, /WorkBuddy只读/, 'the ready adapter is distinguishable from an unavailable app');
+
+  open.dispatch('click');
+  await settle();
+  assert.equal(app.state.sessions[0].title, 'Saved WorkBuddy chat');
+  assert.equal(app.state.sessions[0].tool, 'workbuddy');
+  assert.match(byAttr(doc, 'data-id', 'saved-chat')[0].textContent, /只读/,
+    'the conversation list marks read-only tools using the selected target capability');
+  await app.openSession('saved-chat');
+  assert.equal(doc.getElementById('detail-title').textContent, 'Saved WorkBuddy chat');
+  assert.match(doc.getElementById('message-list').textContent, /已完成 \*\*整理\*\*/,
+    'historical messages use the ordinary readable conversation renderer');
+  assert.equal(doc.getElementById('composer').hidden, true);
+  assert.equal(doc.getElementById('workbuddy-readonly-note').hidden, false);
+  assert.equal(doc.getElementById('workbuddy-readonly-text').textContent,
+    '可查看本机会话；续聊和授权操作暂未接入。');
+  assert.equal(doc.getElementById('workbuddy-readonly-link').getAttribute('href'),
+    'https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice');
+  assert.equal(doc.getElementById('questions-panel').hidden, true,
+    'historical message text does not become an AI question form');
+  assert.equal(doc.getElementById('approvals-panel').hidden, true,
+    'historical message text does not become a permission approval');
+
+  await app.sendMessage('do not send');
+  await app.stopSession();
+  await app.submitAnswer(app.state.current, { callId: 'fake-call', questions: [] });
+  await app.submitApproval(app.state.current,
+    { id: 'fake-approval', toolName: 'shell', reason: 'historical text' }, 'allow-once');
+  await app.openNewSession();
+  await settle();
+  assert.equal(doc.getElementById('new-native-controls').hidden, true,
+    'read-only WorkBuddy does not display model or creation controls');
+  assert.equal(doc.getElementById('workbuddy-official-help').hidden, false);
+  assert.equal(doc.getElementById('workbuddy-official-help-text').textContent,
+    '可查看本机会话；续聊和授权操作暂未接入。');
+  const methods = api.callsOf('adminRpc').map((call) => call.args[0].body.method);
+  assert.ok(methods.every((method) => method === 'sessions.list' || method === 'session.read'),
+    'the read-only adapter receives no send, stop, model, create, answer or approval RPC');
+});
+
+test('a per-tool WorkBuddy send grant overrides a false shared default', async () => {
+  const capabilities = {
+    'sessions.list': true,
+    'session.read': true,
+    'session.send': false,
+    'session.send:workbuddy': true,
+    'models.list': false,
+    'session.create': false,
+    tools: ['workbuddy']
+  };
+  const read = {
+    id: 'writable-chat', tool: 'workbuddy', title: 'Writable WorkBuddy chat', status: 'idle',
+    messages: [], pendingQuestions: [], pendingApprovals: []
+  };
+  const { doc, app, api } = boot({
+    responses: {
+      list: ok({ sessions: [{ id: read.id, tool: 'workbuddy', title: read.title, status: 'idle' }], capabilities }),
+      read: [ok(read), ok(read)]
+    }
+  });
+  await app.start();
+  await app.openSession(read.id);
+  assert.equal(doc.getElementById('composer').hidden, false,
+    'the explicit per-tool capability enables WorkBuddy writing even when the generic default is false');
+  await app.sendMessage('续聊已获支持');
+  assert.equal(api.callsOf('send').length, 1);
+  assert.deepEqual(api.callsOf('send')[0].args[0], {
+    method: 'session.send', params: { tool: 'workbuddy', sessionId: read.id, text: '续聊已获支持' }
+  });
+});

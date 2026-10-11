@@ -280,10 +280,17 @@ func (s *Server) handleAdminComputers(w http.ResponseWriter, r *http.Request) {
 			}
 			tools = append(tools, tool)
 		}
+		rosterCaps := map[string]any{
+			"tools": caps.Tools, "toolStatus": caps.ToolStatus,
+			"sessions.list": caps.SessionsList, "session.read": caps.SessionRead, "session.send": caps.SessionSend,
+		}
+		if caps.SendWorkBuddy != nil {
+			rosterCaps["session.send:workbuddy"] = *caps.SendWorkBuddy
+		}
 		result = append(result, computerView{
 			ClientID: computer.ClientID, OwnerName: computer.OwnerName, ClientName: computer.ClientName,
 			Online: s.hub.ComputerOnline(computer.ClientID), LastSeen: computer.LastSeen,
-			Capabilities: map[string]any{"tools": caps.Tools, "toolStatus": caps.ToolStatus}, Tools: tools,
+			Capabilities: rosterCaps, Tools: tools,
 		})
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"computers": result}})

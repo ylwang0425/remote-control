@@ -109,6 +109,10 @@
       detailTruncated: byId('detail-truncated'),
       detailError: byId('detail-error'),
       messageList: byId('message-list'),
+      composer: byId('composer'),
+      workBuddyReadonlyNote: byId('workbuddy-readonly-note'),
+      workBuddyReadonlyText: byId('workbuddy-readonly-text'),
+      workBuddyReadonlyLink: byId('workbuddy-readonly-link'),
       sendInput: byId('send-input'),
       sendButton: byId('send-button'),
       stopButton: byId('stop-button'),
@@ -149,6 +153,7 @@
       toolChoices: byId('tool-choices'),
       newAvailability: byId('new-availability'),
       workBuddyOfficialHelp: byId('workbuddy-official-help'),
+      workBuddyOfficialHelpText: byId('workbuddy-official-help-text'),
       newNativeControls: byId('new-native-controls'),
       modelSelect: byId('model-select'),
       effortRow: byId('effort-row'),
@@ -513,8 +518,8 @@
       return text;
     }
 
-    function capabilityFor(prefix, tool) {
-      var capabilities = state.capabilities || {};
+    function capabilityForCapabilities(capabilities, prefix, tool) {
+      capabilities = capabilities || {};
       var toolStatus = capabilities.toolStatus && capabilities.toolStatus[tool];
       if (toolStatus && typeof toolStatus === 'object' && toolStatus.available === false) {
         return false;
@@ -524,6 +529,23 @@
         return capabilities[perTool] === true;
       }
       return capabilities[prefix] === true;
+    }
+
+    function capabilityFor(prefix, tool) {
+      return capabilityForCapabilities(state.capabilities, prefix, tool);
+    }
+
+    function toolIsReadOnly(tool) {
+      return capabilityFor('session.read', tool) && !capabilityFor('session.send', tool);
+    }
+
+    function stopCapabilityFor(tool) {
+      var capabilities = state.capabilities || {};
+      var legacyKey = 'stop:' + tool;
+      if (own(capabilities, legacyKey)) {
+        return capabilityForCapabilities(capabilities, 'stop', tool);
+      }
+      return capabilityForCapabilities(capabilities, 'session.stop', tool);
     }
 
     function availableToolIds() {
@@ -834,7 +856,12 @@
         if (!entry || typeof entry.id !== 'string') return;
         var chip = ui.make(document, 'span', 'admin-tool-chip', core.toolLabel(entry.id));
         chip.setAttribute('data-available', entry.available === true ? 'true' : 'false');
-        var status = entry.available === true ? '可用' : (entry.id === 'workbuddy' ? '未接入' : (entry.reason || '不可用'));
+        var readOnly = entry.available === true &&
+          capabilityForCapabilities(computer.capabilities, 'session.read', entry.id) &&
+          !capabilityForCapabilities(computer.capabilities, 'session.send', entry.id);
+        var status = entry.available !== true
+          ? (entry.id === 'workbuddy' ? '未接入' : (entry.reason || '不可用'))
+          : (readOnly ? '只读' : '可用');
         var stateText = ui.make(document, 'span', 'admin-tool-state', status);
         if (entry.reason) stateText.setAttribute('title', String(entry.reason));
         chip.appendChild(stateText);
@@ -1147,6 +1174,9 @@
       var tool = ui.span(document, 'tool tool-' + (session.tool || 'unknown'), core.toolLabel(session.tool));
       tool.setAttribute('data-tool', session.tool || '');
       meta.appendChild(tool);
+      if (toolIsReadOnly(session.tool)) {
+        meta.appendChild(ui.span(document, 'read-only-badge', '只读'));
+      }
 
       var project = core.sessionProject(session);
       if (project) {
@@ -1772,6 +1802,18 @@
     function renderDetail() {
       var current = state.current;
       if (!current) return;
+      var canSend = capabilityFor('session.send', current.tool);
+      if (el.composer) el.composer.hidden = !canSend;
+      if (el.workBuddyReadonlyNote) {
+        var workBuddyReadOnly = current.tool === 'workbuddy' && toolIsReadOnly(current.tool);
+        el.workBuddyReadonlyNote.hidden = canSend;
+        if (el.workBuddyReadonlyText) {
+          el.workBuddyReadonlyText.textContent = workBuddyReadOnly
+            ? '可查看本机会话；续聊和授权操作暂未接入。'
+            : '此工具暂不支持从手机续聊。';
+        }
+        if (el.workBuddyReadonlyLink) el.workBuddyReadonlyLink.hidden = !workBuddyReadOnly;
+      }
       if (el.detailTitle) el.detailTitle.textContent = current.title || '';
       if (el.detailStatus) {
         el.detailStatus.textContent = core.statusLabel(current.status);
@@ -2000,9 +2042,7 @@
      * "show/hide by canStop" wins and the button is hidden.
      */
     function stopButtonMode(current) {
-      var capabilities = state.capabilities;
-      var key = 'stop:' + current.tool;
-      var supported = !!(capabilities && capabilities[key] === true);
+      var supported = stopCapabilityFor(current.tool);
       if (!supported) return 'disabled';
       return core.canStopOf(current) ? 'enabled' : 'hidden';
     }
@@ -2582,7 +2622,7 @@
 
     /** Submit exactly one answer batch, once, for the batch on screen. */
     async function submitAnswer(current, batch) {
-      if (state.busyAnswer) return;
+      if (state.busyAnswer || !current || !capabilityFor('session.answer', current.tool)) return;
       var sessionId = current.id;
       var key = answerDraftKey(sessionId, batch.callId);
       var receipt = state.answerReceipts[key];
@@ -2626,7 +2666,7 @@
 
     /** Submit exactly one explicit decision for one exact live approval. */
     async function submitApproval(current, approval, decision) {
-      if (state.busyApprove) return;
+      if (state.busyApprove || !current || !capabilityFor('session.approve', current.tool)) return;
       var sessionId = current.id;
       var key = approvalReceiptKey(sessionId, approval.id);
       var receipt = state.approvalReceipts[key];
@@ -3105,7 +3145,7 @@
     async function sendMessage(text) {
       if (state.busySend) return; // duplicate-submit guard: one in flight only
       var current = state.current;
-      if (!current) return;
+      if (!current || !capabilityFor('session.send', current.tool)) return;
       var value = text === undefined ? (el.sendInput ? el.sendInput.value : '') : text;
       if (typeof value !== 'string' || value.trim() === '') return;
 
@@ -3149,7 +3189,7 @@
     async function stopSession() {
       if (state.busyStop) return;
       var current = state.current;
-      if (!current) return;
+      if (!current || !stopCapabilityFor(current.tool) || !core.canStopOf(current)) return;
       var context = captureRpcContext();
       if (current.scopeKey !== context.scope) return;
       state.busyStop = true;
@@ -3473,11 +3513,13 @@
 
       var workBuddyUsable = capabilityFor('models.list', 'workbuddy') && capabilityFor('session.create', 'workbuddy');
       var workBuddyReported = availableToolIds().indexOf('workbuddy') !== -1;
-      var workBuddyUnavailable = newState.tool === 'workbuddy' && !workBuddyUsable;
-      var options = workBuddyUnavailable ? [] : core.modelOptions(newState.catalog);
+      var workBuddyReadOnly = workBuddyReported && capabilityFor('session.read', 'workbuddy') &&
+        !capabilityFor('session.send', 'workbuddy');
+      var workBuddyCannotCreate = newState.tool === 'workbuddy' && !workBuddyUsable;
+      var options = workBuddyCannotCreate ? [] : core.modelOptions(newState.catalog);
       var availability = '';
       var ready = false;
-      if (workBuddyUnavailable) {
+      if (workBuddyCannotCreate) {
         availability = '';
       } else if (!capabilityFor('session.create', newState.tool)) {
         availability = toolStatusReason(newState.tool) || '这台电脑不支持新建会话。';
@@ -3495,16 +3537,21 @@
       }
 
       if (el.newAvailability) {
-        el.newAvailability.hidden = ready || workBuddyUnavailable;
+        el.newAvailability.hidden = ready || workBuddyCannotCreate;
         el.newAvailability.textContent = availability;
       }
       if (el.workBuddyOfficialHelp) {
         var workBuddyReason = toolStatusReason('workbuddy');
         el.workBuddyOfficialHelp.hidden = !workBuddyReported || workBuddyUsable;
         el.workBuddyOfficialHelp.setAttribute('title', !workBuddyUsable ? workBuddyReason : '');
+        if (el.workBuddyOfficialHelpText) {
+          el.workBuddyOfficialHelpText.textContent = workBuddyReadOnly
+            ? '可查看本机会话；续聊和授权操作暂未接入。'
+            : 'WorkBuddy 暂未接入此工作台。可在官方手机 App 登录与电脑相同的账号，继续已有聊天。';
+        }
       }
       if (el.newNativeControls) {
-        el.newNativeControls.hidden = workBuddyUnavailable;
+        el.newNativeControls.hidden = workBuddyCannotCreate;
       }
 
       // --- models: options come only from what the desktop reported ---
@@ -3642,6 +3689,7 @@
      */
     async function submitNewSession() {
       if (newState.busy) return;
+      if (!capabilityFor('models.list', newState.tool) || !capabilityFor('session.create', newState.tool)) return;
       var options = core.modelOptions(newState.catalog);
       var selected = core.modelOptionByKey(options, newState.selectedKey);
       if (!selected) return;
@@ -3788,7 +3836,7 @@
     async function retryFirstMessage() {
       var text = newState.pendingFirstText;
       var current = state.current;
-      if (!text || !current || state.busySend) return;
+      if (!text || !current || state.busySend || !capabilityFor('session.send', current.tool)) return;
       var context = captureRpcContext();
       if (context.scope !== current.scopeKey) return;
       state.busySend = true;

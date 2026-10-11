@@ -37,17 +37,20 @@
   回退到普通用户 RPC。
 - 管理员名册来自 `POST /api/admin/computers`（空 JSON 对象），按机主分组，每台电脑都按 `clientId`
   单独呈现，所以重复的机主名、电脑名不会合并。离线电脑继续显示，但不能打开。
-  卡片列出服务端报告的真实 AI 工具与可用状态；WorkBuddy 若当前不可用，会标示
-  「未接入」，原始服务端原因保留在状态提示中。
+  卡片列出服务端报告的真实 AI 工具与可用状态；能读会话但不能续聊的工具标示
+  「只读」，不可用的 WorkBuddy 标示「未接入」，原始服务端原因保留在状态提示中。
 - 管理员选择在线电脑后，原有会话、问题、单次审批、新建会话、模型和项目界面会
   通过 `POST /api/admin/rpc` 操作该 `clientId`。目标失效会明确失败，不会改投另一台
   电脑。顶部会显示机主和电脑名称，可随时返回名册。
 - 管理员可以主动生成一次性电脑登记码。只有点击生成后才请求
   `POST /api/admin/enrollment-codes` 并展示返回的码与有效期。
-- 当 WorkBuddy 尚未接入此工作台时，名册和新建会话页会提供官方
-  [多设备接入说明](https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice)。
-  用户可在 WorkBuddy 官方手机 App 登录与电脑相同的账号，继续已有聊天；此状态下
-  新建会话页不显示 WorkBuddy 模型和创建控件。Android 壳把外站 HTTPS 链接交给系统浏览器。
+- WorkBuddy 若报告可读能力，会话筛选和详情使用电脑返回的本地历史记录，Markdown 与
+  工具活动的展示方式和其他工具相同。`session.send:<tool>` 等逐工具能力覆盖通用能力：
+  只读 WorkBuddy 不显示消息输入、模型、新建、停止、回答或审批操作，并说明
+  「可查看本机会话；续聊和授权操作暂未接入」。该提示提供官方
+  [多设备接入说明](https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice)，
+  用户可在 WorkBuddy 官方手机 App 登录同一账号继续已有聊天；未接入的 WorkBuddy
+  仍会提示「未接入」并隐藏模型与创建控件。Android 壳把外站 HTTPS 链接交给系统浏览器。
 - **仅允许本次 / 拒绝**是针对电脑当前上报的单条执行权限请求；待答问题是 AI 对话
   上报的真实澄清表单。它们都必须先由电脑真实上报，手机只调用既有的
   `session.approve` / `session.answer`，不处理 AI 账号 API key，也不代替电脑确认结果。
@@ -117,6 +120,9 @@
   否则为 A 打了一半的字会被发到 B。
 - **晚到的回包**：`session.read` 的结果用「请求代际 + 目标 sessionId + 当前屏」
   三重校验，过期回包整包丢弃（`isStaleDetailResponse`）。
+- 发送受 `session.send:<tool>` 能力控制；若有逐工具位，它覆盖通用 `session.send`。
+  没有逐工具位时沿用通用能力，保持 Codex/DSH 旧能力清单兼容；不支持发送时直接
+  拦截发送与部分创建后的重发，避免隐藏控件仍能发出请求。
 - 停止按钮：能力位 `stop:<tool>` 为真且 `canStop === true` 才可用；
   电脑不支持该能力时按钮**保留但置灰**并给出中文原因。
 
@@ -238,7 +244,7 @@ D:\env\node.exe --test D:\workspace\codex-workspace\remote-control\mobile\tests\
 | `tests/core.test.js` | 原有纯逻辑（配对码、状态、body、折叠…） |
 | `tests/core-workbench.test.js` | 视图/工具/项目筛选、置顶、任务统计；**目录规范化与相等**（`canonicalPath`：分隔符 / 尾分隔符 / 大小写 / 首尾空白，以及根与空值）；**一组目录一个导航选项**（`mergeProjectOptions`：目录相同写法不同合并、真不同则分列、工具线索、同一 id 不重复）；`Codex` / `DSH` / `WorkBuddy` 工具显示名；`session.send` 的模型覆盖；`session.answer`/`session.approve` body；问题/审批投影与**边界拒绝**；`validateAnswers` 基数规则；`prefs` 往返与投毒存储 |
 | `tests/app.test.js` | 原有 UI 行为、两个异步竞态、模型下拉唯一值；会话卡片显示**产品名而不是线上 id** |
-| `tests/app-workbench.test.js` | 三视图、筛选、抽屉、置顶、主题、筛选记忆；**顶栏新建动作与「设置里唯一的退出登录」**（含 id 不变、列表内无整宽页脚按钮）；**同一目录两种写法只出现一行且带双工具线索**；**新建会话按所选工具解析 projectId**（含切工具重新解析、跨工具 id 拒绝提交）；模型芯片/选择器/effort；**问题作答一次性与竞态**；**相同轮询不重建控件 / 焦点与光标保留**；**表单变化则真重建、表单消失则控件移除、陈旧控件提交被拦**；**审批与模型控件不重绘**；草稿隔离、阅读位置、晚到回包；管理员名册身份、重复名称、在线/离线、真实工具状态、登记码；管理员登录/登出与密码清理；相同原生 id 跨电脑隔离；WorkBuddy 使用目标电脑的真实目录和模型；WorkBuddy 不可用时显示后端原因、官方多设备说明链接并隐藏模型/创建控件 |
+| `tests/app-workbench.test.js` | 三视图、筛选、抽屉、置顶、主题、筛选记忆；**顶栏新建动作与「设置里唯一的退出登录」**（含 id 不变、列表内无整宽页脚按钮）；**同一目录两种写法只出现一行且带双工具线索**；**新建会话按所选工具解析 projectId**（含切工具重新解析、跨工具 id 拒绝提交）；模型芯片/选择器/effort；**问题作答一次性与竞态**；**相同轮询不重建控件 / 焦点与光标保留**；**表单变化则真重建、表单消失则控件移除、陈旧控件提交被拦**；**审批与模型控件不重绘**；草稿隔离、阅读位置、晚到回包；管理员名册身份、重复名称、在线/离线、真实工具状态、登记码；管理员登录/登出与密码清理；相同原生 id 跨电脑隔离；WorkBuddy 使用目标电脑的真实目录和模型；不可用 WorkBuddy 的说明链接；只读 WorkBuddy 历史、能力门控与显式写入能力回归 |
 | `tests/workbench-server.test.js` | **真实 `api.js` + 真实本地 HTTP**（mock relay）：普通身份与管理员身份/名册、管理员精确目标 RPC 和离线拒绝、登记码、登出、问题/审批往返、过期拒绝、参数白名单、Origin/鉴权、静态页面字节 |
 | `tests/api.test.js` | HTTP 客户端契约；`/api/me`、管理员登录/登出、名册、精确目标 RPC 和显式登记码 |
 | `tests/source-guards.test.js` | 静态守卫（无注入、无 CDN、无秘密、Android 壳安全） |

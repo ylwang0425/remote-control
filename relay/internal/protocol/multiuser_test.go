@@ -57,3 +57,21 @@ func TestHelloValidatesStableIdentityAndExplicitToolStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestHelloPreservesExplicitWorkBuddyReadOnlySendingCapability(t *testing.T) {
+	frame, err := ParseFrame([]byte(`{"type":"hello","version":1,"clientName":"DESKTOP","capabilities":{"tools":["workbuddy"],"session.read":true,"session.send":true,"session.send:workbuddy":false}}`))
+	if err != nil || frame.ValidateHello() != nil {
+		t.Fatalf("valid read-only WorkBuddy hello was rejected: %v", err)
+	}
+	if frame.Capabilities.SendWorkBuddy == nil || *frame.Capabilities.SendWorkBuddy {
+		t.Fatal("explicit false was lost, enabling the legacy generic send capability")
+	}
+	encoded, err := json.Marshal(frame.Capabilities)
+	if err != nil || !strings.Contains(string(encoded), `"session.send:workbuddy":false`) {
+		t.Fatalf("read-only capability was not preserved: %s, %v", encoded, err)
+	}
+	legacy, err := ParseFrame([]byte(`{"type":"hello","version":1,"clientName":"DESKTOP","capabilities":{"tools":["codex"]}}`))
+	if err != nil || legacy.Capabilities.SendWorkBuddy != nil {
+		t.Fatalf("legacy absence should stay absent: %v", err)
+	}
+}

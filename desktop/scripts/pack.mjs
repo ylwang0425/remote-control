@@ -100,11 +100,13 @@ const README = `AI Remote —— Windows 电脑端桥接程序
 请把该文件设成只有你自己能读。token 只会发往服务器，出现在连接握手的请求头里；
 它不会出现在网址、日志或任何报告里。也可以用环境变量 AI_REMOTE_BRIDGE_TOKEN 代替。
 
-WorkBuddy 临时入口
+WorkBuddy 本地会话（只读）
 ------------------
-手机工作台提供 WorkBuddy 官方手机端接入说明。当前本桥接器尚无受信的原生会话控制通道，
-不会把 WorkBuddy 标为可操作，也不提供假的模型、提问或授权按钮。按官方说明在电脑端
-开启移动连接，并在官方手机 App 登录同一账号，可继续 WorkBuddy 的已有任务。
+手机工作台可读取此 Windows 用户在 WorkBuddy 中本地保存的会话和消息，支持 Markdown
+与折叠工具记录。程序只读打开 .workbuddy/workbuddy.db 和项目 JSONL，不会修改原数据。
+自定义数据目录可在私密配置中设置 workbuddy.configDir，或使用 WORKBUDDY_CONFIG_DIR。
+续聊、新建、模型与授权等执行操作暂未接入，界面会标注只读。需要这些操作时，可按官方
+说明在官方手机 App 登录与电脑相同的账号。只有本地保存的历史才会出现在此读取入口中。
 官方说明：https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice
 
 它能在这台电脑上做什么

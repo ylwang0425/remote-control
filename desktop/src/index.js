@@ -46,8 +46,8 @@ const { CreateLog, fingerprintOf } = require('./creates');
  */
 const CODEX_LIST_TIMEOUT_MS = 8000;
 const DSH_LIST_TIMEOUT_MS = 5000;
-const WORKBUDDY_UNAVAILABLE_REASON =
-  'WorkBuddy 未接入此桥接器的受信会话控制通道。已检视的本机接口依赖 WorkBuddy 内部上下文；当前本桥接器不能真实读取或操作它的会话、模型、项目、提问与审批。';
+const WORKBUDDY_UNAVAILABLE_REASON = '未找到可读取的 WorkBuddy 本地会话存储。';
+const WORKBUDDY_READ_ONLY_REASON = '可查看本机会话和消息；续聊、模型切换与授权操作暂未接入。';
 
 const VERSION = require('../package.json').version;
 
@@ -138,7 +138,7 @@ function selfCheck(config) {
   const major = Number(process.versions.node.split('.')[0]);
   add('node version', major >= 22, `v${process.versions.node} (needs 22 or newer)`);
 
-  for (const module of ['./ws', './bridge', './protocol', './errors', './framing', './dsh-events', './codex-context', './adapters/codex', './adapters/dsh', './ui/server']) {
+  for (const module of ['./ws', './bridge', './protocol', './errors', './framing', './dsh-events', './codex-context', './adapters/codex', './adapters/dsh', './adapters/workbuddy', './ui/server']) {
     try {
       require(module.startsWith('./adapters') || module === './ui/server' ? path.join(__dirname, module.slice(2)) : module);
       add(`module ${module}`, true, 'loads');
@@ -193,7 +193,7 @@ function selfCheck(config) {
  * rather than pretending.
  */
 function createDispatcher(config, log, factories = {}) {
-  const state = { codex: null, dsh: null, lastError: { codex: null, dsh: null } };
+  const state = { codex: null, dsh: null, workbuddy: null, lastError: { codex: null, dsh: null, workbuddy: null } };
   const createLog = new CreateLog({ path: config.createLogPath });
   /**
    * Numbers that were really measured, `null` wherever nothing has been measured
@@ -203,6 +203,7 @@ function createDispatcher(config, log, factories = {}) {
   const metrics = {
     codex: { tools: null, threads: null },
     dsh: { port: null, pid: null, sessions: null },
+    workbuddy: { sessions: null },
   };
 
   async function codex() {
@@ -232,6 +233,19 @@ function createDispatcher(config, log, factories = {}) {
     metrics.dsh.pid = described.pid ?? null;
     log(`dsh: backend on ${described.baseUrl}`);
     return state.dsh;
+  }
+
+  async function workbuddy() {
+    if (state.workbuddy !== null) return state.workbuddy;
+    const { WorkBuddyAdapter } = require('./adapters/workbuddy');
+    try {
+      state.workbuddy = await (factories.workbuddy ?? WorkBuddyAdapter.open)({ configDir: config.workbuddy?.configDir });
+      state.lastError.workbuddy = null;
+      return state.workbuddy;
+    } catch (error) {
+      state.lastError.workbuddy = safeMessage(error);
+      throw error;
+    }
   }
 
   async function pair(open) {
@@ -274,7 +288,7 @@ function createDispatcher(config, log, factories = {}) {
     };
   }
 
-  function capabilityToolStatus(codexAdapter, dshAdapter) {
+  function capabilityToolStatus(codexAdapter, dshAdapter, workbuddyAdapter) {
     return {
       codex: codexAdapter === null
         ? { available: false, reason: state.lastError.codex ?? 'no Codex app-tools pipe answered yet' }
@@ -282,16 +296,19 @@ function createDispatcher(config, log, factories = {}) {
       dsh: dshAdapter === null
         ? { available: false, reason: 'no DSH backend answered on loopback yet' }
         : { available: true },
-      workbuddy: { available: false, reason: WORKBUDDY_UNAVAILABLE_REASON },
+      workbuddy: workbuddyAdapter == null
+        ? { available: false, reason: state.lastError.workbuddy ?? WORKBUDDY_UNAVAILABLE_REASON }
+        : { available: true, reason: WORKBUDDY_READ_ONLY_REASON },
     };
   }
 
   async function capabilities() {
-    const [codexAdapter, dshAdapter] = await Promise.all([pair(codex), pair(dsh)]);
+    const [codexAdapter, dshAdapter, workbuddyAdapter] = await Promise.all([pair(codex), pair(dsh), pair(workbuddy)]);
     const tools = [];
     if (codexAdapter !== null) tools.push('codex');
     if (dshAdapter !== null) tools.push('dsh');
-    const toolStatus = capabilityToolStatus(codexAdapter, dshAdapter);
+    if (workbuddyAdapter !== null) tools.push('workbuddy');
+    const toolStatus = capabilityToolStatus(codexAdapter, dshAdapter, workbuddyAdapter);
     // No default-on: with no session source the hello carries an empty `tools`
     // and false bits, which is the contract's "connected but nothing to show".
     return buildCapabilities(tools, { ...capabilityOptions(codexAdapter, dshAdapter), toolStatus });
@@ -300,10 +317,8 @@ function createDispatcher(config, log, factories = {}) {
   function route(params, capabilitiesNow) {
     if (params.tool === 'codex') return { open: codex, stopTool: 'codex', capabilities: capabilitiesNow };
     if (params.tool === 'dsh') return { open: dsh, stopTool: 'dsh', capabilities: capabilitiesNow };
-    if (params.tool === 'workbuddy') {
-      throw new BridgeError('not_capable', 'WorkBuddy session control is unavailable on this desktop');
-    }
-    throw new BridgeError('invalid_params', 'params.tool must be "codex" or "dsh"');
+    if (params.tool === 'workbuddy') return { open: workbuddy, stopTool: 'workbuddy', capabilities: capabilitiesNow };
+    throw new BridgeError('invalid_params', 'params.tool must be "codex", "dsh" or "workbuddy"');
   }
 
   /**
@@ -346,6 +361,11 @@ function createDispatcher(config, log, factories = {}) {
   }
 
   async function dispatch({ method, params }) {
+    // The local WorkBuddy archive exposes no native execution channel. Refuse
+    // every write before catalog/create routing could select another adapter.
+    if (params.tool === 'workbuddy' && method !== 'sessions.list' && method !== 'session.read') {
+      throw new BridgeError('not_capable', WORKBUDDY_READ_ONLY_REASON);
+    }
     if (method === 'models.list') {
       const adapter = await pair(params.tool === 'codex' ? codex : dsh);
       if (adapter === null) {
@@ -434,21 +454,20 @@ function createDispatcher(config, log, factories = {}) {
     }
 
     if (method === 'sessions.list') {
-      if (params.tool === 'workbuddy') {
-        throw new BridgeError('not_capable', 'WorkBuddy sessions are unavailable on this desktop');
-      }
-      const [codexAdapter, dshAdapter] = await Promise.all([pair(codex), pair(dsh)]);
+      const [codexAdapter, dshAdapter, workbuddyAdapter] = await Promise.all([pair(codex), pair(dsh), pair(workbuddy)]);
       const tools = [];
       if (codexAdapter !== null) tools.push('codex');
       if (dshAdapter !== null) tools.push('dsh');
+      if (workbuddyAdapter !== null) tools.push('workbuddy');
       const sessions = [];
       const capabilitiesNow = buildCapabilities(tools, {
         ...capabilityOptions(codexAdapter, dshAdapter),
-        toolStatus: capabilityToolStatus(codexAdapter, dshAdapter),
+        toolStatus: capabilityToolStatus(codexAdapter, dshAdapter, workbuddyAdapter),
       });
       for (const [tool, adapter] of [
         ['codex', codexAdapter],
         ['dsh', dshAdapter],
+        ['workbuddy', workbuddyAdapter],
       ]) {
         if (adapter === null) continue;
         // Each source answers under its own deadline and falls back to its own
@@ -487,6 +506,7 @@ function createDispatcher(config, log, factories = {}) {
         // A native permission approval only ever exists on the adapter's own
         // native event stream; absent means this bridge saw none.
         pendingApprovals: session.pendingApprovals,
+        historyTruncated: session.historyTruncated,
       });
     }
     if (method === 'session.send') {
@@ -559,8 +579,14 @@ function createDispatcher(config, log, factories = {}) {
     } catch {
       // already gone
     }
+    try {
+      state.workbuddy?.close();
+    } catch {
+      // already gone
+    }
     state.codex = null;
     state.dsh = null;
+    state.workbuddy = null;
   }
 
   /**
@@ -585,7 +611,12 @@ function createDispatcher(config, log, factories = {}) {
         sessions: metrics.dsh.sessions,
         reason: state.dsh === null ? 'no DSH backend answered on loopback yet' : null,
       },
-      workbuddy: { available: false, reason: WORKBUDDY_UNAVAILABLE_REASON },
+      workbuddy: {
+        available: state.workbuddy !== null,
+        sessions: metrics.workbuddy.sessions,
+        readOnly: true,
+        reason: state.workbuddy === null ? state.lastError.workbuddy ?? WORKBUDDY_UNAVAILABLE_REASON : WORKBUDDY_READ_ONLY_REASON,
+      },
     }),
   };
 }
@@ -644,7 +675,7 @@ async function run(config, args, log) {
       const toolStatus = {
         codex: described.codex.available ? { available: true } : { available: false, reason: described.codex.reason },
         dsh: described.dsh.available ? { available: true } : { available: false, reason: described.dsh.reason },
-        workbuddy: { available: false, reason: WORKBUDDY_UNAVAILABLE_REASON },
+        workbuddy: { available: described.workbuddy.available, reason: described.workbuddy.reason },
       };
       // If the combined session list itself failed, membership is unknown. Do
       // not claim any configured tool as an opened native session adapter.

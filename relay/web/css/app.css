@@ -296,6 +296,15 @@ body {
 
 .workbuddy-official-help p { margin: 0; }
 
+.workbuddy-readonly-note {
+  position: sticky;
+  bottom: 0;
+  flex: none;
+  margin: 0;
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+  background: var(--bg);
+}
+
 .workbuddy-official-link {
   display: inline-flex;
   align-items: center;
@@ -631,6 +640,18 @@ button.wide { width: 100%; margin-top: 20px; }
   border-radius: 999px;
   background: color-mix(in srgb, var(--accent) 18%, var(--surface));
   color: var(--accent);
+}
+
+.read-only-badge {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
 }
 
 .session-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 13px; color: var(--muted); }
@@ -1312,6 +1333,8 @@ main {
      the scrolling. The floor is dropped so the message list cannot force the
      composer out of the shell. */
   .message-list { flex: none; min-height: 0; }
+
+  .workbuddy-readonly-note { position: static; }
 
   #detail-screen > .pending-panel { flex: none; }
 

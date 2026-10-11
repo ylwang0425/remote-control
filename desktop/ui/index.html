@@ -223,7 +223,8 @@
     if (!workbuddy || workbuddy.available !== true) {
       return { text: '不可用 — ' + ((workbuddy && workbuddy.reason) || '没有接入原生会话控制通道'), className: 'warn' };
     }
-    return { text: '已连接', className: 'ok' };
+    const count = Number.isFinite(workbuddy.sessions) ? ' — ' + String(workbuddy.sessions) + ' 条本地会话' : '';
+    return { text: '已接入（只读）' + count, className: 'ok' };
   }
 
   function showIdentityResult(text, className) {

@@ -65,6 +65,7 @@ function makeDispatcher(codexAdapter, dshAdapter) {
   return createDispatcher(config, () => {}, {
     codex: async () => codexAdapter,
     dsh: async () => dshAdapter,
+    workbuddy: async () => { throw new Error('未找到可读取的 WorkBuddy 本地会话存储'); },
   });
 }
 
@@ -283,7 +284,7 @@ test('WorkBuddy remains visible as unavailable without inventing sessions or dec
     const listed = await dispatcher.dispatch({ method: 'sessions.list', params: {} });
     assert.deepEqual(listed.capabilities.tools, ['codex', 'dsh'], 'only opened adapters count as session sources');
     assert.equal(listed.capabilities.toolStatus.workbuddy.available, false);
-    assert.match(listed.capabilities.toolStatus.workbuddy.reason, /未接入此桥接器的受信会话控制通道/);
+    assert.match(listed.capabilities.toolStatus.workbuddy.reason, /未找到可读取/);
     for (const capability of [
       'stop:workbuddy',
       'session.send:model:workbuddy',
@@ -298,7 +299,8 @@ test('WorkBuddy remains visible as unavailable without inventing sessions or dec
       method: 'session.answer',
       params: { tool: 'workbuddy', sessionId: 'wb-1', callId: 'native-call-1', answers: [{ id: 'q-1', selected: ['yes'] }] },
     }).catch((error) => error);
-    assert.equal(sessions.code, 'not_capable');
+    assert.deepEqual(sessions.sessions, []);
+    assert.equal(sessions.capabilities.toolStatus.workbuddy.available, false);
     const approval = await dispatcher.dispatch({
       method: 'session.approve',
       params: { tool: 'workbuddy', sessionId: 'wb-1', approvalId: '11111111-2222-4333-8444-555555555555', decision: 'allow-once' },
@@ -324,6 +326,7 @@ test('Codex context discovery failures remain visible as honest unavailable reas
   const dispatcher = createDispatcher(config, () => {}, {
     codex: async () => { throw new Error(reason); },
     dsh: async () => fakeAdapter(),
+    workbuddy: async () => { throw new Error('WorkBuddy not installed in this fixture'); },
   });
   try {
     const listed = await dispatcher.dispatch({ method: 'sessions.list', params: {} });

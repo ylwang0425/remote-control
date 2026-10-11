@@ -47,12 +47,15 @@ const (
 // real pending state plus an instruction to act at the computer, never a
 // button.
 type Capabilities struct {
-	SessionsList  bool     `json:"sessions.list"`
-	SessionRead   bool     `json:"session.read"`
-	SessionSend   bool     `json:"session.send"`
-	SessionStop   bool     `json:"session.stop"`
-	ModelsList    bool     `json:"models.list"`
-	SessionCreate bool     `json:"session.create"`
+	SessionsList  bool `json:"sessions.list"`
+	SessionRead   bool `json:"session.read"`
+	SessionSend   bool `json:"session.send"`
+	SessionStop   bool `json:"session.stop"`
+	ModelsList    bool `json:"models.list"`
+	SessionCreate bool `json:"session.create"`
+	// An optional per-tool override distinguishes a local history reader from
+	// a tool that can continue a conversation. Nil preserves legacy clients.
+	SendWorkBuddy *bool    `json:"session.send:workbuddy,omitempty"`
 	StopCodex     bool     `json:"stop:codex"`
 	StopDSH       bool     `json:"stop:dsh"`
 	Tools         []string `json:"tools"`

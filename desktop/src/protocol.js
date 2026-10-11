@@ -471,7 +471,7 @@ function buildCapabilities(tools, options = {}) {
   const capabilities = {
     'sessions.list': any,
     'session.read': any,
-    'session.send': any,
+    'session.send': has('codex') || has('dsh') || flag('sendWorkbuddy', 'workbuddy'),
     'session.stop': any,
     'stop:codex': has('codex') ? options.stopCodex !== false : false,
     'stop:dsh': has('dsh') ? options.stopDsh !== false : false,
@@ -480,12 +480,18 @@ function buildCapabilities(tools, options = {}) {
     // session source and really implements them.
     'models.list': any && options.modelsList === true,
     'session.create': any && options.sessionCreate === true,
+    'models.list:workbuddy': flag('modelsListWorkbuddy', 'workbuddy'),
+    'session.create:workbuddy': flag('sessionCreateWorkbuddy', 'workbuddy'),
     // CRD 0008: per-tool, because one tool can carry the model override and the
     // other cannot. Absent/false means "no model picker for this tool", while a
     // plain send without a model keeps working exactly as before.
     'session.send:model:codex': flag('sendModelCodex', 'codex'),
     'session.send:model:dsh': flag('sendModelDsh', 'dsh'),
     'session.send:model:workbuddy': flag('sendModelWorkbuddy', 'workbuddy'),
+    // WorkBuddy's local history projection is read-only. Keep this explicit
+    // false so the phone can disable the per-tool composer even though other
+    // session sources on the same bridge accept messages.
+    'session.send:workbuddy': flag('sendWorkbuddy', 'workbuddy'),
     // CRD 0008: whether this desktop can hand a real answer back to a native
     // question. False is honest for a tool with no answer path at all.
     'session.answer:codex': flag('answerCodex', 'codex'),
@@ -778,7 +784,7 @@ function selectMessages(messages) {
 }
 
 /** §9.2. `activeTurnId` is present only while the session is working. */
-function buildSessionReadResult({ id, tool, title, status, messages, canStop, activeTurnId, currentModel, pendingQuestions, pendingApprovals }) {
+function buildSessionReadResult({ id, tool, title, status, messages, canStop, activeTurnId, currentModel, pendingQuestions, pendingApprovals, historyTruncated }) {
   if (!isSessionId(id)) {
     throw protocolError('bridge_error', 'the session id is not a valid session id');
   }
@@ -791,6 +797,7 @@ function buildSessionReadResult({ id, tool, title, status, messages, canStop, ac
     throw protocolError('bridge_error', 'a working session must report an activeTurnId');
   }
   const result = { id, tool, title, status, messages: selectMessages(messages), canStop };
+  if (historyTruncated === true || messages.length > MAX_MESSAGES) result.historyTruncated = true;
   if (status === 'working') {
     result.activeTurnId = activeTurnId;
   }

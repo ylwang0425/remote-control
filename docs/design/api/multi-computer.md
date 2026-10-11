@@ -92,3 +92,10 @@ decisions remain `allow-once` or `reject`, with honest `submitted`/`confirmed`
 receipts and no automatic retries. Every displayed question/approval must come
 from an actual native event. Unsupported tools advertise false capability bits.
 No CLI session is substituted for an already-open desktop conversation.
+
+WorkBuddy's local archive adapter declares `session.send:workbuddy:false` while
+remaining available for listing and reading. The optional per-tool sending flag
+is preserved in hello, stored capabilities and the administrator roster. It
+overrides the shared send flag; older tools without an override keep their
+existing behavior. WorkBuddy model/create/stop/answer/approval flags remain
+false. Historical tool entries never become native pending permission controls.

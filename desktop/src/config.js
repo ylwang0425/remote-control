@@ -25,6 +25,7 @@ const DEFAULTS = Object.freeze({
   bridgeToken: null,
   codex: { pipePath: null, contextThreadId: null },
   dsh: { port: null },
+  workbuddy: { configDir: null },
   tools: ['codex', 'dsh'],
   autoStartBridge: true,
 });
@@ -105,6 +106,9 @@ function loadConfig(options = {}) {
     dsh: {
       port: asNumber(env.AI_REMOTE_DSH_PORT ?? fromFile.dsh?.port ?? null, null),
     },
+    workbuddy: {
+      configDir: (env.WORKBUDDY_CONFIG_DIR ?? fromFile.workbuddy?.configDir ?? path.join(os.homedir(), '.workbuddy')),
+    },
     tools: Array.isArray(fromFile.tools) && fromFile.tools.length > 0 ? fromFile.tools : DEFAULTS.tools,
     autoStartBridge:
       env.AI_REMOTE_NO_BRIDGE === '1' ? false : (fromFile.autoStartBridge ?? DEFAULTS.autoStartBridge),
@@ -170,6 +174,9 @@ function redactedConfig(config) {
     codex: {
       ...config.codex,
       contextThreadId: config.codex?.contextThreadId == null ? null : '<set>',
+    },
+    workbuddy: {
+      configured: typeof config.workbuddy?.configDir === 'string',
     },
   };
 }

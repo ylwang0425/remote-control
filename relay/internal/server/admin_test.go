@@ -347,6 +347,52 @@ func TestEnrollmentAdminRPCTargetingWorkBuddyAndMetadataOnlyAudit(t *testing.T) 
 	}
 }
 
+func TestAdminRosterPreservesWorkBuddyReadOnlyCapability(t *testing.T) {
+	e := newAdminEnv(t)
+	readOnly := false
+	_ = e.helloBridge(protocol.Capabilities{
+		Tools: []string{"codex", "workbuddy"}, SessionsList: true, SessionRead: true, SessionSend: true, SendWorkBuddy: &readOnly,
+		ToolStatus: map[string]protocol.ToolStatus{"workbuddy": {Available: true, Reason: "local history only"}},
+	})
+	resp, token := adminLogin(e, testAdminUsername, testAdminPassword)
+	if resp.StatusCode != http.StatusOK || token == "" {
+		t.Fatal("administrator login failed")
+	}
+	response := e.request(http.MethodPost, "/api/admin/computers", testOrigin, "application/json", adminCookieName+"="+token, `{}`)
+	var body struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Computers []struct {
+				Capabilities map[string]json.RawMessage `json:"capabilities"`
+				Tools        []struct {
+					ID        string `json:"id"`
+					Available bool   `json:"available"`
+				} `json:"tools"`
+			} `json:"computers"`
+		} `json:"result"`
+	}
+	defer response.Body.Close()
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !body.OK || len(body.Result.Computers) != 1 {
+		t.Fatalf("unexpected administrator roster status/size: %d/%d", response.StatusCode, len(body.Result.Computers))
+	}
+	computer := body.Result.Computers[0]
+	if string(computer.Capabilities["session.send:workbuddy"]) != "false" {
+		t.Fatal("roster lost the explicit false sending capability")
+	}
+	if string(computer.Capabilities["session.read"]) != "true" || string(computer.Capabilities["session.send"]) != "true" {
+		t.Fatal("roster omitted the shared method capabilities needed to interpret the per-tool override")
+	}
+	for _, tool := range computer.Tools {
+		if tool.ID == "workbuddy" && tool.Available {
+			return
+		}
+	}
+	t.Fatal("a readable WorkBuddy history adapter was incorrectly unavailable")
+}
+
 func TestAdminRPCTargetOfflineNeverFallsBackToAnotherOnlineComputer(t *testing.T) {
 	e := newAdminEnv(t)
 	_, adminToken := adminLogin(e, testAdminUsername, testAdminPassword)
