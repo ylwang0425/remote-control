@@ -313,3 +313,25 @@ test('WorkBuddy remains visible as unavailable without inventing sessions or dec
     dispatcher.close();
   }
 });
+
+test('Codex context discovery failures remain visible as honest unavailable reasons', async () => {
+  const config = {
+    createLogPath: path.join(os.tmpdir(), `ai-remote-dispatch-${crypto.randomUUID()}`, 'creates.json'),
+    codex: { pipePath: null, contextThreadId: null },
+    dsh: { port: null },
+  };
+  const reason = '未找到可用的本机 Codex 对话上下文。请先打开一条本机对话。';
+  const dispatcher = createDispatcher(config, () => {}, {
+    codex: async () => { throw new Error(reason); },
+    dsh: async () => fakeAdapter(),
+  });
+  try {
+    const listed = await dispatcher.dispatch({ method: 'sessions.list', params: {} });
+    assert.deepEqual(listed.capabilities.tools, ['dsh']);
+    assert.equal(listed.capabilities.toolStatus.codex.available, false);
+    assert.equal(listed.capabilities.toolStatus.codex.reason, reason);
+    assert.equal(dispatcher.describe().codex.reason, reason);
+  } finally {
+    dispatcher.close();
+  }
+});

@@ -167,6 +167,10 @@ function redactedConfig(config) {
   return {
     ...config,
     bridgeToken: config.bridgeToken === null ? null : '<set>',
+    codex: {
+      ...config.codex,
+      contextThreadId: config.codex?.contextThreadId == null ? null : '<set>',
+    },
   };
 }
 

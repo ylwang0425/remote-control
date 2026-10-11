@@ -311,6 +311,8 @@ test('config: defaults, file values and environment overrides', async () => {
     const rendered = JSON.stringify(redactedConfig(fromFile));
     assert.ok(!rendered.includes('from-file-token'), 'the token never appears in a printable config');
     assert.equal(redactedConfig(fromFile).bridgeToken, '<set>');
+    const contextConfig = redactedConfig({ ...fromFile, codex: { pipePath: null, contextThreadId: 'local-thread-id' } });
+    assert.equal(contextConfig.codex.contextThreadId, '<set>', 'thread identifiers are not written to startup logs');
     assert.ok(configPath({ env: { AI_REMOTE_CONFIG: file } }).endsWith(path.basename(file)));
   } finally {
     fs.unlinkSync(file);

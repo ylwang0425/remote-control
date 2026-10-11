@@ -138,7 +138,7 @@ function selfCheck(config) {
   const major = Number(process.versions.node.split('.')[0]);
   add('node version', major >= 22, `v${process.versions.node} (needs 22 or newer)`);
 
-  for (const module of ['./ws', './bridge', './protocol', './errors', './framing', './dsh-events', './adapters/codex', './adapters/dsh', './ui/server']) {
+  for (const module of ['./ws', './bridge', './protocol', './errors', './framing', './dsh-events', './codex-context', './adapters/codex', './adapters/dsh', './ui/server']) {
     try {
       require(module.startsWith('./adapters') || module === './ui/server' ? path.join(__dirname, module.slice(2)) : module);
       add(`module ${module}`, true, 'loads');
@@ -208,13 +208,19 @@ function createDispatcher(config, log, factories = {}) {
   async function codex() {
     if (state.codex !== null) return state.codex;
     const { CodexAdapter } = require('./adapters/codex');
-    state.codex = await (factories.codex ?? CodexAdapter.open)({
-      pipePath: config.codex.pipePath,
-      contextThreadId: config.codex.contextThreadId,
-    });
-    metrics.codex.tools = state.codex.availableTools().length;
-    log(`codex: pipe ${metrics.codex.tools} tools (${state.codex.availableTools().join(', ')})`);
-    return state.codex;
+    try {
+      state.codex = await (factories.codex ?? CodexAdapter.open)({
+        pipePath: config.codex.pipePath,
+        contextThreadId: config.codex.contextThreadId,
+      });
+      state.lastError.codex = null;
+      metrics.codex.tools = state.codex.availableTools().length;
+      log(`codex: pipe ${metrics.codex.tools} tools (${state.codex.availableTools().join(', ')})`);
+      return state.codex;
+    } catch (error) {
+      state.lastError.codex = safeMessage(error);
+      throw error;
+    }
   }
 
   async function dsh() {
@@ -271,7 +277,7 @@ function createDispatcher(config, log, factories = {}) {
   function capabilityToolStatus(codexAdapter, dshAdapter) {
     return {
       codex: codexAdapter === null
-        ? { available: false, reason: 'no Codex app-tools pipe answered yet' }
+        ? { available: false, reason: state.lastError.codex ?? 'no Codex app-tools pipe answered yet' }
         : { available: true },
       dsh: dshAdapter === null
         ? { available: false, reason: 'no DSH backend answered on loopback yet' }
@@ -570,7 +576,7 @@ function createDispatcher(config, log, factories = {}) {
         available: state.codex !== null,
         tools: metrics.codex.tools,
         threads: metrics.codex.threads,
-        reason: state.codex === null ? 'no Codex app-tools pipe answered yet' : null,
+        reason: state.codex === null ? state.lastError.codex ?? 'no Codex app-tools pipe answered yet' : null,
       },
       dsh: {
         available: state.dsh !== null,

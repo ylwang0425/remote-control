@@ -28,6 +28,7 @@ const crypto = require('node:crypto');
 const { FrameDecoder, encodeFrame } = require('../framing');
 const { BridgeError, safeMessage } = require('../errors');
 const { toRfc3339 } = require('../protocol');
+const { resolveCodexContext } = require('../codex-context');
 
 /** server.mjs `MAX_FRAME_BYTES`: the app-tools pipe allows 8 MiB frames. */
 const PIPE_MAX_FRAME_BYTES = 8 * 1024 * 1024;
@@ -643,7 +644,7 @@ class CodexPipeClient {
  * with the tools this adapter needs. The environment variable is only ever a
  * preference, never a requirement.
  *
- * @param {{pipePath?: string, contextThreadId?: string, timeoutMs?: number, candidates?: string[]}} options
+ * @param {{pipePath?: string, contextThreadId?: string, timeoutMs?: number, candidates?: string[], contextDiscovery?: object}} options
  */
 async function openCodexAdapter(options) {
   const configured = options.pipePath ?? null;
@@ -655,9 +656,14 @@ async function openCodexAdapter(options) {
       candidates.push(candidate);
     }
   }
-  const contextThreadId = options.contextThreadId ?? process.env.CODEX_THREAD_ID ?? process.env.CODEX_SESSION_ID ?? null;
-  if (contextThreadId === null || contextThreadId === '') {
-    throw new BridgeError('bridge_error', 'no Codex context thread id was given');
+  const context = resolveCodexContext({
+    configured: options.contextThreadId,
+    env: options.contextEnv ?? process.env,
+    discoveryOptions: options.contextDiscovery,
+  });
+  const contextThreadId = context.contextThreadId;
+  if (contextThreadId === null) {
+    throw new BridgeError('bridge_error', context.reason);
   }
   const failures = [];
   // Probing is a preference test, not a real call: a pipe that is idle or half

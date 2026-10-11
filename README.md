@@ -66,6 +66,8 @@ node desktop/src/index.js
 
 Save the computer name, enroll it, generate a one-use pairing code and enter it on the phone. Keep the bridge and desktop AI applications running. The bootstrap credential is durably pinned to one computer; additional computers enroll with independent credentials.
 
+A bridge started from Explorer can discover its calling context from the current user's local Codex metadata index in read-only mode. It selects an existing desktop user thread without creating a chat or reading transcript content; explicit configuration keeps precedence. Discovery requires Node 22.13+, included in the portable package. Unsupported indexes or missing local chats produce a setup explanation.
+
 ## Administrator and multiple computers
 
 Initialize the first administrator on the server with `ai-remote-relay --init-admin --config /etc/ai-remote-relay/relay.json --admin-username admin`, providing an independent password on stdin. The command refuses to overwrite an existing administrator and stores only a salted PBKDF2-SHA256 verifier (310,000 iterations); passwords are not command-line arguments.
