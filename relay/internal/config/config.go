@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // Config is the on-disk relay configuration. The generated file is private
@@ -26,6 +27,7 @@ type Config struct {
 	PublicOrigin   string   `json:"publicOrigin"`
 	AllowedOrigins []string `json:"allowedOrigins"`
 	BridgeToken    string   `json:"bridgeToken"`
+	Admin          *Admin   `json:"admin,omitempty"`
 
 	DBPath       string `json:"dbPath"`
 	WebDir       string `json:"webDir"`
@@ -39,6 +41,14 @@ type Config struct {
 	// refused by Validate unless the operator opted in explicitly.
 	AllowInsecureCookie bool `json:"allowInsecureCookie"`
 	AllowInsecureOrigin bool `json:"allowInsecureOrigin"`
+}
+
+// Admin contains only a username and a salted password verifier. Plaintext is
+// accepted only through the local --init-admin command and is never persisted.
+type Admin struct {
+	Username     string `json:"username"`
+	PasswordSalt string `json:"passwordSalt"`
+	PasswordHash string `json:"passwordHash"`
 }
 
 const (
@@ -169,6 +179,24 @@ func Validate(c *Config) error {
 	}
 	if len(c.BridgeToken) < 40 {
 		return errors.New("bridgeToken is too short; re-run --init")
+	}
+	if c.Admin != nil {
+		if strings.TrimSpace(c.Admin.Username) != c.Admin.Username || c.Admin.Username == "" || len(c.Admin.Username) > 128 {
+			return errors.New("admin.username must be a trimmed 1–128 character value")
+		}
+		for _, r := range c.Admin.Username {
+			if unicode.IsControl(r) {
+				return errors.New("admin.username contains a control character")
+			}
+		}
+		salt, err := base64.StdEncoding.DecodeString(c.Admin.PasswordSalt)
+		if err != nil || len(salt) < 16 || len(salt) > 64 {
+			return errors.New("admin.passwordSalt must be base64 of 16–64 random bytes")
+		}
+		hash, err := base64.StdEncoding.DecodeString(c.Admin.PasswordHash)
+		if err != nil || len(hash) != 32 {
+			return errors.New("admin.passwordHash must be base64 of a 32-byte PBKDF2-SHA256 verifier")
+		}
 	}
 	if c.ListenAddr == "" {
 		return errors.New("listenAddr is empty")

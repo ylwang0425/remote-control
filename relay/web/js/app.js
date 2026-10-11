@@ -55,6 +55,10 @@
 
     var el = {
       appbar: byId('appbar'),
+      appbarTitle: byId('appbar-title'),
+      adminContext: byId('admin-context'),
+      adminContextName: byId('admin-context-name'),
+      adminContextBack: byId('admin-context-back'),
       tabbar: byId('tabbar'),
       tabChats: byId('tab-chats'),
       tabTasks: byId('tab-tasks'),
@@ -62,6 +66,7 @@
       tabSettings: byId('tab-settings'),
       loading: byId('loading-screen'),
       pair: byId('pair-screen'),
+      pairUserForm: byId('pair-user-form'),
       list: byId('list-screen'),
       detail: byId('detail-screen'),
       settings: byId('settings-screen'),
@@ -69,6 +74,21 @@
       pairName: byId('pair-name-input'),
       pairSubmit: byId('pair-submit'),
       pairError: byId('pair-error'),
+      pairAdminLoginToggle: byId('pair-admin-login-toggle'),
+      adminLoginPanel: byId('admin-login-panel'),
+      adminUsername: byId('admin-username-input'),
+      adminPassword: byId('admin-password-input'),
+      adminLoginSubmit: byId('admin-login-submit'),
+      adminLoginBack: byId('admin-login-back'),
+      adminLoginError: byId('admin-login-error'),
+      adminRoster: byId('admin-roster-screen'),
+      adminRosterError: byId('admin-roster-error'),
+      adminRosterEmpty: byId('admin-roster-empty'),
+      adminComputerList: byId('admin-computer-list'),
+      adminToolFilter: byId('admin-tool-filter'),
+      adminLogout: byId('admin-logout-button'),
+      adminEnrollmentButton: byId('admin-enrollment-button'),
+      adminEnrollmentResult: byId('admin-enrollment-result'),
       search: byId('search-input'),
       toolFilter: byId('tool-filter'),
       projectFilterButton: byId('project-filter-button'),
@@ -115,6 +135,8 @@
       pinsSummary: byId('pins-summary'),
       pinsClearButton: byId('pins-clear-button'),
       settingsVersion: byId('settings-version'),
+      accountSummary: byId('account-summary'),
+      settingsAdminLogin: byId('settings-admin-login'),
       sheetBackdrop: byId('sheet-backdrop'),
       projectSheet: byId('project-sheet'),
       projectSheetClose: byId('project-sheet-close'),
@@ -126,6 +148,8 @@
       newBack: byId('new-back'),
       toolChoices: byId('tool-choices'),
       newAvailability: byId('new-availability'),
+      workBuddyOfficialHelp: byId('workbuddy-official-help'),
+      newNativeControls: byId('new-native-controls'),
       modelSelect: byId('model-select'),
       effortRow: byId('effort-row'),
       effortSelect: byId('effort-select'),
@@ -167,6 +191,16 @@
       // status: a fresh device whose first call fails for any reason at all
       // (401, 403, 501 from a proxy, no network) must still be able to pair.
       authed: false,
+      admin: false,
+      identity: null,
+      selectedComputer: null,
+      adminComputers: [],
+      adminRosterFilter: 'all',
+      adminRosterLoading: false,
+      adminRosterError: '',
+      adminLoginBusy: false,
+      adminReturnScreen: 'pair',
+      userWasPairedBeforeAdmin: false,
       inflight: false,
       busySend: false,
       busyStop: false,
@@ -189,15 +223,17 @@
       answerDrafts: {},
       answerReceipts: {},
       approvalReceipts: {},
-      timer: null
+      timer: null,
+      lastRosterMs: 0
     };
 
 
     // Requests currently in flight, and a generation counter for the detail
     // view. The counter is what lets a late answer for session A be recognised
     // as stale after the user has moved to session B (or back to the list).
-    var pendingRequests = 0;
+    var pendingByScope = {};
     var detailRequestSeq = 0;
+    var scopeGeneration = 0;
     // The new-session panel: which tool is chosen, what the desktop reported,
     // and the generation counters that make a late answer harmless.
     var newPanelSeq = 0;
@@ -208,7 +244,9 @@
       // One catalog per tool, so switching back and forth does not re-fetch in
       // a loop and a project chosen for one tool is still nameable.
       catalogs: {},
+      catalogsByScope: {},
       projectNames: {},
+      projectNamesByScope: {},
       loading: false,
       // One creation attempt = one requestId. It is reused when the user
       // retries the SAME attempt so the desktop can de-duplicate, and replaced
@@ -218,6 +256,84 @@
       partial: null
     };
 
+    function currentScopeKey() {
+      if (state.admin) {
+        return 'admin:' + (state.selectedComputer && state.selectedComputer.clientId
+          ? String(state.selectedComputer.clientId) : 'roster');
+      }
+      var identity = state.identity || {};
+      return 'user:' + (identity.clientId ? String(identity.clientId) : 'paired');
+    }
+
+    function scopedSessionKey(sessionId, scope) {
+      var key = scope || currentScopeKey();
+      return key.length + ':' + key + ':' + String(sessionId);
+    }
+
+    function toolCatalogMap(scope) {
+      var key = scope || currentScopeKey();
+      if (!state.sessionCatalogs[key]) state.sessionCatalogs[key] = {};
+      return state.sessionCatalogs[key];
+    }
+
+    function newCatalogMap(scope) {
+      var key = scope || currentScopeKey();
+      if (!newState.catalogsByScope[key]) newState.catalogsByScope[key] = {};
+      return newState.catalogsByScope[key];
+    }
+
+    function projectNamesMap(scope) {
+      var key = scope || currentScopeKey();
+      if (!newState.projectNamesByScope[key]) newState.projectNamesByScope[key] = {};
+      return newState.projectNamesByScope[key];
+    }
+
+    function captureRpcContext() {
+      return {
+        admin: state.admin === true,
+        clientId: state.admin && state.selectedComputer
+          ? String(state.selectedComputer.clientId || '') : '',
+        scope: currentScopeKey(),
+        generation: scopeGeneration
+      };
+    }
+
+    function rpcContextIsCurrent(context) {
+      return !!context && context.generation === scopeGeneration && context.scope === currentScopeKey();
+    }
+
+    /** One transport boundary. Admin calls always name the captured target. */
+    function rpc(body, context) {
+      var ctx = context || captureRpcContext();
+      var pending;
+      if (ctx.admin) {
+        if (!ctx.clientId || typeof apiClient.adminRpc !== 'function') {
+          return Promise.resolve({ ok: false, code: 'admin_target_required', message: '请先选择一台在线电脑。', status: 400 });
+        }
+        pending = apiClient.adminRpc(ctx.clientId, body);
+      } else {
+        pending = apiClient.rpc(body);
+      }
+      return Promise.resolve(pending).then(function (result) {
+        if (!rpcContextIsCurrent(ctx)) {
+          return Object.assign({}, result || {}, { stale: true });
+        }
+        return result;
+      });
+    }
+
+    function refreshInflightForScope() {
+      state.inflight = (pendingByScope[currentScopeKey()] || 0) > 0;
+    }
+
+    function invalidateScopeRequests() {
+      scopeGeneration += 1;
+      detailRequestSeq += 1;
+      newPanelSeq += 1;
+      createSeq += 1;
+      refreshInflightForScope();
+    }
+
     // ---------------------------------------------------------------- shell
 
     /** Show one protocol screen, keeping the tab bar in step. */
@@ -225,12 +341,29 @@
       state.screen = screen;
       if (el.loading) el.loading.hidden = screen !== 'loading';
       if (el.pair) el.pair.hidden = screen !== 'pair';
+      if (screen === 'pair' && el.adminLoginPanel && el.adminLoginPanel.hidden && el.pairUserForm) {
+        el.pairUserForm.hidden = false;
+        if (el.pairAdminLoginToggle) el.pairAdminLoginToggle.hidden = false;
+      }
       if (el.list) el.list.hidden = screen !== 'list';
       if (el.detail) el.detail.hidden = screen !== 'detail';
       if (el.newScreen) el.newScreen.hidden = screen !== 'new';
       if (el.settings) el.settings.hidden = screen !== 'settings';
+      if (el.adminRoster) el.adminRoster.hidden = screen !== 'admin-roster';
       var chromeVisible = screen === 'list' || screen === 'detail' || screen === 'new' || screen === 'settings';
       if (el.tabbar) el.tabbar.hidden = !chromeVisible;
+      if (el.newSessionButton) el.newSessionButton.hidden = !chromeVisible || screen === 'settings' || !state.selectedComputer && state.admin;
+      if (el.adminContext) el.adminContext.hidden = !state.admin || !state.selectedComputer;
+      if (el.appbarTitle) el.appbarTitle.textContent = state.admin ? 'AI 工作台 · 管理员' : 'AI 工作台';
+      if (el.adminContextName) {
+        var selected = state.selectedComputer;
+        el.adminContextName.textContent = selected
+          ? String(selected.ownerName || '未命名人员') + ' · ' + String(selected.clientName || '未命名电脑')
+          : '';
+        el.adminContextName.setAttribute('title', selected
+          ? String(selected.ownerName || '') + ' · ' + String(selected.clientName || '') + ' · ' + String(selected.clientId || '') : '');
+      }
+      refreshInflightForScope();
       if (!chromeVisible) closeProjectSheet();
       renderTabs();
     }
@@ -294,14 +427,17 @@
     // and the poller (which refuses to stack) would fire again on top of it.
     // Count them instead, and derive the flag.
 
-    function beginRequest() {
-      pendingRequests += 1;
-      state.inflight = true;
+    function beginRequest(scope) {
+      var key = scope || currentScopeKey();
+      pendingByScope[key] = (pendingByScope[key] || 0) + 1;
+      refreshInflightForScope();
     }
 
-    function endRequest() {
-      pendingRequests = Math.max(0, pendingRequests - 1);
-      state.inflight = pendingRequests > 0;
+    function endRequest(scope) {
+      var key = scope || currentScopeKey();
+      pendingByScope[key] = Math.max(0, (pendingByScope[key] || 0) - 1);
+      if (pendingByScope[key] === 0) delete pendingByScope[key];
+      refreshInflightForScope();
     }
 
     /** True when the request never reached the server at all. */
@@ -347,18 +483,88 @@
         if (el.connBadge) el.connBadge.textContent = '离线';
       }
       var text = core.errorMessage(result.code, result.message);
-      if (where === 'detail') showDetailError(text);
-      else showNotice(text);
+      var authExpired = core.isAuthFailure(result.code);
+      if (authExpired) {
+        // Admin and paired-user cookies are independent. Clear the selected
+        // admin target on expiry so a later action can never look like it fell
+        // back to the paired computer.
+        if (state.admin) {
+          state.admin = false;
+          state.selectedComputer = null;
+          state.identity = null;
+          state.sessions = [];
+          state.capabilities = null;
+          state.current = null;
+          state.sessionCatalog = null;
+          if (el.approvalsList) ui.clear(el.approvalsList);
+          if (el.questionsList) ui.clear(el.questionsList);
+          if (el.messageList) ui.clear(el.messageList);
+          invalidateScopeRequests();
+        }
+        state.authed = false;
+        if (el.connBadge) el.connBadge.textContent = '需要重新登录';
+        show('pair');
+        showPairError(text);
+      }
+      if (!authExpired) {
+        if (where === 'detail') showDetailError(text);
+        else showNotice(text);
+      }
       return text;
     }
 
     function capabilityFor(prefix, tool) {
       var capabilities = state.capabilities || {};
+      var toolStatus = capabilities.toolStatus && capabilities.toolStatus[tool];
+      if (toolStatus && typeof toolStatus === 'object' && toolStatus.available === false) {
+        return false;
+      }
       var perTool = prefix + ':' + tool;
       if (own(capabilities, perTool)) {
         return capabilities[perTool] === true;
       }
       return capabilities[prefix] === true;
+    }
+
+    function availableToolIds() {
+      var capabilities = state.capabilities || {};
+      var out = [];
+      var hasInventory = Array.isArray(capabilities.tools) ||
+        !!(capabilities.toolStatus && typeof capabilities.toolStatus === 'object');
+      if (Array.isArray(capabilities.tools)) {
+        capabilities.tools.forEach(function (tool) {
+          if (typeof tool === 'string' && tool !== '' && out.indexOf(tool) === -1) out.push(tool);
+        });
+      }
+      if (capabilities.toolStatus && typeof capabilities.toolStatus === 'object') {
+        Object.keys(capabilities.toolStatus).forEach(function (tool) {
+          if (out.indexOf(tool) === -1) out.push(tool);
+        });
+      }
+      if (out.length) return out;
+      if (hasInventory) return [];
+      // Compatibility for older bridge versions that predate explicit tool
+      // inventory. Creation is still gated by per-tool capabilities below.
+      return ['codex', 'dsh'];
+    }
+
+    function toolStatusReason(tool) {
+      var statuses = state.capabilities && state.capabilities.toolStatus;
+      var status = statuses && statuses[tool];
+      return status && typeof status.reason === 'string' ? status.reason : '';
+    }
+
+    function makeWorkBuddyOfficialHelp() {
+      var box = ui.make(document, 'div', 'workbuddy-official-help');
+      box.appendChild(ui.make(document, 'p', '',
+        'WorkBuddy 暂未接入此工作台。可在官方手机 App 登录与电脑相同的账号，继续已有聊天。'));
+      var link = document.createElement('a');
+      link.setAttribute('class', 'workbuddy-official-link');
+      link.setAttribute('href', 'https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice');
+      link.setAttribute('rel', 'noopener noreferrer');
+      link.textContent = '查看 WorkBuddy 官方手机端多设备接入说明';
+      box.appendChild(link);
+      return box;
     }
 
     function own(object, key) {
@@ -404,11 +610,345 @@
       }
       state.code = '';
       state.authed = true;
+      state.admin = false;
+      state.selectedComputer = null;
+      state.identity = { role: 'user', clientName: name };
+      invalidateScopeRequests();
       hideNotice();
       showPairError('');
       setOnline(true);
       show('list');
+      if (typeof apiClient.me === 'function') {
+        var identity = await apiClient.me();
+        if (identity.ok && identity.result && identity.result.role === 'user') {
+          state.identity = Object.assign({}, identity.result);
+          invalidateScopeRequests();
+        }
+      }
       await refreshList();
+    }
+
+    function showAdminLogin(returnScreen) {
+      state.adminReturnScreen = returnScreen || 'pair';
+      if (el.adminLoginPanel) el.adminLoginPanel.hidden = false;
+      if (el.pairUserForm) el.pairUserForm.hidden = true;
+      if (el.pairAdminLoginToggle) el.pairAdminLoginToggle.hidden = true;
+      if (el.adminLoginError) el.adminLoginError.textContent = '';
+      if (el.adminPassword) el.adminPassword.value = '';
+      show('pair');
+    }
+
+    function hideAdminLogin() {
+      if (el.adminLoginPanel) el.adminLoginPanel.hidden = true;
+      if (el.pairUserForm) el.pairUserForm.hidden = false;
+      if (el.pairAdminLoginToggle) el.pairAdminLoginToggle.hidden = false;
+      if (el.adminPassword) el.adminPassword.value = '';
+      if (el.adminLoginError) el.adminLoginError.textContent = '';
+      var target = state.adminReturnScreen;
+      if (target === 'settings' && state.authed) show('settings');
+      else show('pair');
+    }
+
+    async function submitAdminLogin() {
+      if (state.adminLoginBusy || typeof apiClient.adminLogin !== 'function') return;
+      var username = el.adminUsername ? el.adminUsername.value.trim() : '';
+      var password = el.adminPassword ? el.adminPassword.value : '';
+      if (!username || !password) {
+        if (el.adminLoginError) el.adminLoginError.textContent = '请输入管理员账号和密码。';
+        return;
+      }
+      var previousScope = currentScopeKey();
+      state.adminLoginBusy = true;
+      if (el.adminLoginSubmit) el.adminLoginSubmit.disabled = true;
+      if (el.adminLoginError) el.adminLoginError.textContent = '';
+      var pending = apiClient.adminLogin(username, password);
+      if (el.adminPassword) el.adminPassword.value = '';
+      var result = await pending;
+      state.adminLoginBusy = false;
+      if (el.adminLoginSubmit) el.adminLoginSubmit.disabled = false;
+      if (!result.ok) {
+        if (el.adminLoginError) el.adminLoginError.textContent = core.errorMessage(result.code, result.message);
+        return;
+      }
+      state.userWasPairedBeforeAdmin = !!(state.authed && state.identity && state.identity.role === 'user');
+      state.admin = true;
+      state.identity = { role: 'admin' };
+      state.selectedComputer = null;
+      state.authed = true;
+      state.sessions = [];
+      state.capabilities = null;
+      state.current = null;
+      state.sessionCatalog = null;
+      state.adminComputers = [];
+      state.adminRosterFilter = 'all';
+      state.adminRosterError = '';
+      if (el.approvalsList) ui.clear(el.approvalsList);
+      if (el.questionsList) ui.clear(el.questionsList);
+      if (el.messageList) ui.clear(el.messageList);
+      if (previousScope !== currentScopeKey()) invalidateScopeRequests();
+      if (el.adminLoginPanel) el.adminLoginPanel.hidden = true;
+      if (el.pairAdminLoginToggle) el.pairAdminLoginToggle.hidden = false;
+      if (el.adminUsername) el.adminUsername.value = '';
+      show('admin-roster');
+      await refreshAdminRoster();
+    }
+
+    async function refreshAdminRoster() {
+      if (!state.admin || typeof apiClient.adminComputers !== 'function') return;
+      var scope = currentScopeKey();
+      var generation = scopeGeneration;
+      state.adminRosterLoading = true;
+      state.lastRosterMs = now();
+      if (el.connBadge) el.connBadge.textContent = '读取电脑名册…';
+      if (el.adminRosterError) {
+        el.adminRosterError.hidden = true;
+        el.adminRosterError.textContent = '';
+      }
+      var result = await apiClient.adminComputers();
+      if (generation !== scopeGeneration || scope !== currentScopeKey()) return;
+      state.adminRosterLoading = false;
+      if (!result.ok) {
+        if (core.isAuthFailure(result.code)) {
+          state.admin = false;
+          state.authed = false;
+          state.selectedComputer = null;
+          state.identity = null;
+          invalidateScopeRequests();
+          if (el.connBadge) el.connBadge.textContent = '需要重新登录';
+          show('pair');
+          if (el.adminRosterError) {
+            el.adminRosterError.hidden = false;
+            el.adminRosterError.textContent = '管理员登录已失效，请重新登录。';
+          }
+          return;
+        }
+        state.adminRosterError = core.errorMessage(result.code, result.message);
+        if (el.connBadge) el.connBadge.textContent = '电脑名册暂不可用';
+        if (el.adminRosterError) {
+          el.adminRosterError.hidden = false;
+          el.adminRosterError.textContent = state.adminRosterError;
+        }
+        return;
+      }
+      var rows = result.result && Array.isArray(result.result.computers) ? result.result.computers : [];
+      state.adminComputers = rows.filter(function (computer) {
+        return computer && typeof computer.clientId === 'string';
+      });
+      state.adminRosterError = '';
+      if (el.connBadge) el.connBadge.textContent = '电脑名册已更新';
+      renderAdminRoster();
+    }
+
+    function adminToolList(computer) {
+      if (computer && Array.isArray(computer.tools)) return computer.tools;
+      var legacy = computer && computer.capabilities && Array.isArray(computer.capabilities.tools)
+        ? computer.capabilities.tools : [];
+      return legacy.map(function (id) { return { id: id, available: true }; });
+    }
+
+    function allAdminToolIds() {
+      var seen = {};
+      var ids = [];
+      state.adminComputers.forEach(function (computer) {
+        adminToolList(computer).forEach(function (tool) {
+          var id = tool && typeof tool.id === 'string' ? tool.id : '';
+          if (id && !seen[id]) {
+            seen[id] = true;
+            ids.push(id);
+          }
+        });
+      });
+      ids.sort();
+      return ids;
+    }
+
+    function renderAdminRoster() {
+      if (!el.adminComputerList) return;
+      ui.clear(el.adminComputerList);
+      var toolIds = allAdminToolIds();
+      if (el.adminToolFilter) {
+        ui.clear(el.adminToolFilter);
+        el.adminToolFilter.appendChild(ui.button(document, '全部工具',
+          'chip' + (state.adminRosterFilter === 'all' ? ' chip-active' : ''), function () {
+            state.adminRosterFilter = 'all';
+            renderAdminRoster();
+          }));
+        toolIds.forEach(function (id) {
+          el.adminToolFilter.appendChild(ui.button(document, core.toolLabel(id),
+            'chip' + (state.adminRosterFilter === id ? ' chip-active' : ''), function () {
+              state.adminRosterFilter = id;
+              renderAdminRoster();
+            }));
+        });
+      }
+      var rows = state.adminComputers.filter(function (computer) {
+        return state.adminRosterFilter === 'all' || adminToolList(computer).some(function (tool) {
+          return tool && tool.id === state.adminRosterFilter;
+        });
+      });
+      if (el.adminRosterEmpty) el.adminRosterEmpty.hidden = rows.length > 0;
+      var owners = {};
+      rows.forEach(function (computer) {
+        var owner = String(computer.ownerName || '未命名人员');
+        if (!owners[owner]) owners[owner] = [];
+        owners[owner].push(computer);
+      });
+      Object.keys(owners).sort().forEach(function (owner) {
+        var group = ui.make(document, 'section', 'admin-owner-group');
+        var heading = ui.make(document, 'h3', 'admin-owner-title', owner);
+        group.appendChild(heading);
+        owners[owner].sort(function (a, b) {
+          var byName = String(a.clientName || '').localeCompare(String(b.clientName || ''));
+          return byName || String(a.clientId).localeCompare(String(b.clientId));
+        }).forEach(function (computer) {
+          group.appendChild(buildAdminComputerCard(computer));
+        });
+        el.adminComputerList.appendChild(group);
+      });
+      if (el.adminRosterError) {
+        el.adminRosterError.textContent = state.adminRosterError;
+        el.adminRosterError.hidden = !state.adminRosterError;
+      }
+    }
+
+    function buildAdminComputerCard(computer) {
+      var card = ui.make(document, 'article', 'admin-computer-card');
+      var head = ui.make(document, 'div', 'admin-computer-head');
+      var nameGroup = ui.make(document, 'div', '');
+      nameGroup.appendChild(ui.make(document, 'h4', 'admin-computer-name', computer.clientName || '未命名电脑'));
+      nameGroup.appendChild(ui.make(document, 'p', 'admin-computer-id', '电脑编号：' + computer.clientId));
+      head.appendChild(nameGroup);
+      var open = ui.button(document, '打开工作台', 'secondary', function () {
+        selectComputer(computer.clientId);
+      });
+      open.disabled = computer.online !== true;
+      open.setAttribute('data-client-id', computer.clientId);
+      open.setAttribute('aria-label', '打开 ' + String(computer.ownerName || '未命名人员') + ' 的 ' + String(computer.clientName || '未命名电脑'));
+      head.appendChild(open);
+      card.appendChild(head);
+      var lastSeen = core.formatRelativeTime(computer.lastSeen, now());
+      card.appendChild(ui.make(document, 'p', 'admin-computer-status',
+        (computer.online === true ? '在线' : '离线') + (lastSeen ? ' · 最近活动 ' + lastSeen : ' · 最近活动时间未知')));
+      var tools = ui.make(document, 'div', 'admin-tool-list');
+      adminToolList(computer).forEach(function (entry) {
+        if (!entry || typeof entry.id !== 'string') return;
+        var chip = ui.make(document, 'span', 'admin-tool-chip', core.toolLabel(entry.id));
+        chip.setAttribute('data-available', entry.available === true ? 'true' : 'false');
+        var status = entry.available === true ? '可用' : (entry.id === 'workbuddy' ? '未接入' : (entry.reason || '不可用'));
+        var stateText = ui.make(document, 'span', 'admin-tool-state', status);
+        if (entry.reason) stateText.setAttribute('title', String(entry.reason));
+        chip.appendChild(stateText);
+        tools.appendChild(chip);
+      });
+      if (tools.children.length === 0) {
+        tools.appendChild(ui.make(document, 'span', 'muted small', '电脑未报告已连接的 AI 工具'));
+      }
+      card.appendChild(tools);
+      var unavailableWorkBuddy = adminToolList(computer).filter(function (entry) {
+        return entry && entry.id === 'workbuddy' && entry.available !== true;
+      })[0];
+      if (unavailableWorkBuddy) {
+        card.appendChild(makeWorkBuddyOfficialHelp());
+      }
+      return card;
+    }
+
+    function selectComputer(clientId) {
+      var computer = state.adminComputers.filter(function (row) { return row.clientId === clientId; })[0];
+      if (!computer || computer.online !== true) return;
+      if (state.current && el.sendInput) {
+        state.drafts[scopedSessionKey(state.current.id)] = el.sendInput.value;
+      }
+      state.selectedComputer = computer;
+      invalidateScopeRequests();
+      state.adminRosterLoading = false;
+      state.sessions = [];
+      state.capabilities = null;
+      state.current = null;
+      state.sessionCatalog = null;
+      state.query = '';
+      state.toolFilter = 'all';
+      state.projectFilter = '';
+      state.busySend = false;
+      state.busyStop = false;
+      state.busyAnswer = false;
+      state.busyApprove = false;
+      newState.catalog = null;
+      newState.tool = 'codex';
+      newState.selectedKey = '';
+      newState.selectedEffort = '';
+      newState.projectId = '';
+      newState.prefillProjectId = '';
+      newState.requestId = '';
+      newState.busy = false;
+      newState.partial = null;
+      if (el.sendInput) el.sendInput.value = '';
+      if (el.sendButton) el.sendButton.disabled = false;
+      if (el.stopButton) el.stopButton.disabled = false;
+      if (el.detailPartialRetry) el.detailPartialRetry.disabled = false;
+      if (el.approvalsList) ui.clear(el.approvalsList);
+      if (el.questionsList) ui.clear(el.questionsList);
+      if (el.approvalsPanel) el.approvalsPanel.hidden = true;
+      if (el.questionsPanel) el.questionsPanel.hidden = true;
+      if (el.messageList) ui.clear(el.messageList);
+      clearFocusMemo();
+      resetModelPickerPaint();
+      hideDetailError();
+      show('list');
+      renderList();
+      refreshList();
+    }
+
+    function returnToAdminRoster() {
+      if (!state.admin || !state.selectedComputer) return;
+      if (state.current && el.sendInput) {
+        state.drafts[scopedSessionKey(state.current.id)] = el.sendInput.value;
+      }
+      state.selectedComputer = null;
+      invalidateScopeRequests();
+      state.adminRosterLoading = false;
+      state.sessions = [];
+      state.capabilities = null;
+      state.current = null;
+      state.sessionCatalog = null;
+      state.busySend = false;
+      state.busyStop = false;
+      state.busyAnswer = false;
+      state.busyApprove = false;
+      if (el.sendInput) el.sendInput.value = '';
+      if (el.sendButton) el.sendButton.disabled = false;
+      if (el.stopButton) el.stopButton.disabled = false;
+      if (el.detailPartialRetry) el.detailPartialRetry.disabled = false;
+      if (el.approvalsList) ui.clear(el.approvalsList);
+      if (el.questionsList) ui.clear(el.questionsList);
+      if (el.approvalsPanel) el.approvalsPanel.hidden = true;
+      if (el.questionsPanel) el.questionsPanel.hidden = true;
+      if (el.messageList) ui.clear(el.messageList);
+      clearFocusMemo();
+      show('admin-roster');
+      refreshAdminRoster();
+    }
+
+    async function generateEnrollmentCode() {
+      if (!state.admin || typeof apiClient.adminEnrollmentCodes !== 'function') return;
+      var context = captureRpcContext();
+      if (el.adminEnrollmentButton) el.adminEnrollmentButton.disabled = true;
+      if (el.adminEnrollmentResult) {
+        el.adminEnrollmentResult.hidden = true;
+        el.adminEnrollmentResult.textContent = '';
+      }
+      var result = await apiClient.adminEnrollmentCodes();
+      if (el.adminEnrollmentButton) el.adminEnrollmentButton.disabled = false;
+      if (!rpcContextIsCurrent(context) || state.screen !== 'admin-roster') return;
+      if (!result.ok) {
+        state.adminRosterError = core.errorMessage(result.code, result.message);
+        renderAdminRoster();
+        return;
+      }
+      var data = result.result || {};
+      if (!data.code || !el.adminEnrollmentResult) return;
+      el.adminEnrollmentResult.textContent = '登记码：' + String(data.code) + (data.expiresAt ? ' · 有效至 ' + String(data.expiresAt) : '');
+      el.adminEnrollmentResult.hidden = false;
     }
 
     // ------------------------------------------------- workbench: tabs/filters
@@ -458,7 +998,7 @@
       if (projectId === '') {
         return '全部项目';
       }
-      var known = newState.projectNames[projectId];
+      var known = projectNamesMap()[projectId];
       if (known) {
         return known;
       }
@@ -505,7 +1045,7 @@
       // would miss the sessions that only report the directory.
       rows = core.filterByProject(rows, state.projectFilter, projectsForSheet());
       rows = core.filterSessions(rows, state.query);
-      return core.withPinsFirst(rows, prefs.get().pins);
+      return core.withPinsFirst(rows, scopedPins());
     }
 
     function renderList() {
@@ -539,7 +1079,35 @@
     }
 
     function isPinned(id) {
-      return prefs.get().pins[String(id)] === true;
+      return prefs.get().pins[pinKey(id)] === true;
+    }
+
+    function pinKey(id) {
+      // A paired phone has one fixed computer, so keep its historic pin ids.
+      // Admin pins need the client prefix because two computers may share a
+      // session id.
+      return state.admin && state.selectedComputer ? scopedSessionKey(id) : String(id);
+    }
+
+    function scopedPins() {
+      var all = prefs.get().pins || {};
+      var out = {};
+      (state.sessions || []).forEach(function (session) {
+        var key = pinKey(session.id);
+        if (all[key] === true) out[String(session.id)] = true;
+      });
+      return out;
+    }
+
+    function clearScopedPins() {
+      var all = prefs.get().pins || {};
+      var next = {};
+      var prefix = state.admin && state.selectedComputer
+        ? currentScopeKey().length + ':' + currentScopeKey() + ':' : '';
+      Object.keys(all).forEach(function (key) {
+        if (prefix && key.indexOf(prefix) !== 0) next[key] = true;
+      });
+      rememberPrefs({ pins: next });
     }
 
     function buildSessionRow(session) {
@@ -554,7 +1122,7 @@
       // The pin is a per-device convenience only; it never changes the session.
       var pin = ui.button(document, isPinned(session.id) ? '★' : '☆', 'pin-button' + (isPinned(session.id) ? ' pin-on' : ''), function (event) {
         if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
-        prefs.togglePin(session.id);
+        prefs.togglePin(pinKey(session.id));
         renderList();
       });
       pin.setAttribute('aria-label', isPinned(session.id) ? '取消置顶' : '置顶');
@@ -599,15 +1167,33 @@
 
     async function refreshList() {
       state.lastListMs = now();
-      beginRequest();
-      var result = await apiClient.rpc(core.listBody());
-      endRequest();
+      var context = captureRpcContext();
+      beginRequest(context.scope);
+      var result = await rpc(core.listBody(), context);
+      endRequest(context.scope);
+      if (!result || result.stale) return;
 
       if (!result.ok) {
         if (core.isAuthFailure(result.code)) {
-          // 401: the cookie is gone or was never valid. Back to pairing.
+          // The admin cookie and the paired-device cookie are independent.
+          // An expired admin target must return to login, never to user RPC.
+          if (state.admin) {
+            state.admin = false;
+            state.selectedComputer = null;
+            state.identity = null;
+            state.sessions = [];
+            state.capabilities = null;
+            state.current = null;
+            state.sessionCatalog = null;
+            if (el.approvalsList) ui.clear(el.approvalsList);
+            if (el.questionsList) ui.clear(el.questionsList);
+            if (el.messageList) ui.clear(el.messageList);
+            invalidateScopeRequests();
+          }
           state.authed = false;
+          if (el.connBadge) el.connBadge.textContent = '需要重新登录';
           show('pair');
+          showPairError(core.errorMessage(result.code, result.message));
           return;
         }
         // The user is reading a session, or filling in the new-session panel.
@@ -689,7 +1275,7 @@
           ' · 项目：' + projectDisplayName(state.projectFilter);
       }
       if (el.pinsSummary) {
-        var count = prefsModule.pinnedCount(current);
+        var count = prefsModule.pinnedCount(state.admin ? scopedPins() : current);
         el.pinsSummary.textContent = count === 0
           ? '还没有置顶的会话。在会话卡片上点 ☆ 就能置顶。'
           : '已置顶 ' + count + ' 个会话，它们排在列表最前面（只影响这台手机）。';
@@ -697,6 +1283,18 @@
       if (el.settingsVersion) {
         el.settingsVersion.textContent = APP_VERSION_TEXT;
       }
+      if (el.accountSummary) {
+        if (state.admin && state.selectedComputer) {
+          el.accountSummary.textContent = '管理员正在管理：' + String(state.selectedComputer.ownerName || '未命名人员') + ' · ' + String(state.selectedComputer.clientName || '未命名电脑');
+        } else if (state.admin) {
+          el.accountSummary.textContent = '已使用管理员账号登录。';
+        } else if (state.identity && (state.identity.ownerName || state.identity.clientName)) {
+          el.accountSummary.textContent = '配对设备：' + String(state.identity.ownerName || '当前用户') + ' · ' + String(state.identity.clientName || '电脑');
+        } else {
+          el.accountSummary.textContent = state.authed ? '已配对到生成此配对码的电脑。' : '尚未配对电脑。';
+        }
+      }
+      if (el.settingsAdminLogin) el.settingsAdminLogin.hidden = state.admin;
     }
 
     // ------------------------------------------------------- project sheet
@@ -724,14 +1322,15 @@
       // tools can name the same directory differently, and the filter value has
       // to be one the open session list can match.
       var preferred = sheetTool();
-      var tools = Object.keys(state.sessionCatalogs);
+      var catalogs = toolCatalogMap();
+      var tools = Object.keys(catalogs);
       tools.sort(function (a, b) {
         if (a === preferred) return -1;
         if (b === preferred) return 1;
         return a < b ? -1 : (a > b ? 1 : 0);
       });
       tools.forEach(function (tool) {
-        var entry = state.sessionCatalogs[tool];
+        var entry = catalogs[tool];
         if (!entry || !entry.catalog) {
           return;
         }
@@ -773,8 +1372,8 @@
       // The tool the sheet is shown for also becomes the composer's active
       // catalog, so the model picker reuses the answer we already have instead
       // of asking the desktop again.
-      if (!state.sessionCatalog && state.sessionCatalogs[sheetTool()]) {
-        state.sessionCatalog = state.sessionCatalogs[sheetTool()];
+      if (!state.sessionCatalog && toolCatalogMap()[sheetTool()]) {
+        state.sessionCatalog = toolCatalogMap()[sheetTool()];
       }
       var query = el.projectSearch ? String(el.projectSearch.value || '').trim().toLowerCase() : '';
       var projects = projectsForSheet().filter(function (project) {
@@ -835,6 +1434,7 @@
     }
 
     async function openProjectSheet() {
+      var context = captureRpcContext();
       openSheetUi();
       renderProjectSheet();
       // The catalog is the desktop's own project list; the session list alone
@@ -842,8 +1442,10 @@
       if (!state.capabilities) {
         return;
       }
-      await ensureSessionCatalog(sheetTool());
-      await loadSheetCatalogs();
+      await ensureSessionCatalog(sheetTool(), context);
+      if (!rpcContextIsCurrent(context)) return;
+      await loadSheetCatalogs(context);
+      if (!rpcContextIsCurrent(context)) return;
       renderProjectSheet();
     }
 
@@ -854,26 +1456,25 @@
      * own list, so the ones that were never fetched are requested now. Nothing
      * is invented in the meantime: a tool that has not answered has no cue.
      */
-    async function loadSheetCatalogs() {
+    async function loadSheetCatalogs(context) {
       if (!state.capabilities) {
         return;
       }
       var capabilities = state.capabilities || {};
-      var tools = Array.isArray(capabilities.tools) && capabilities.tools.length
-        ? capabilities.tools : ['codex', 'dsh'];
+      var tools = availableToolIds();
       var preferred = sheetTool();
       if (tools.indexOf(preferred) === -1) {
         tools = tools.concat([preferred]);
       }
       var wanted = [];
       tools.forEach(function (tool) {
-        if (state.sessionCatalogs[tool]) {
+        if (toolCatalogMap(context && context.scope)[tool]) {
           return;
         }
         if (!capabilityFor('models.list', tool)) {
           return;
         }
-        wanted.push(loadSessionCatalog(tool));
+        wanted.push(loadSessionCatalog(tool, context));
       });
       await Promise.all(wanted);
     }
@@ -890,8 +1491,7 @@
 
     function defaultTool() {
       var capabilities = state.capabilities || {};
-      var tools = Array.isArray(capabilities.tools) && capabilities.tools.length
-        ? capabilities.tools : ['codex', 'dsh'];
+      var tools = availableToolIds();
       for (var i = 0; i < tools.length; i++) {
         if (capabilityFor('models.list', tools[i])) return tools[i];
       }
@@ -1283,10 +1883,14 @@
 
     function activityKey(block) {
       var first = block.items && block.items[0];
+      var localKey;
       if (first && first.id !== undefined && first.id !== null) {
-        return 'm:' + String(first.id);
+        localKey = 'm:' + String(first.id);
+      } else {
+        localKey = 'n:' + String(block.count);
       }
-      return 'n:' + String(block.count);
+      var current = state.current;
+      return scopedSessionKey(current ? current.id : 'none') + ':act:' + localKey;
     }
 
     /** Stable identity for a block across polls (message ids are stable). */
@@ -1418,7 +2022,7 @@
     // ------------------------------------------- pending questions/approvals
 
     function answerDraftKey(sessionId, callId) {
-      return String(sessionId) + '\u0000' + String(callId);
+      return scopedSessionKey(sessionId) + '\u0000' + String(callId);
     }
 
     function answerDraft(sessionId, callId) {
@@ -1430,7 +2034,7 @@
     }
 
     function approvalReceiptKey(sessionId, approvalId) {
-      return String(sessionId) + '\u0000' + String(approvalId);
+      return scopedSessionKey(sessionId) + '\u0000' + String(approvalId);
     }
 
     function renderPendingPanels(current) {
@@ -1994,15 +2598,17 @@
         return;
       }
       var live = state.current;
-      if (!live || live.id !== sessionId) {
+      if (!live || live.id !== sessionId || live.scopeKey !== currentScopeKey()) {
         state.answerReceipts[key] = { state: 'error', message: '会话已经切换，请重新打开后再回答。' };
         return;
       }
+      var context = captureRpcContext();
       state.busyAnswer = true;
       hideDetailError();
-      var result = await apiClient.rpc(core.sessionAnswerBody({
+      var result = await rpc(core.sessionAnswerBody({
         tool: live.tool, sessionId: sessionId, callId: batch.callId, answers: answers
-      }));
+      }), context);
+      if (!result || result.stale) return;
       state.busyAnswer = false;
 
       var accepted = !!(result.ok && result.result && result.result.accepted === true);
@@ -2028,7 +2634,7 @@
         return; // exactly once per request; native first answer wins
       }
       var live = state.current;
-      if (!live || live.id !== sessionId) {
+      if (!live || live.id !== sessionId || live.scopeKey !== currentScopeKey()) {
         state.approvalReceipts[key] = { state: 'error', message: '会话已经切换，请重新打开后再操作。' };
         renderDetail();
         return;
@@ -2036,11 +2642,13 @@
       if (!core.approvalDecisionLabel(decision)) {
         return;
       }
+      var context = captureRpcContext();
       state.busyApprove = true;
       hideDetailError();
-      var result = await apiClient.rpc(core.sessionApproveBody({
+      var result = await rpc(core.sessionApproveBody({
         tool: live.tool, sessionId: sessionId, approvalId: approval.id, decision: decision
-      }));
+      }), context);
+      if (!result || result.stale) return;
       state.busyApprove = false;
 
       var accepted = !!(result.ok && result.result && result.result.accepted === true);
@@ -2077,36 +2685,41 @@
      * Repainting is left to the caller: the composer's model picker belongs to
      * the session on screen, and the project sheet belongs to the list.
      */
-    async function loadSessionCatalog(tool) {
+    async function loadSessionCatalog(tool, requestContext) {
       if (!tool || !capabilityFor('models.list', tool)) {
         return;
       }
-      if (state.sessionCatalogs[tool] && state.sessionCatalogs[tool].catalog) {
+      var context = requestContext || captureRpcContext();
+      var catalogs = toolCatalogMap(context.scope);
+      if (catalogs[tool] && catalogs[tool].catalog) {
         return;
       }
-      var inflight = catalogRequests[tool];
+      var requestKey = context.scope + '\u0000' + tool;
+      var inflight = catalogRequests[requestKey];
       if (!inflight) {
-        inflight = apiClient.rpc(core.modelsListBody(tool)).then(function (result) {
-          delete catalogRequests[tool];
-          storeCatalog(tool, result);
+        inflight = rpc(core.modelsListBody(tool), context).then(function (result) {
+          delete catalogRequests[requestKey];
+          if (!result || result.stale) return;
+          storeCatalog(tool, result, context.scope);
         });
-        catalogRequests[tool] = inflight;
+        catalogRequests[requestKey] = inflight;
       }
       await inflight;
     }
 
     /** Record one models.list answer under its tool. Never invents a catalog. */
-    function storeCatalog(tool, result) {
+    function storeCatalog(tool, result, scope) {
+      var catalogs = toolCatalogMap(scope);
       if (!result || !result.ok) {
-        state.sessionCatalogs[tool] = {
+        catalogs[tool] = {
           tool: tool, catalog: null, key: '', effort: '',
           error: core.errorMessage(result ? result.code : null, result ? result.message : '')
         };
         return;
       }
       var loaded = { tool: tool, catalog: result.result || null, key: '', effort: '', error: '' };
-      state.sessionCatalogs[tool] = loaded;
-      rememberProjectNames(loaded.catalog);
+      catalogs[tool] = loaded;
+      rememberProjectNames(loaded.catalog, scope);
     }
 
     var catalogRequests = {};
@@ -2309,7 +2922,7 @@
       // whatever was typed in the one being opened. Without the save, text
       // typed for A would be sent to B.
       if (state.current && el.sendInput) {
-        state.drafts[String(state.current.id)] = el.sendInput.value;
+        state.drafts[scopedSessionKey(state.current.id, state.current.scopeKey)] = el.sendInput.value;
       }
       // The partial-success note belongs to the session it was raised for.
       newState.partial = null;
@@ -2317,13 +2930,14 @@
       // of pending controls. Nothing about the previous session may be reused --
       // including a focus snapshot taken inside its answer form.
       state.sessionCatalog = null;
-      state.sessionCatalogs = {};
+      state.sessionCatalogs[currentScopeKey()] = {};
       clearFocusMemo();
       resetModelPickerPaint();
       if (el.modelPicker) el.modelPicker.hidden = true;
       state.current = {
         id: session.id,
         tool: session.tool,
+        scopeKey: currentScopeKey(),
         title: session.title,
         status: session.status,
         messages: [],
@@ -2333,7 +2947,7 @@
         raw: null
       };
       if (el.sendInput) {
-        var stored = state.drafts[String(session.id)];
+        var stored = state.drafts[scopedSessionKey(session.id)];
         el.sendInput.value = typeof stored === 'string' ? stored : '';
       }      hideDetailError();
       show('detail');
@@ -2354,20 +2968,21 @@
       var requestSeq = detailRequestSeq;
       var targetId = current.id;
       var targetTool = current.tool;
+      var context = captureRpcContext();
+      var targetScope = current.scopeKey || context.scope;
 
       state.lastReadMs = now();
-      beginRequest();
-      var result = await apiClient.rpc(core.readBody(targetTool, targetId));
-      endRequest();
+      beginRequest(context.scope);
+      var result = await rpc(core.readBody(targetTool, targetId), context);
+      endRequest(context.scope);
 
-      if (isStaleDetailResponse(requestSeq, targetId)) {
+      if (!result || result.stale || targetScope !== context.scope || isStaleDetailResponse(requestSeq, targetId)) {
         return;
       }
 
       if (!result.ok) {
         if (core.isAuthFailure(result.code)) {
-          state.authed = false;
-          show('pair');
+          handleFailure(result, 'detail');
           return;
         }
         handleFailure(result, 'detail');
@@ -2378,18 +2993,20 @@
       // the partial-creation notice is a different element and is untouched.
       hideDetailError();
       var payload = result.result || {};
+      clearStalePendingReceipts(payload, targetId, targetScope);
       // Remember where the user was reading before the DOM is rebuilt.
       var scrollTop = captureScrollTop();
       // A draft belongs to the session it was typed in; the composer holds the
       // text for whichever session is on screen. The draft map is authoritative
       // here: it is what openSession() and the input listener keep up to date.
-      var draftKey = String(targetId);
+      var draftKey = scopedSessionKey(targetId, targetScope);
       if (el.sendInput && state.drafts[draftKey] === undefined) {
         state.drafts[draftKey] = el.sendInput.value;
       }
       state.current = {
         id: payload.id || targetId,
         tool: payload.tool || targetTool,
+        scopeKey: targetScope,
         title: payload.title || current.title,
         status: payload.status || current.status,
         messages: payload.messages || [],
@@ -2412,12 +3029,39 @@
       ensureSessionCatalog(state.current.tool);
     }
 
+    function clearStalePendingReceipts(readResult, sessionId, scope) {
+      var sessionPrefix = scopedSessionKey(sessionId, scope) + '\u0000';
+      var activeQuestions = {};
+      var activeApprovals = {};
+      var batches = readResult && Array.isArray(readResult.pendingQuestions) ? readResult.pendingQuestions : [];
+      batches.forEach(function (batch) {
+        if (batch && typeof batch.callId === 'string') activeQuestions[batch.callId] = true;
+      });
+      var approvals = readResult && Array.isArray(readResult.pendingApprovals) ? readResult.pendingApprovals : [];
+      approvals.forEach(function (approval) {
+        if (approval && typeof approval.id === 'string') activeApprovals[approval.id] = true;
+      });
+      [state.answerDrafts, state.answerReceipts].forEach(function (map) {
+        Object.keys(map).forEach(function (key) {
+          if (key.indexOf(sessionPrefix) !== 0) return;
+          var callId = key.slice(sessionPrefix.length);
+          if (!activeQuestions[callId]) delete map[key];
+        });
+      });
+      Object.keys(state.approvalReceipts).forEach(function (key) {
+        if (key.indexOf(sessionPrefix) !== 0) return;
+        var approvalId = key.slice(sessionPrefix.length);
+        if (!activeApprovals[approvalId]) delete state.approvalReceipts[key];
+      });
+    }
+
     /** Fetch the picker's catalog once per tool, never stacking duplicates. */
-    function ensureSessionCatalog(tool) {
+    function ensureSessionCatalog(tool, requestContext) {
       if (!tool || !capabilityFor('models.list', tool)) {
         return;
       }
-      var known = state.sessionCatalogs[tool] || state.sessionCatalog;
+      var context = requestContext || captureRpcContext();
+      var known = toolCatalogMap(context.scope)[tool] || state.sessionCatalog;
       if (known && known.tool === tool && known.catalog) {
         // Already fetched for this tool: reuse it (and make it the active one)
         // instead of re-asking the desktop on every open.
@@ -2425,13 +3069,15 @@
         renderModelPicker();
         return;
       }
-      loadSessionCatalog(tool).then(function () {
-        if (!state.current || state.current.tool !== tool) {
+      loadSessionCatalog(tool, context).then(function () {
+        if (!rpcContextIsCurrent(context) || !state.current || state.current.scopeKey !== context.scope || state.current.tool !== tool) {
           return; // the user moved on: a late catalog is not this session's
         }
-        if (state.sessionCatalogs[tool]) {
-          state.sessionCatalog = state.sessionCatalogs[tool];
+        if (toolCatalogMap(context.scope)[tool]) {
+          state.sessionCatalog = toolCatalogMap(context.scope)[tool];
           renderModelPicker();
+        } else {
+          ensureSessionCatalog(tool, context);
         }
       });
     }
@@ -2480,7 +3126,9 @@
         reasoningEffort: effort
       });
 
-      var result = await apiClient.rpc(body);
+      var context = captureRpcContext();
+      var result = await rpc(body, context);
+      if (!result || result.stale) return;
 
       state.busySend = false;
       if (el.sendButton) el.sendButton.disabled = false;
@@ -2493,7 +3141,7 @@
       hideDetailError();
       if (text === undefined && el.sendInput) {
         el.sendInput.value = '';
-        delete state.drafts[String(current.id)];
+        delete state.drafts[scopedSessionKey(current.id, context.scope)];
       }
       await refreshDetail();
     }
@@ -2502,9 +3150,12 @@
       if (state.busyStop) return;
       var current = state.current;
       if (!current) return;
+      var context = captureRpcContext();
+      if (current.scopeKey !== context.scope) return;
       state.busyStop = true;
       hideDetailError();
-      var result = await apiClient.rpc(core.stopBody(current.tool, current.id));
+      var result = await rpc(core.stopBody(current.tool, current.id), context);
+      if (!result || result.stale) return;
       state.busyStop = false;
       if (!result.ok) {
         handleFailure(result, 'detail');
@@ -2515,15 +3166,77 @@
     }
 
     async function logout() {
+      if (state.admin) return adminLogout();
       await apiClient.logout();
       state.sessions = [];
       state.capabilities = null;
       state.current = null;
       state.sessionCatalog = null;
-      state.sessionCatalogs = {};
+      state.sessionCatalogs[currentScopeKey()] = {};
       clearFocusMemo();
       state.authed = false;
+      state.identity = null;
+      invalidateScopeRequests();
       hideNotice();
+      show('pair');
+    }
+
+    async function adminLogout() {
+      if (!state.admin || typeof apiClient.adminLogout !== 'function') return;
+      var result = await apiClient.adminLogout();
+      if (!result.ok) {
+        state.adminRosterError = core.errorMessage(result.code, result.message);
+        if (state.screen === 'admin-roster') renderAdminRoster();
+        else handleFailure(result, 'list');
+        return;
+      }
+      var wasPaired = state.userWasPairedBeforeAdmin;
+      state.admin = false;
+      state.selectedComputer = null;
+      state.identity = null;
+      state.authed = false;
+      if (el.connBadge) el.connBadge.textContent = '未登录';
+      state.sessions = [];
+      state.capabilities = null;
+      state.current = null;
+      state.sessionCatalog = null;
+      state.sessionCatalogs = {};
+      state.drafts = {};
+      state.answerDrafts = {};
+      state.answerReceipts = {};
+      state.approvalReceipts = {};
+      state.expandedActivity = {};
+      newState.catalogsByScope = {};
+      newState.projectNamesByScope = {};
+      newState.catalog = null;
+      newState.busy = false;
+      if (el.adminPassword) el.adminPassword.value = '';
+      if (el.adminUsername) el.adminUsername.value = '';
+      if (el.adminLoginPanel) el.adminLoginPanel.hidden = true;
+      if (el.pairUserForm) el.pairUserForm.hidden = false;
+      if (el.pairAdminLoginToggle) el.pairAdminLoginToggle.hidden = false;
+      clearFocusMemo();
+      invalidateScopeRequests();
+      hideNotice();
+
+      var identity = typeof apiClient.me === 'function' ? await apiClient.me() : null;
+      if (identity && identity.ok && identity.result && identity.result.role === 'user') {
+        state.identity = Object.assign({}, identity.result);
+        state.authed = true;
+        invalidateScopeRequests();
+        show('list');
+        await refreshList();
+        return;
+      }
+      if (wasPaired) {
+        state.identity = { role: 'user' };
+        state.authed = true;
+        invalidateScopeRequests();
+        show('list');
+        await refreshList();
+        return;
+      }
+      state.userWasPairedBeforeAdmin = false;
       show('pair');
     }
 
@@ -2537,6 +3250,14 @@
     }
 
     async function tick() {
+      if (state.admin && !state.selectedComputer) {
+        if (state.screen === 'admin-roster' && !document.hidden && !state.adminRosterLoading &&
+            now() - state.lastRosterMs >= core.LIST_INTERVAL_MS) {
+          await refreshAdminRoster();
+        }
+        scheduleTick();
+        return;
+      }
       var action = core.nextPollAction({
         authed: state.authed,
         hidden: !!document.hidden,
@@ -2554,7 +3275,8 @@
     }
 
     async function retry() {
-      if (state.screen === 'detail') await refreshDetail();
+      if (state.screen === 'admin-roster') await refreshAdminRoster();
+      else if (state.screen === 'detail') await refreshDetail();
       else await refreshList();
     }
 
@@ -2590,9 +3312,7 @@
     }
 
     function pickDefaultTool() {
-      var capabilities = state.capabilities || {};
-      var tools = Array.isArray(capabilities.tools) && capabilities.tools.length
-        ? capabilities.tools : ['codex', 'dsh'];
+      var tools = availableToolIds();
       for (var i = 0; i < tools.length; i++) {
         if (capabilityFor('models.list', tools[i]) && capabilityFor('session.create', tools[i])) {
           return tools[i];
@@ -2643,8 +3363,9 @@
         renderNewPanel();
         return;
       }
-      if (newState.catalogs[tool]) {
-        newState.catalog = newState.catalogs[tool];
+      var catalogs = newCatalogMap();
+      if (catalogs[tool]) {
+        newState.catalog = catalogs[tool];
         renderNewPanel();
         return;
       }
@@ -2652,11 +3373,12 @@
       if (el.newSubmit) el.newSubmit.disabled = true;
       renderNewPanel();
 
-      var result = await apiClient.rpc(core.modelsListBody(tool));
+      var context = captureRpcContext();
+      var result = await rpc(core.modelsListBody(tool), context);
 
       // The user may have switched tool (or left) while this was in flight: a
       // late catalog must never land on a different tool's panel.
-      if (seq !== newPanelSeq || newState.tool !== tool) {
+      if (!result || result.stale || !rpcContextIsCurrent(context) || seq !== newPanelSeq || newState.tool !== tool) {
         return;
       }
       newState.loading = false;
@@ -2668,15 +3390,16 @@
       }
       newState.error = '';
       newState.catalog = result.result || null;
-      newState.catalogs[tool] = newState.catalog;
-      rememberProjectNames(newState.catalog);
+      newCatalogMap(context.scope)[tool] = newState.catalog;
+      rememberProjectNames(newState.catalog, context.scope);
       renderNewPanel();
     }
 
     /** Remember the readable name of every catalog project (never invented). */
-    function rememberProjectNames(catalog) {
+    function rememberProjectNames(catalog, scope) {
+      var names = projectNamesMap(scope);
       core.projectOptions(catalog).forEach(function (project) {
-        newState.projectNames[project.id] = core.projectLabel(project);
+        names[project.id] = core.projectLabel(project);
       });
     }
 
@@ -2712,7 +3435,7 @@
       if (key === '') {
         return '';
       }
-      var catalog = newState.catalogs[tool];
+      var catalog = newCatalogMap()[tool];
       if (catalog && typeof catalog.tool === 'string' && catalog.tool !== '' && catalog.tool !== tool) {
         catalog = null;
       }
@@ -2738,7 +3461,7 @@
       // --- tool choices: an unusable tool is greyed, never silently missing ---
       if (el.toolChoices) {
         ui.clear(el.toolChoices);
-        ['codex', 'dsh'].forEach(function (tool) {
+        availableToolIds().forEach(function (tool) {
           var button = ui.button(document, core.toolLabel(tool),
             'choice' + (newState.tool === tool ? ' choice-active' : ''),
             function () { selectNewTool(tool); });
@@ -2748,13 +3471,18 @@
         });
       }
 
-      var options = core.modelOptions(newState.catalog);
+      var workBuddyUsable = capabilityFor('models.list', 'workbuddy') && capabilityFor('session.create', 'workbuddy');
+      var workBuddyReported = availableToolIds().indexOf('workbuddy') !== -1;
+      var workBuddyUnavailable = newState.tool === 'workbuddy' && !workBuddyUsable;
+      var options = workBuddyUnavailable ? [] : core.modelOptions(newState.catalog);
       var availability = '';
       var ready = false;
-      if (!capabilityFor('session.create', newState.tool)) {
-        availability = '这台电脑不支持新建会话。';
+      if (workBuddyUnavailable) {
+        availability = '';
+      } else if (!capabilityFor('session.create', newState.tool)) {
+        availability = toolStatusReason(newState.tool) || '这台电脑不支持新建会话。';
       } else if (!capabilityFor('models.list', newState.tool)) {
-        availability = '该工具不支持读取模型列表，暂时不能新建。';
+        availability = toolStatusReason(newState.tool) || '该工具不支持读取模型列表，暂时不能新建。';
       } else if (newState.loading) {
         availability = '正在读取模型…';
       } else if (newState.error) {
@@ -2767,8 +3495,16 @@
       }
 
       if (el.newAvailability) {
-        el.newAvailability.hidden = ready;
+        el.newAvailability.hidden = ready || workBuddyUnavailable;
         el.newAvailability.textContent = availability;
+      }
+      if (el.workBuddyOfficialHelp) {
+        var workBuddyReason = toolStatusReason('workbuddy');
+        el.workBuddyOfficialHelp.hidden = !workBuddyReported || workBuddyUsable;
+        el.workBuddyOfficialHelp.setAttribute('title', !workBuddyUsable ? workBuddyReason : '');
+      }
+      if (el.newNativeControls) {
+        el.newNativeControls.hidden = workBuddyUnavailable;
       }
 
       // --- models: options come only from what the desktop reported ---
@@ -2953,25 +3689,26 @@
       newState.busy = true;
       createSeq += 1;
       var seq = createSeq;
+      var context = captureRpcContext();
       var known = snapshotSessionIds();
       if (el.newSubmit) el.newSubmit.disabled = true;
       if (el.newError) el.newError.textContent = '';
 
-      var result = await apiClient.rpc(body);
+      var result = await rpc(body, context);
 
       // A newer attempt (or a different tool) has taken over: drop this answer.
-      if (seq !== createSeq) return;
+      if (!result || result.stale || !rpcContextIsCurrent(context) || seq !== createSeq) return;
       newState.busy = false;
 
       if (result.ok && result.result && typeof result.result.sessionId === 'string' &&
           result.result.sessionId !== '') {
-        await adoptCreatedSession(result.result, firstText);
+        await adoptCreatedSession(result.result, firstText, context.scope);
         return;
       }
 
       if (isUnreachable(result) || result.code === 'bridge_timeout' ||
           result.code === 'bridge_bad_response') {
-        await resolveUnknownCreate(known);
+        await resolveUnknownCreate(known, context.scope, context.generation);
         return;
       }
 
@@ -2991,13 +3728,15 @@
      * failure prompt, and it invites the user to send a duplicate message.
      * Only an explicitly partial result gets the in-session re-send.
      */
-    async function adoptCreatedSession(created, firstText) {
+    async function adoptCreatedSession(created, firstText, scope) {
       newState.requestId = '';
       newState.partial = null;
       newState.pendingFirstText = '';
       clearPartial();
       await refreshList();
+      if (scope !== currentScopeKey()) return;
       await openSession(created.sessionId, { tool: created.tool || newState.tool, title: created.title || '' });
+      if (scope !== currentScopeKey()) return;
 
       // The desktop's own verdict, not our guess: only an explicit flag means
       // something was left unfinished.
@@ -3018,12 +3757,14 @@
      * The creation answer never arrived. Do NOT create again: ask the session
      * list whether a new session of this tool appeared, and adopt it if so.
      */
-    async function resolveUnknownCreate(known) {
+    async function resolveUnknownCreate(known, scope, generation) {
+      var tool = newState.tool;
       await refreshList();
+      if (scope !== currentScopeKey() || generation !== scopeGeneration) return;
       var candidate = null;
       (state.sessions || []).forEach(function (session) {
         if (!session || known[session.id]) return;
-        if (session.tool !== newState.tool) return;
+        if (session.tool !== tool) return;
         if (!candidate || String(session.updatedAt) > String(candidate.updatedAt)) {
           candidate = session;
         }
@@ -3048,9 +3789,12 @@
       var text = newState.pendingFirstText;
       var current = state.current;
       if (!text || !current || state.busySend) return;
+      var context = captureRpcContext();
+      if (context.scope !== current.scopeKey) return;
       state.busySend = true;
       if (el.detailPartialRetry) el.detailPartialRetry.disabled = true;
-      var result = await apiClient.rpc(core.sendBody(current.tool, current.id, text));
+      var result = await rpc(core.sendBody(current.tool, current.id, text), context);
+      if (!result || result.stale) return;
       state.busySend = false;
       if (el.detailPartialRetry) el.detailPartialRetry.disabled = false;
       if (!result.ok) {
@@ -3069,6 +3813,27 @@
         el.pairSubmit.addEventListener('click', function () {
           submitPair();
         });
+      }
+      if (el.pairAdminLoginToggle) {
+        el.pairAdminLoginToggle.addEventListener('click', function () { showAdminLogin('pair'); });
+      }
+      if (el.adminLoginSubmit) {
+        el.adminLoginSubmit.addEventListener('click', function () { submitAdminLogin(); });
+      }
+      if (el.adminLoginBack) {
+        el.adminLoginBack.addEventListener('click', function () { hideAdminLogin(); });
+      }
+      if (el.settingsAdminLogin) {
+        el.settingsAdminLogin.addEventListener('click', function () { showAdminLogin('settings'); });
+      }
+      if (el.adminLogout) {
+        el.adminLogout.addEventListener('click', function () { adminLogout(); });
+      }
+      if (el.adminContextBack) {
+        el.adminContextBack.addEventListener('click', function () { returnToAdminRoster(); });
+      }
+      if (el.adminEnrollmentButton) {
+        el.adminEnrollmentButton.addEventListener('click', function () { generateEnrollmentCode(); });
       }
       if (el.noticeRetry) {
         el.noticeRetry.addEventListener('click', function () {
@@ -3109,7 +3874,7 @@
       }
       if (el.pinsClearButton) {
         el.pinsClearButton.addEventListener('click', function () {
-          rememberPrefs({ pins: {} });
+          clearScopedPins();
           renderList();
         });
       }
@@ -3146,7 +3911,7 @@
         el.sendInput.addEventListener('input', function () {
           var current = state.current;
           if (current) {
-            state.drafts[String(current.id)] = el.sendInput.value;
+            state.drafts[scopedSessionKey(current.id, current.scopeKey)] = el.sendInput.value;
           }
         });
       }
@@ -3260,7 +4025,7 @@
       captureExpandedState();
       var draft = el.sendInput ? el.sendInput.value : '';
       if (state.current) {
-        state.drafts[String(state.current.id)] = draft;
+        state.drafts[scopedSessionKey(state.current.id, state.current.scopeKey)] = draft;
       }
       if (el.sendInput) el.sendInput.value = '';
       if (el.messageList) el.messageList.textContent = '';
@@ -3271,7 +4036,7 @@
       if (el.detailTruncated) el.detailTruncated.hidden = true;
       if (el.modelPicker) el.modelPicker.hidden = true;
       state.sessionCatalog = null;
-      state.sessionCatalogs = {};
+      state.sessionCatalogs[currentScopeKey()] = {};
       clearFocusMemo();
       resetModelPickerPaint();
       state.current = null;
@@ -3292,6 +4057,24 @@
       state.authed = false;
       show('pair');
       scheduleTick();
+      if (typeof apiClient.me === 'function') {
+        var identity = await apiClient.me();
+        if (identity.ok && identity.result && identity.result.role === 'admin') {
+          state.admin = true;
+          state.identity = Object.assign({}, identity.result);
+          state.authed = true;
+          invalidateScopeRequests();
+          show('admin-roster');
+          await refreshAdminRoster();
+          return;
+        }
+        if (identity.ok && identity.result && identity.result.role === 'user') {
+          state.admin = false;
+          state.identity = Object.assign({}, identity.result);
+          state.authed = true;
+          invalidateScopeRequests();
+        }
+      }
       await refreshList();
     }
 

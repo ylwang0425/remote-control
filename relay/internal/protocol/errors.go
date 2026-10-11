@@ -24,6 +24,8 @@ const (
 	CodeRateLimited          Code = "rate_limited"
 	CodeInternal             Code = "internal"
 	CodeBridgeOffline        Code = "bridge_offline"
+	CodeTargetOffline        Code = "target_offline"
+	CodeIdentityConflict     Code = "identity_conflict"
 	CodeBridgeBusy           Code = "bridge_busy"
 	CodeBridgeTimeout        Code = "bridge_timeout"
 	CodeBridgeBadResponse    Code = "bridge_bad_response"
@@ -95,6 +97,8 @@ func (c Code) HTTPStatus() int {
 		return 403
 	case CodeNotFound:
 		return 404
+	case CodeIdentityConflict:
+		return 409
 	case CodeMethodNotAllowed:
 		return 405
 	case CodePayloadTooLarge:
@@ -107,7 +111,7 @@ func (c Code) HTTPStatus() int {
 		return 500
 	case CodeBridgeBadResponse:
 		return 502
-	case CodeBridgeOffline, CodeBridgeBusy:
+	case CodeBridgeOffline, CodeTargetOffline, CodeBridgeBusy:
 		return 503
 	case CodeBridgeTimeout:
 		return 504
@@ -154,6 +158,10 @@ func (c Code) CanonicalMessage() string {
 		return "internal error"
 	case CodeBridgeOffline:
 		return "desktop is offline"
+	case CodeTargetOffline:
+		return "target computer is offline"
+	case CodeIdentityConflict:
+		return "computer identity is already bound"
 	case CodeBridgeBusy:
 		return "desktop is busy"
 	case CodeBridgeTimeout:

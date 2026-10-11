@@ -80,7 +80,7 @@ const MAX_MESSAGES = 200;
 
 const STATUS_VALUES = Object.freeze(['idle', 'working', 'stopped', 'error']);
 const ROLE_VALUES = Object.freeze(['user', 'assistant', 'system', 'tool']);
-const TOOL_VALUES = Object.freeze(['codex', 'dsh']);
+const TOOL_VALUES = Object.freeze(['codex', 'dsh', 'workbuddy']);
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SESSION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -414,6 +414,37 @@ function newId() {
  *   answerCodex?: boolean, answerDsh?: boolean, approveCodex?: boolean,
  *   approveDsh?: boolean}} [options]
  */
+function normalizeToolStatus(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw protocolError('invalid_params', 'toolStatus must be an object');
+  }
+  const status = {};
+  for (const [tool, detail] of Object.entries(value)) {
+    if (!TOOL_VALUES.includes(tool)) throw protocolError('invalid_params', `unknown toolStatus entry: ${tool}`);
+    if (detail === null || typeof detail !== 'object' || Array.isArray(detail)) {
+      throw protocolError('invalid_params', `toolStatus.${tool} must be an object`);
+    }
+    for (const key of Object.keys(detail)) {
+      if (key !== 'available' && key !== 'reason') {
+        throw protocolError('invalid_params', `toolStatus.${tool} has an unsupported field`);
+      }
+    }
+    if (typeof detail.available !== 'boolean') {
+      throw protocolError('invalid_params', `toolStatus.${tool}.available must be a boolean`);
+    }
+    const entry = { available: detail.available };
+    if (detail.reason !== undefined) {
+      if (typeof detail.reason !== 'string' || [...detail.reason].length > 500 || /\p{Cc}/u.test(detail.reason)) {
+        throw protocolError('invalid_params', `toolStatus.${tool}.reason must be at most 500 printable characters`);
+      }
+      if (detail.reason.length > 0) entry.reason = detail.reason;
+    }
+    status[tool] = entry;
+  }
+  return status;
+}
+
 function buildCapabilities(tools, options = {}) {
   // An empty array is legal and means "connected, but this computer has no
   // session source right now". The contract's answer to that is an empty `tools`
@@ -437,13 +468,14 @@ function buildCapabilities(tools, options = {}) {
   // An unmeasured bit is false, never true by default (§9.5): the phone may
   // only show a control the desktop can really carry out.
   const flag = (optionKey, tool) => has(tool) && options[optionKey] === true;
-  return {
+  const capabilities = {
     'sessions.list': any,
     'session.read': any,
     'session.send': any,
-    'session.stop': has('codex') || has('dsh'),
+    'session.stop': any,
     'stop:codex': has('codex') ? options.stopCodex !== false : false,
     'stop:dsh': has('dsh') ? options.stopDsh !== false : false,
+    'stop:workbuddy': has('workbuddy') ? options.stopWorkbuddy === true : false,
     // CRD 0006: optional additions, false unless this desktop really has a
     // session source and really implements them.
     'models.list': any && options.modelsList === true,
@@ -453,29 +485,49 @@ function buildCapabilities(tools, options = {}) {
     // plain send without a model keeps working exactly as before.
     'session.send:model:codex': flag('sendModelCodex', 'codex'),
     'session.send:model:dsh': flag('sendModelDsh', 'dsh'),
+    'session.send:model:workbuddy': flag('sendModelWorkbuddy', 'workbuddy'),
     // CRD 0008: whether this desktop can hand a real answer back to a native
     // question. False is honest for a tool with no answer path at all.
     'session.answer:codex': flag('answerCodex', 'codex'),
     'session.answer:dsh': flag('answerDsh', 'dsh'),
+    'session.answer:workbuddy': flag('answerWorkbuddy', 'workbuddy'),
     // Requirement F: whether a generic native permission approval can be decided
     // from here. DSH really forwards `approval/request` over its event stream, so
     // this is a genuine ability; Codex's app-tools pipe has no such surface at
     // all, so its bit is false rather than a button that must fail.
     'session.approve:codex': flag('approveCodex', 'codex'),
     'session.approve:dsh': flag('approveDsh', 'dsh'),
+    'session.approve:workbuddy': flag('approveWorkbuddy', 'workbuddy'),
     tools: [...tools],
   };
+  const toolStatus = normalizeToolStatus(options.toolStatus);
+  if (toolStatus !== undefined) capabilities.toolStatus = toolStatus;
+  return capabilities;
 }
 
-/** @param {{clientName: string, capabilities: object}} input */
-function buildHello({ clientName, capabilities }) {
-  if (typeof clientName !== 'string' || clientName.trim().length === 0 || clientName.length > CLIENT_NAME_LIMIT) {
+/** @param {{clientName: string, clientId?: string, ownerName?: string, capabilities: object}} input */
+function buildHello({ clientName, clientId, ownerName, capabilities }) {
+  if (typeof clientName !== 'string' || clientName.trim().length === 0 || clientName.length > CLIENT_NAME_LIMIT || /\p{Cc}/u.test(clientName)) {
     throw protocolError('invalid_params', 'clientName must be 1-64 non-blank characters');
   }
   if (capabilities === null || typeof capabilities !== 'object') {
     throw protocolError('invalid_params', 'capabilities must be an object');
   }
-  return { type: 'hello', version: 1, clientName: clientName.trim(), capabilities };
+  const frame = { type: 'hello', version: 1, clientName: clientName.trim(), capabilities };
+  if (clientId !== undefined && clientId !== null) {
+    if (!isUuidV4(clientId) || clientId !== clientId.toLowerCase()) {
+      throw protocolError('invalid_params', 'clientId must be a canonical UUID v4');
+    }
+    frame.clientId = clientId;
+  }
+  if (ownerName !== undefined && ownerName !== null) {
+    const chars = typeof ownerName === 'string' ? [...ownerName].length : 0;
+    if (typeof ownerName !== 'string' || ownerName.trim() !== ownerName || chars < 1 || chars > 64 || /\p{Cc}/u.test(ownerName)) {
+      throw protocolError('invalid_params', 'ownerName must be a trimmed 1-64 character printable label');
+    }
+    frame.ownerName = ownerName;
+  }
+  return frame;
 }
 
 function buildPairCreate() {

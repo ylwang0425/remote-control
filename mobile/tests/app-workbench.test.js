@@ -99,7 +99,8 @@ function fakeApi(overrides) {
   const calls = [];
   const queues = {
     health: [], pair: [], list: [], read: [], send: [], stop: [], logout: [],
-    models: [], create: [], answer: [], approve: []
+    models: [], create: [], answer: [], approve: [], me: [], adminLogin: [],
+    adminLogout: [], adminComputers: [], adminRpc: [], adminEnrollmentCodes: []
   };
   const defaults = Object.assign({
     health: ok({ bridgeOnline: true }),
@@ -112,7 +113,23 @@ function fakeApi(overrides) {
     models: ok(DSH_CATALOG),
     create: ok({ sessionId: 'created-1', tool: 'dsh', model: 'deepseek-flash' }),
     answer: ok({ accepted: true, sessionId: 'b2', callId: 'call-42' }),
-    approve: ok({ accepted: true, sessionId: 'b2', approvalId: APPROVAL_ID, state: 'submitted' })
+    approve: ok({ accepted: true, sessionId: 'b2', approvalId: APPROVAL_ID, state: 'submitted' }),
+    me: err('unauthenticated', 'unauthenticated'),
+    adminLogin: ok({ role: 'admin' }),
+    adminLogout: ok({}),
+    adminComputers: ok({ computers: [] }),
+    adminRpc: function (request) {
+      const body = request.body;
+      if (body.method === 'sessions.list') return ok({ sessions: SESSIONS, capabilities: CAPS });
+      if (body.method === 'session.read') return readFor(body.params.sessionId);
+      if (body.method === 'models.list') return ok(DSH_CATALOG);
+      if (body.method === 'session.answer') return ok({ accepted: true, sessionId: body.params.sessionId, callId: body.params.callId });
+      if (body.method === 'session.approve') return ok({ accepted: true, sessionId: body.params.sessionId, approvalId: body.params.approvalId, state: 'submitted' });
+      if (body.method === 'session.send') return ok({ accepted: true, sessionId: body.params.sessionId });
+      if (body.method === 'session.stop') return ok({ accepted: true, sessionId: body.params.sessionId });
+      return err('not_capable', 'not capable');
+    },
+    adminEnrollmentCodes: ok({ code: 'TEST-ENROLLMENT-CODE', expiresAt: '2026-10-11T12:00:00Z' })
   }, overrides || {});
   function next(name, args) {
     calls.push({ name, args });
@@ -149,6 +166,12 @@ function fakeApi(overrides) {
       return next(name || ('unknown:' + body.method), [body]);
     },
     logout() { return next('logout', []); },
+    me() { return next('me', []); },
+    adminLogin(username, password) { return next('adminLogin', [{ username, password }]); },
+    adminLogout() { return next('adminLogout', []); },
+    adminComputers() { return next('adminComputers', []); },
+    adminRpc(clientId, body) { return next('adminRpc', [{ clientId, body }]); },
+    adminEnrollmentCodes() { return next('adminEnrollmentCodes', []); },
     callsOf(name) { return calls.filter((c) => c.name === name); }
   };
 }
@@ -211,6 +234,46 @@ function byAttr(doc, attr, value) {
 
 function chipByLabel(doc, id, label) {
   return doc.getElementById(id).children.filter((node) => node.textContent === label)[0] || null;
+}
+
+async function enterAdmin(options) {
+  const instance = boot(options);
+  await instance.app.start();
+  await instance.app.logout();
+  instance.doc.getElementById('pair-admin-login-toggle').dispatch('click');
+  instance.doc.getElementById('admin-username-input').value = 'operator';
+  instance.doc.getElementById('admin-password-input').value = 'admin-test-secret';
+  instance.doc.getElementById('admin-login-submit').dispatch('click');
+  await settle();
+  return instance;
+}
+
+function adminRpcFixture(targets, onCall) {
+  return function (request) {
+    if (onCall) onCall(request);
+    const target = targets[request.clientId];
+    if (!target || target.online === false) return err('target_offline', '电脑不在线或不存在');
+    const body = request.body;
+    if (body.method === 'sessions.list') {
+      return ok({ sessions: target.sessions || [], capabilities: target.capabilities || CAPS });
+    }
+    if (body.method === 'session.read') {
+      const read = target.reads && target.reads[body.params.sessionId] || target.read;
+      return read ? ok(read) : err('session_not_found', 'not found');
+    }
+    if (body.method === 'models.list') {
+      const catalog = target.catalogs && target.catalogs[body.params.tool] || target.catalog;
+      return catalog ? ok(catalog) : err('not_capable', 'this tool does not support listing models');
+    }
+    if (body.method === 'session.create') {
+      return ok(target.createResult || { sessionId: 'created-workbuddy', tool: body.params.tool, title: 'Created session' });
+    }
+    if (body.method === 'session.answer') return ok({ accepted: true, sessionId: body.params.sessionId, callId: body.params.callId });
+    if (body.method === 'session.approve') return ok({ accepted: true, sessionId: body.params.sessionId, approvalId: body.params.approvalId, state: 'submitted' });
+    if (body.method === 'session.send') return ok({ accepted: true, sessionId: body.params.sessionId });
+    if (body.method === 'session.stop') return ok({ accepted: true, sessionId: body.params.sessionId });
+    return err('not_capable', 'not capable');
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,7 +1312,7 @@ test('the project sheet folds the same directory written two ways into one optio
   await app.selectTab('chats');
   await app.openProjectSheet();
   // Both catalogs really landed: that is what the cue below is asserting.
-  assert.deepEqual(Object.keys(app.state.sessionCatalogs).sort(), ['codex', 'dsh']);
+  assert.deepEqual(Object.keys(app.state.sessionCatalogs['user:paired']).sort(), ['codex', 'dsh']);
 
   const rows = doc.getElementById('project-sheet-list').children;
   const names = rows.map((row) => row.textContent);
@@ -1554,4 +1617,272 @@ test('an unchanged poll does not churn the model picker options', async () => {
   assert.equal(doc.activeElement, inheritRow, 'focus inside the picker survives the poll');
   assert.equal(doc.getElementById('model-picker').hidden, false,
     'an open picker stays open across a poll');
+});
+
+test('admin login shows distinct computer identities, live tool status and explicit enrollment codes', async () => {
+  const computers = [
+    { clientId: 'pc-a', ownerName: 'Alex', clientName: 'Work PC', online: true,
+      lastSeen: '2026-10-11T09:00:00Z', tools: [{ id: 'workbuddy', available: false, reason: '没有可用的现有聊天 API' }] },
+    { clientId: 'pc-b', ownerName: 'Alex', clientName: 'Work PC', online: false,
+      lastSeen: '2026-10-10T09:00:00Z', tools: [{ id: 'codex', available: true }] }
+  ];
+  const targets = {
+    'pc-a': { sessions: [], capabilities: CAPS },
+    'pc-b': { sessions: [], capabilities: CAPS }
+  };
+  const instance = await enterAdmin({ defaults: {
+    adminComputers: ok({ computers }),
+    adminRpc: adminRpcFixture(targets)
+  } });
+  const { doc, app, api } = instance;
+
+  assert.equal(app.state.screen, 'admin-roster');
+  assert.equal(doc.getElementById('conn-badge').textContent, '电脑名册已更新',
+    'the badge reports roster readiness without implying a computer is selected online');
+  const cards = harness.queryAll(doc.getElementById('admin-computer-list'),
+    (node) => node.classList.contains('admin-computer-card'));
+  assert.equal(cards.length, 2, 'duplicate names remain separate computer cards');
+  assert.equal(byAttr(doc, 'data-client-id', 'pc-a').length, 1);
+  assert.equal(byAttr(doc, 'data-client-id', 'pc-b')[0].disabled, true,
+    'offline computers remain visible but cannot be opened');
+  assert.match(doc.getElementById('admin-computer-list').textContent, /WorkBuddy/);
+  assert.match(doc.getElementById('admin-computer-list').textContent, /未接入/);
+  assert.doesNotMatch(doc.getElementById('admin-computer-list').textContent, /没有可用的现有聊天 API/,
+    'technical backend reasons are not repeated in the roster copy');
+  const reasonTitle = byAttr(doc, 'title', '没有可用的现有聊天 API');
+  assert.equal(reasonTitle.length, 1, 'the raw reason remains available from the WorkBuddy status title');
+  const officialLinks = harness.queryAll(doc.getElementById('admin-computer-list'),
+    (node) => node.classList.contains('workbuddy-official-link'));
+  assert.equal(officialLinks.length, 1);
+  assert.equal(officialLinks[0].getAttribute('href'), 'https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice');
+  assert.match(officialLinks[0].textContent, /官方手机端多设备接入说明/);
+
+  chipByLabel(doc, 'admin-tool-filter', 'WorkBuddy').dispatch('click');
+  assert.equal(harness.queryAll(doc.getElementById('admin-computer-list'),
+    (node) => node.classList.contains('admin-computer-card')).length, 1,
+    'the tool filter uses the actual roster tool inventory');
+  doc.getElementById('admin-enrollment-button').dispatch('click');
+  await settle();
+  assert.equal(doc.getElementById('admin-enrollment-result').hidden, false);
+  assert.match(doc.getElementById('admin-enrollment-result').textContent, /TEST-ENROLLMENT-CODE/);
+  assert.equal(api.callsOf('adminEnrollmentCodes').length, 1,
+    'an enrollment code is requested only after the admin button is clicked');
+
+  byAttr(doc, 'data-client-id', 'pc-a')[0].dispatch('click');
+  await settle();
+  assert.equal(app.state.selectedComputer.clientId, 'pc-a');
+  assert.ok(api.callsOf('adminRpc').some((call) => call.args[0].clientId === 'pc-a' && call.args[0].body.method === 'sessions.list'));
+  assert.equal(api.callsOf('adminRpc').some((call) => call.args[0].clientId === 'pc-b'), false,
+    'the offline target receives no RPC');
+});
+
+test('admin login from settings clears the password and never stores credentials', async () => {
+  const { doc, app, storage, api } = boot({
+    responses: { me: [err('unauthenticated', 'unauthenticated'), ok({ role: 'user', clientId: 'paired-pc', ownerName: 'Pat', clientName: 'Home PC' })] },
+    defaults: { adminComputers: ok({ computers: [] }) }
+  });
+  await app.start();
+  await app.selectTab('settings');
+  doc.getElementById('settings-admin-login').dispatch('click');
+  assert.equal(app.state.screen, 'pair');
+  assert.equal(doc.getElementById('admin-login-panel').hidden, false);
+  doc.getElementById('admin-username-input').value = 'operator';
+  doc.getElementById('admin-password-input').value = 'admin-test-secret';
+  doc.getElementById('admin-login-submit').dispatch('click');
+  await settle();
+  assert.equal(app.state.screen, 'admin-roster');
+  assert.equal(doc.getElementById('admin-password-input').value, '');
+  assert.equal(Object.values(storage.dump()).join(' ').includes('admin-test-secret'), false);
+  assert.equal(Object.values(storage.dump()).join(' ').includes('operator'), false);
+
+  doc.getElementById('admin-logout-button').dispatch('click');
+  await settle();
+  assert.equal(api.callsOf('adminLogout').length, 1);
+  assert.equal(app.state.admin, false);
+  assert.equal(app.state.identity.clientId, 'paired-pc');
+  assert.equal(app.state.screen, 'settings', 'admin logout returns to the still-paired settings view');
+  assert.equal(doc.getElementById('admin-password-input').value, '');
+});
+
+test('same session and pending IDs stay isolated by computer; answers and approvals target the selected computer', async () => {
+  const capabilities = Object.assign({}, CAPS, {
+    'session.answer:dsh': true,
+    'session.approve:dsh': true,
+    tools: ['dsh']
+  });
+  function readForTarget(label, choice) {
+    return {
+      id: 'same-session', tool: 'dsh', title: label, status: 'idle', messages: [], canStop: false,
+      pendingQuestions: [{ callId: 'same-call', state: 'open', questions: [{ id: 'same-question', question: label + ' question?', options: [{ label: choice }] }] }],
+      pendingApprovals: [{ id: APPROVAL_ID, toolName: 'shell', callId: 'same-approval-call', reason: label + ' permission request' }]
+    };
+  }
+  const targets = {
+    'pc-a': { sessions: [{ id: 'same-session', tool: 'dsh', title: 'A list item', status: 'idle' }], capabilities, read: readForTarget('A session', 'A choice'), catalog: DSH_CATALOG },
+    'pc-b': { sessions: [{ id: 'same-session', tool: 'dsh', title: 'B list item', status: 'idle' }], capabilities, read: readForTarget('B session', 'B choice'), catalog: DSH_CATALOG }
+  };
+  const computers = ['pc-a', 'pc-b'].map((clientId) => ({
+    clientId, ownerName: clientId, clientName: 'Same name', online: true,
+    tools: [{ id: 'dsh', available: true }]
+  }));
+  const instance = await enterAdmin({ defaults: {
+    adminComputers: ok({ computers }),
+    adminRpc: adminRpcFixture(targets)
+  } });
+  const { doc, app, api } = instance;
+  byAttr(doc, 'data-client-id', 'pc-a')[0].dispatch('click');
+  await settle();
+  await app.openSession('same-session');
+  doc.getElementById('send-input').value = 'draft from A';
+  doc.getElementById('send-input').dispatch('input');
+  pickOption(doc, 'A choice');
+
+  doc.getElementById('admin-context-back').dispatch('click');
+  await settle();
+  byAttr(doc, 'data-client-id', 'pc-b')[0].dispatch('click');
+  await settle();
+  await app.openSession('same-session');
+  assert.equal(doc.getElementById('detail-title').textContent, 'B session');
+  assert.equal(doc.getElementById('send-input').value, '', 'A draft is not restored into B');
+  assert.match(doc.getElementById('questions-list').textContent, /B session question/);
+  assert.doesNotMatch(doc.getElementById('questions-list').textContent, /A session question/);
+  assert.equal(byAttr(doc, 'data-option-label', 'B choice')[0].getAttribute('class'), 'option');
+
+  pickOption(doc, 'B choice');
+  submitQuestions(doc, 'same-call');
+  await settle();
+  const answerCalls = api.callsOf('adminRpc').filter((call) => call.args[0].body.method === 'session.answer');
+  assert.equal(answerCalls.length, 1);
+  assert.equal(answerCalls[0].args[0].clientId, 'pc-b');
+  assert.deepEqual(answerCalls[0].args[0].body.params.answers, [{ id: 'same-question', selected: ['B choice'] }]);
+  submitQuestions(doc, 'same-call');
+  await settle();
+  assert.equal(api.callsOf('adminRpc').filter((call) => call.args[0].body.method === 'session.answer').length, 1,
+    'one click submits at most one answer for this computer and batch');
+
+  clickApproval(doc, '仅允许本次');
+  await settle();
+  const approvalCalls = api.callsOf('adminRpc').filter((call) => call.args[0].body.method === 'session.approve');
+  assert.equal(approvalCalls.length, 1);
+  assert.equal(approvalCalls[0].args[0].clientId, 'pc-b');
+  assert.equal(approvalCalls[0].args[0].body.params.approvalId, APPROVAL_ID);
+  assert.ok(Object.keys(app.state.drafts).some((key) => key.includes('admin:pc-a')));
+  assert.ok(Object.keys(app.state.drafts).some((key) => key.includes('admin:pc-b')));
+  assert.ok(Object.keys(app.state.answerDrafts).some((key) => key.includes('admin:pc-a')));
+  assert.ok(Object.keys(app.state.answerDrafts).some((key) => key.includes('admin:pc-b')));
+});
+
+test('a late response from computer A cannot replace computer B detail with the same session ID', async () => {
+  let finishA;
+  const targets = {
+    'pc-a': { sessions: [{ id: 'same-session', tool: 'dsh', title: 'A item', status: 'idle' }], capabilities: CAPS, catalog: DSH_CATALOG },
+    'pc-b': { sessions: [{ id: 'same-session', tool: 'dsh', title: 'B item', status: 'idle' }], capabilities: CAPS,
+      read: { id: 'same-session', tool: 'dsh', title: 'B current', status: 'idle', messages: [], pendingQuestions: [], pendingApprovals: [] }, catalog: DSH_CATALOG }
+  };
+  const handler = adminRpcFixture(targets, (request) => {
+    if (request.clientId === 'pc-a' && request.body.method === 'session.read') {
+      return;
+    }
+  });
+  const instance = await enterAdmin({ defaults: {
+    adminComputers: ok({ computers: ['pc-a', 'pc-b'].map((clientId) => ({ clientId, ownerName: clientId, clientName: 'PC', online: true, tools: [{ id: 'dsh', available: true }] })) }),
+    adminRpc: function (request) {
+      if (request.clientId === 'pc-a' && request.body.method === 'session.read') {
+        return new Promise((resolve) => { finishA = resolve; });
+      }
+      return handler(request);
+    }
+  } });
+  const { doc, app } = instance;
+  byAttr(doc, 'data-client-id', 'pc-a')[0].dispatch('click');
+  await settle();
+  const lateOpen = app.openSession('same-session');
+  await Promise.resolve();
+  assert.equal(typeof finishA, 'function');
+  doc.getElementById('admin-context-back').dispatch('click');
+  await settle();
+  byAttr(doc, 'data-client-id', 'pc-b')[0].dispatch('click');
+  await settle();
+  await app.openSession('same-session');
+  assert.equal(doc.getElementById('detail-title').textContent, 'B current');
+
+  finishA(ok({ id: 'same-session', tool: 'dsh', title: 'A late response', status: 'idle', messages: [], pendingQuestions: [], pendingApprovals: [] }));
+  await lateOpen;
+  assert.equal(doc.getElementById('detail-title').textContent, 'B current');
+  assert.equal(app.state.current.scopeKey, 'admin:pc-b');
+});
+
+test('WorkBuddy appears by its real tool ID and can create only from the selected target catalog', async () => {
+  const capabilities = {
+    'sessions.list': true,
+    'models.list': true,
+    'models.list:workbuddy': true,
+    'session.create': true,
+    'session.create:workbuddy': true,
+    tools: ['workbuddy']
+  };
+  const catalog = { tool: 'workbuddy', models: [{ id: 'wb-model-1', label: 'WorkBuddy model', provider: 'workbuddy-provider' }], projects: [] };
+  const targets = { 'workbuddy-pc': { sessions: [], capabilities, catalogs: { workbuddy: catalog }, createResult: { sessionId: 'new-wb', tool: 'workbuddy', title: 'WorkBuddy session' } } };
+  const instance = await enterAdmin({ defaults: {
+    adminComputers: ok({ computers: [{ clientId: 'workbuddy-pc', ownerName: 'Jo', clientName: 'Laptop', online: true, tools: [{ id: 'workbuddy', available: true }] }] }),
+    adminRpc: adminRpcFixture(targets)
+  } });
+  const { doc, app, api } = instance;
+  byAttr(doc, 'data-client-id', 'workbuddy-pc')[0].dispatch('click');
+  await settle();
+  await app.openNewSession();
+  await settle();
+  const button = byAttr(doc, 'data-tool', 'workbuddy').filter((node) => node.tagName === 'BUTTON')[0];
+  assert.ok(button);
+  assert.equal(button.textContent, 'WorkBuddy');
+  assert.equal(button.disabled, false);
+  assert.match(doc.getElementById('model-select').textContent, /WorkBuddy model/);
+  await app.submitNewSession();
+  const create = api.callsOf('adminRpc').filter((call) => call.args[0].body.method === 'session.create')[0];
+  assert.ok(create);
+  assert.equal(create.args[0].clientId, 'workbuddy-pc');
+  assert.equal(create.args[0].body.params.tool, 'workbuddy');
+  assert.equal(create.args[0].body.params.model, 'wb-model-1');
+});
+
+test('an explicitly unavailable WorkBuddy adapter shows the backend reason and sends no model or create request', async () => {
+  const capabilities = {
+    'sessions.list': true,
+    'models.list': true,
+    'models.list:workbuddy': true,
+    'session.create': true,
+    'session.create:workbuddy': true,
+    tools: ['workbuddy'],
+    toolStatus: { workbuddy: { available: false, reason: 'WorkBuddy host connection is not attached.' } }
+  };
+  const targets = { 'workbuddy-pc': { sessions: [], capabilities } };
+  const instance = await enterAdmin({ defaults: {
+    adminComputers: ok({ computers: [{ clientId: 'workbuddy-pc', ownerName: 'Jo', clientName: 'Laptop', online: true,
+      tools: [{ id: 'workbuddy', available: false, reason: 'WorkBuddy host connection is not attached.' }] }] }),
+    adminRpc: adminRpcFixture(targets)
+  } });
+  const { doc, app, api } = instance;
+  byAttr(doc, 'data-client-id', 'workbuddy-pc')[0].dispatch('click');
+  await settle();
+  await app.openNewSession();
+
+  const button = byAttr(doc, 'data-tool', 'workbuddy').filter((node) => node.tagName === 'BUTTON')[0];
+  assert.ok(button);
+  assert.equal(button.textContent, 'WorkBuddy');
+  assert.equal(button.disabled, true);
+  assert.equal(doc.getElementById('new-availability').hidden, true,
+    'the fallback card replaces the technical availability banner');
+  const officialHelp = doc.getElementById('workbuddy-official-help');
+  assert.equal(officialHelp.hidden, false);
+  assert.equal(officialHelp.textContent, 'WorkBuddy 暂未接入此工作台。可在官方手机 App 登录与电脑相同的账号，继续已有聊天。查看 WorkBuddy 官方手机端多设备接入说明');
+  assert.equal(officialHelp.getAttribute('title'), 'WorkBuddy host connection is not attached.',
+    'the raw backend reason is available once as a title, not repeated in the product copy');
+  assert.doesNotMatch(officialHelp.textContent, /原生|接口|伪造|API/);
+  assert.equal(doc.getElementById('new-native-controls').hidden, true,
+    'unavailable WorkBuddy has no visible model or fake chat creation controls');
+  assert.equal(harness.queryAll(officialHelp,
+    (node) => node.getAttribute && node.getAttribute('href') === 'https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice').length, 1);
+  const methods = api.callsOf('adminRpc').map((call) => call.args[0].body.method);
+  assert.equal(methods.includes('models.list'), false);
+  assert.equal(methods.includes('session.create'), false);
 });

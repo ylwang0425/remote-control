@@ -122,6 +122,24 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+.admin-context {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  margin-left: auto;
+}
+
+.admin-context-name {
+  max-width: min(48vw, 360px);
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 #appbar-title { font-size: 17px; margin: 0; font-weight: 600; }
 
 /* The app bar's right-hand cluster: the new-chat action and the connection
@@ -133,6 +151,207 @@ body {
   gap: 8px;
   flex: 0 0 auto;
   min-width: 0;
+}
+
+.admin-login-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.admin-login-actions,
+.admin-roster-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.admin-roster-head > div {
+  min-width: 0;
+}
+
+.admin-roster-head > button,
+.admin-computer-head > button {
+  flex: 0 0 auto;
+  padding-inline: 12px;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.admin-computer-list {
+  display: grid;
+  gap: 12px;
+  padding-bottom: 20px;
+}
+
+.admin-owner-group {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-owner-title {
+  margin: 16px 0 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.admin-computer-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.admin-computer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.admin-computer-name {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 16px;
+}
+
+.admin-computer-id {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.admin-computer-status {
+  margin: 8px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-tool-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 10px 0;
+}
+
+.admin-tool-chip {
+  display: inline-flex;
+  flex-direction: column;
+  max-width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.admin-tool-chip[data-available="true"] {
+  border-color: var(--success-border, var(--border));
+}
+
+.admin-tool-state {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.admin-enrollment {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.admin-enrollment p {
+  margin: 0;
+}
+
+.admin-enrollment-result {
+  padding: 9px;
+  border-radius: 8px;
+  background: var(--surface-raised, var(--background));
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.workbuddy-official-help {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+
+.workbuddy-official-help p { margin: 0; }
+
+.workbuddy-official-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--tap);
+  max-width: 100%;
+  color: var(--accent);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  text-decoration: underline;
+}
+
+.workbuddy-official-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.new-native-controls { display: contents; }
+
+@media (max-width: 390px) {
+  #appbar {
+    gap: 6px;
+  }
+
+  #appbar-title {
+    font-size: 16px;
+  }
+
+  .admin-context-name {
+    max-width: 35vw;
+  }
+
+  .admin-roster-head,
+  .admin-computer-head {
+    align-items: center;
+  }
+}
+
+@media (max-width: 480px) {
+  #appbar {
+    flex-wrap: wrap;
+  }
+
+  #appbar-title {
+    flex: 1 1 auto;
+  }
+
+  .admin-context {
+    order: 3;
+    flex: 1 0 100%;
+    justify-content: space-between;
+    margin-left: 0;
+  }
+
+  .admin-context-name {
+    max-width: calc(100vw - 150px);
+  }
 }
 
 /* The new-chat action.

@@ -44,6 +44,8 @@ class BridgeClient {
     this.url = options.url;
     this.token = options.token;
     this.clientName = options.clientName;
+    this.clientId = options.clientId ?? null;
+    this.ownerName = options.ownerName ?? null;
     this.capabilities = options.capabilities;
     this.dispatch = options.dispatch;
     this.backoff = options.backoff ?? new Backoff();
@@ -142,7 +144,7 @@ class BridgeClient {
     socket.on('open', () => {
       this.lastFrameAt = Date.now();
       this.state = 'handshaking';
-      this.sendFrame(buildHello({ clientName: this.clientName, capabilities: this.capabilities }));
+      this.sendFrame(this.helloFrame());
       clearTimeout(this.helloTimer);
       this.helloTimer = setTimeout(() => {
         // No hello.ok: drop the socket and let the normal reconnect path retry.
@@ -160,6 +162,10 @@ class BridgeClient {
     });
     socket.on('error', (error) => this.emit('error', error));
     socket.on('close', (code) => {
+      // `updateConnection` and `stop` may retire a socket while another socket
+      // is already active. A late close from the retired connection must never
+      // clear the new socket or schedule a duplicate reconnect.
+      if (this.socket !== socket) return;
       clearTimeout(this.helloTimer);
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -216,6 +222,52 @@ class BridgeClient {
     } catch (error) {
       this.emit('error', error);
       return false;
+    }
+  }
+
+  helloFrame() {
+    return buildHello({
+      clientName: this.clientName,
+      clientId: this.clientId,
+      ownerName: this.ownerName,
+      capabilities: this.capabilities,
+    });
+  }
+
+  /** Update the computer label on the authenticated connection. The relay accepts a repeated hello. */
+  updateIdentity({ clientId = this.clientId, ownerName = this.ownerName, clientName = this.clientName } = {}) {
+    const frame = buildHello({ clientId, ownerName, clientName, capabilities: this.capabilities });
+    this.clientId = clientId;
+    this.ownerName = ownerName;
+    this.clientName = clientName;
+    if (this.connected) return this.sendFrame(frame);
+    return false; // the next handshake carries the current identity
+  }
+
+  /** Replace relay credentials and reconnect only this bridge transport. */
+  updateConnection({ url = this.url, token = this.token, clientId = this.clientId, ownerName = this.ownerName, clientName = this.clientName } = {}) {
+    if (typeof url !== 'string' || url.length === 0 || typeof token !== 'string' || token.length === 0) {
+      throw new TypeError('the relay URL and credential are required');
+    }
+    // Validate all hello fields before changing the active connection settings.
+    buildHello({ clientId, ownerName, clientName, capabilities: this.capabilities });
+    this.url = url;
+    this.token = token;
+    this.clientId = clientId;
+    this.ownerName = ownerName;
+    this.clientName = clientName;
+    this.authRejected = false;
+    this.backoff.reset();
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (this.socket !== null) {
+      const previous = this.socket;
+      this.socket = null;
+      this.state = 'reconnecting';
+      previous.destroy();
+    }
+    if (!this.stopped) {
+      void this.connectOnce();
     }
   }
 
@@ -435,6 +487,8 @@ class BridgeClient {
     return {
       relayUrl: this.url,
       clientName: this.clientName,
+      clientId: this.clientId,
+      ownerName: this.ownerName,
       connected: this.connected,
       state: this.state,
       authRejected: this.authRejected,

@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -101,7 +102,7 @@ func TestCallWhenOffline(t *testing.T) {
 // own id, and the matching response is the only one that completes it.
 func TestCallHappyPathAndIDSeparation(t *testing.T) {
 	h := NewHub()
-	fs, _ := helloHub(t, h)
+	fs, c := helloHub(t, h)
 
 	ids := make(chan string, 2)
 	fs.onSend = func(frame *protocol.Frame) {
@@ -114,7 +115,7 @@ func TestCallHappyPathAndIDSeparation(t *testing.T) {
 				"type": "response", "id": id, "ok": true,
 				"result": map[string]any{"sessions": []any{}, "capabilities": map[string]any{}},
 			})
-			h.Deliver(id, payload)
+			h.DeliverFrom(c, id, payload)
 		}(frame.ID)
 	}
 
@@ -133,7 +134,7 @@ func TestCallHappyPathAndIDSeparation(t *testing.T) {
 	go func() { done <- h.Call(context.Background(), "sessions.list", json.RawMessage(`{}`), 2*time.Second) }()
 	time.Sleep(50 * time.Millisecond)
 	stale, _ := json.Marshal(map[string]any{"type": "response", "id": "00000000-0000-4000-8000-000000000000", "ok": true, "result": map[string]any{}})
-	h.Deliver("00000000-0000-4000-8000-000000000000", stale)
+	h.DeliverFrom(c, "00000000-0000-4000-8000-000000000000", stale)
 	select {
 	case r := <-done:
 		if r.Code != protocol.CodeBridgeTimeout {
@@ -257,13 +258,13 @@ func TestResponseIsValidatedBeforeItReachesThePhone(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := NewHub()
-			fs, _ := helloHub(t, h)
+			fs, c := helloHub(t, h)
 			fs.onSend = func(frame *protocol.Frame) {
 				if frame.Type != protocol.FrameRequest {
 					return
 				}
 				payload := []byte(replaceID(tc.response, frame.ID))
-				h.Deliver(frame.ID, payload)
+				h.DeliverFrom(c, frame.ID, payload)
 			}
 			reply := h.Call(context.Background(), "session.send", json.RawMessage(`{"tool":"codex","sessionId":"s1","text":"hi"}`), 2*time.Second)
 			if tc.wantCode == "" {
@@ -299,7 +300,7 @@ func TestEmptyToolsTrimsSessionsList(t *testing.T) {
 				"capabilities": map[string]any{},
 			},
 		})
-		h.Deliver(frame.ID, payload)
+		h.DeliverFrom(c, frame.ID, payload)
 	}
 
 	reply := h.Call(context.Background(), "sessions.list", json.RawMessage(`{}`), 2*time.Second)
@@ -343,6 +344,103 @@ func TestPickPrefersTheLeastBusyConnection(t *testing.T) {
 	_ = fsA
 	_ = cA
 	<-done
+}
+
+func TestCallComputerRoutesOverlappingSessionIDsByIdentity(t *testing.T) {
+	h := NewHub()
+	clientA := "0f1c7a2e-9b64-4c5f-8f1a-2d3e4b5c6a70"
+	clientB := "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	makeDesktop := func(id, title string) (*fakeSender, *Conn) {
+		fs := &fakeSender{}
+		conn := h.Register(fs.send)
+		h.HelloIdentity(conn, id, title, "DESKTOP", protocol.Capabilities{Tools: []string{"codex"}})
+		fs.onSend = func(frame *protocol.Frame) {
+			if frame.Type != protocol.FrameRequest {
+				return
+			}
+			response, _ := json.Marshal(map[string]any{
+				"type": "response", "id": frame.ID, "ok": true,
+				"result": map[string]any{
+					"id": "shared-session", "tool": "codex", "title": title,
+					"status": "working", "messages": []any{}, "canStop": false,
+				},
+			})
+			h.DeliverFrom(conn, frame.ID, response)
+		}
+		return fs, conn
+	}
+	_, connA := makeDesktop(clientA, "Computer A")
+	_, connB := makeDesktop(clientB, "Computer B")
+	defer h.Unregister(connA)
+	defer h.Unregister(connB)
+
+	params := json.RawMessage(`{"tool":"codex","sessionId":"shared-session"}`)
+	for _, tc := range []struct {
+		clientID string
+		want     string
+	}{{clientA, "Computer A"}, {clientB, "Computer B"}} {
+		reply := h.CallComputer(context.Background(), tc.clientID, "session.read", params, time.Second)
+		if reply.Code != "" || reply.Err != nil {
+			t.Fatalf("CallComputer(%s) = %+v", tc.clientID, reply)
+		}
+		var result struct {
+			Title string `json:"title"`
+		}
+		if err := json.Unmarshal(reply.Result, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Title != tc.want {
+			t.Fatalf("CallComputer(%s) reached %q, want %q", tc.clientID, result.Title, tc.want)
+		}
+	}
+}
+
+func TestResponseFromWrongComputerCannotCompletePendingCall(t *testing.T) {
+	h := NewHub()
+	clientA := "0f1c7a2e-9b64-4c5f-8f1a-2d3e4b5c6a70"
+	clientB := "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	fsA, connA := helloHub(t, h)
+	h.HelloIdentity(connA, clientA, "A", "DESKTOP-A", protocol.Capabilities{Tools: []string{"codex"}})
+	fsB := &fakeSender{}
+	connB := h.Register(fsB.send)
+	h.HelloIdentity(connB, clientB, "B", "DESKTOP-B", protocol.Capabilities{Tools: []string{"codex"}})
+	defer h.Unregister(connA)
+	defer h.Unregister(connB)
+
+	resultCh := make(chan Reply, 1)
+	go func() {
+		resultCh <- h.CallComputer(context.Background(), clientA, "session.read", json.RawMessage(`{"tool":"codex","sessionId":"s1"}`), 2*time.Second)
+	}()
+	time.Sleep(40 * time.Millisecond)
+	request := fsA.last()
+	if request == nil || request.Type != protocol.FrameRequest {
+		t.Fatal("target computer A did not receive the request")
+	}
+	forged, _ := json.Marshal(map[string]any{
+		"type": "response", "id": request.ID, "ok": true,
+		"result": map[string]any{"id": "s1", "tool": "codex", "title": "forged", "status": "working", "messages": []any{}, "canStop": false},
+	})
+	if h.DeliverFrom(connB, request.ID, forged) {
+		t.Fatal("response from computer B was accepted for computer A's pending request")
+	}
+	if h.PendingCount() != 1 {
+		t.Fatal("forged response removed the pending call")
+	}
+	valid, _ := json.Marshal(map[string]any{
+		"type": "response", "id": request.ID, "ok": true,
+		"result": map[string]any{"id": "s1", "tool": "codex", "title": "real", "status": "working", "messages": []any{}, "canStop": false},
+	})
+	if !h.DeliverFrom(connA, request.ID, valid) {
+		t.Fatal("response from the originating computer was dropped")
+	}
+	select {
+	case reply := <-resultCh:
+		if reply.Code != "" || !strings.Contains(string(reply.Result), `"title":"real"`) {
+			t.Fatalf("call returned the wrong response: %+v", reply)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("originating response did not complete the pending call")
+	}
 }
 
 func replaceID(template, id string) string {

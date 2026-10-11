@@ -15,6 +15,7 @@ const http = require('node:http');
 
 const { LocalUiServer, ALLOWED_ORIGIN_PREFIX } = require('../src/ui/server');
 const { loadConfig, configPath, redactedConfig } = require('../src/config');
+const { EnrollmentError } = require('../src/enrollment');
 
 function request(port, options) {
   return new Promise((resolve, reject) => {
@@ -77,6 +78,10 @@ test('the page is served on loopback with the status JSON beside it', async (t) 
   assert.equal(page.status, 200);
   assert.match(page.headers['content-type'], /text\/html/);
   assert.match(page.body, /AI Remote/);
+  assert.match(page.body, /id="ownerName" type="text" maxlength="128"/);
+  const inlineScript = page.body.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(inlineScript, 'the local page has its identity form script');
+  assert.doesNotThrow(() => new Function(inlineScript), 'the inline page script parses');
   assert.match(page.headers['x-content-type-options'], /nosniff/);
 
   const status = await request(port, { path: '/api/status' });
@@ -131,6 +136,101 @@ test('a write without the CSRF token is refused, with it it works', async (t) =>
   assert.equal(body.ok, true);
   assert.match(body.code, /^[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){5}$/);
   assert.ok(body.url.startsWith('https://101.43.98.18/#pair='));
+});
+
+test('computer identity writes are CSRF-protected and never expose enrollment credentials', async (t) => {
+  const clientId = '98c9e96b-5d91-4a04-8d89-e2bdd29e30a5';
+  const received = [];
+  const { port, csrfToken } = await startUi(t, {
+    onIdentityUpdate: async ({ ownerName }) => ({ identity: { clientId, ownerName: ownerName.trim() }, helloUpdated: true }),
+    onEnroll: async (input) => {
+      received.push(input);
+      return {
+        identity: { clientId, ownerName: input.ownerName.trim() },
+        relayUrl: 'wss://relay.example/bridge',
+        connected: true,
+        connecting: false,
+        bridgeToken: 'must-not-reach-the-page',
+      };
+    },
+  });
+  const origin = `${ALLOWED_ORIGIN_PREFIX}${port}`;
+  const denied = await request(port, {
+    method: 'POST', path: '/api/identity', headers: { Origin: origin, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerName: 'admin' }),
+  });
+  assert.equal(denied.status, 403);
+
+  const saved = await request(port, {
+    method: 'POST', path: '/api/identity',
+    headers: { Origin: origin, 'X-CSRF-Token': csrfToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerName: ' admin ' }),
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(JSON.parse(saved.body), { ok: true, identity: { clientId, ownerName: 'admin' }, helloUpdated: true });
+
+  const foreign = await request(port, {
+    method: 'POST', path: '/api/enroll',
+    headers: { Origin: 'https://evil.example', 'X-CSRF-Token': csrfToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: 'invitation', ownerName: 'admin', relayUrl: 'wss://relay.example/bridge' }),
+  });
+  assert.equal(foreign.status, 403);
+  assert.deepEqual(received, [], 'a foreign origin cannot consume an invitation');
+
+  const enrolled = await request(port, {
+    method: 'POST', path: '/api/enroll',
+    headers: { Origin: origin, 'X-CSRF-Token': csrfToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: 'one-use-secret', ownerName: 'admin', relayUrl: 'wss://relay.example/bridge' }),
+  });
+  assert.equal(enrolled.status, 200);
+  assert.equal(received.length, 1);
+  assert.equal(received[0].code, 'one-use-secret');
+  assert.ok(!enrolled.body.includes('one-use-secret'));
+  assert.ok(!enrolled.body.includes('must-not-reach-the-page'));
+  assert.ok(!enrolled.body.includes('bridgeToken'));
+  assert.deepEqual(JSON.parse(enrolled.body), {
+    ok: true,
+    identity: { clientId, ownerName: 'admin' },
+    relayUrl: 'wss://relay.example/bridge',
+    connected: true,
+    connecting: false,
+  });
+});
+
+test('oversized pairing requests are drained and rejected before consuming a code', async (t) => {
+  let pairCalls = 0;
+  const { port, csrfToken } = await startUi(t, {
+    onPairCreate: async () => { pairCalls += 1; return { code: 'unused' }; },
+  });
+  const response = await request(port, {
+    method: 'POST',
+    path: '/api/pair',
+    headers: {
+      Origin: `${ALLOWED_ORIGIN_PREFIX}${port}`,
+      'X-CSRF-Token': csrfToken,
+      'Content-Length': '5000',
+    },
+    body: 'x'.repeat(5000),
+  });
+  assert.equal(response.status, 413);
+  assert.equal(JSON.parse(response.body).error.code, 'body_too_large');
+  assert.equal(pairCalls, 0);
+});
+
+test('computer identity endpoint rejects unknown fields and keeps error messages bounded', async (t) => {
+  const { port, csrfToken } = await startUi(t, {
+    onIdentityUpdate: async () => { throw new EnrollmentError('invalid_params', 'Computer name must be 1–64 printable characters.'); },
+  });
+  const headers = { Origin: `${ALLOWED_ORIGIN_PREFIX}${port}`, 'X-CSRF-Token': csrfToken, 'Content-Type': 'application/json' };
+  const extra = await request(port, {
+    method: 'POST', path: '/api/identity', headers, body: JSON.stringify({ ownerName: 'admin', bridgeToken: 'guess' }),
+  });
+  assert.equal(extra.status, 400);
+  const invalid = await request(port, {
+    method: 'POST', path: '/api/identity', headers, body: JSON.stringify({ ownerName: 'bad\nname' }),
+  });
+  assert.equal(invalid.status, 400);
+  assert.match(JSON.parse(invalid.body).error.message, /printable/);
 });
 
 test('the pairing code is never cached and never logged by the response headers', async (t) => {
@@ -198,6 +298,10 @@ test('config: defaults, file values and environment overrides', async () => {
     const fromEnv = loadConfig({ path: file, env: { AI_REMOTE_BRIDGE_TOKEN: 'from-env-token', AI_REMOTE_UI_PORT: '20001' } });
     assert.equal(fromEnv.bridgeToken, 'from-env-token');
     assert.equal(fromEnv.uiPort, 20001);
+    assert.equal(fromEnv.bridgeTokenOverridden, true);
+
+    const relayOverride = loadConfig({ path: file, env: { AI_REMOTE_RELAY_URL: '' } });
+    assert.equal(relayOverride.relayUrlOverridden, true, 'even an empty explicit environment override must block a misleading enrollment');
 
     const missing = loadConfig({ path: path.join(os.tmpdir(), 'does-not-exist.json'), env: {} });
     assert.equal(missing.relayUrl, 'wss://101.43.98.18/bridge');

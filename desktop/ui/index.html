@@ -28,6 +28,9 @@
   .box { border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-top: 8px; }
   .box ol { margin: 0; padding-left: 20px; }
   .box li + li { margin-top: 6px; }
+  .field { display: grid; gap: 4px; margin: 10px 0; }
+  input { width: 100%; max-width: 560px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--fg); background: var(--soft); font: inherit; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   .hidden { display: none; }
   @media (max-width: 480px) {
     body { padding: 16px 12px 32px; }
@@ -60,11 +63,31 @@
     </table>
   </div>
 
+  <h2>电脑身份与注册</h2>
+  <div class="box">
+    <label class="field" for="ownerName">使用者姓名（在管理员端显示）
+      <input id="ownerName" type="text" maxlength="128" autocomplete="name" placeholder="请输入你的姓名">
+    </label>
+    <p class="note">管理员会按此姓名识别你的电脑。首次使用需填写姓名和管理员提供的登记码；已登记的电脑可以直接保存姓名。</p>
+    <button id="saveIdentity">保存姓名</button>
+    <hr>
+    <label class="field" for="relayUrl">中继地址
+      <input id="relayUrl" type="url" maxlength="2048" autocomplete="url" placeholder="wss://example.com/bridge 或 https://example.com">
+    </label>
+    <label class="field" for="enrollmentCode">管理员生成的一次性注册码
+      <input id="enrollmentCode" type="password" maxlength="256" autocomplete="one-time-code">
+    </label>
+    <p class="note">注册码只发送给 HTTPS 中继一次，用完即清除；中继返回的电脑凭据只保存到本机配置文件，不会交给网页显示。</p>
+    <div class="actions"><button id="enroll">注册这台电脑</button></div>
+    <p id="identityResult" class="note" role="status" aria-live="polite"></p>
+  </div>
+
   <h2>会话来源</h2>
   <div class="card">
     <table>
       <tr><th>Codex Desktop</th><td id="codex">—</td></tr>
       <tr><th>DSH Desktop</th><td id="dsh">—</td></tr>
+      <tr><th>WorkBuddy</th><td id="workbuddy">—</td></tr>
     </table>
   </div>
 
@@ -135,13 +158,14 @@
   function toolLabel(tool) {
     if (tool === 'codex') return 'Codex';
     if (tool === 'dsh') return 'DSH';
+    if (tool === 'workbuddy') return 'WorkBuddy';
     return String(tool);
   }
 
   /** 逐工具列出停止 / 回答 / 批准这三项是否被本机上报为可用。 */
   function describePerTool(caps) {
     const tools = Array.isArray(caps.tools)
-      ? caps.tools.filter((tool) => tool === 'codex' || tool === 'dsh')
+      ? caps.tools.filter((tool) => tool === 'codex' || tool === 'dsh' || tool === 'workbuddy')
       : [];
     return tools.map((tool) => {
       const flags = parts([
@@ -195,13 +219,27 @@
     return { text: extra.length > 0 ? '已连接 — ' + extra.join('，') : '已连接', className: 'ok' };
   }
 
+  function describeWorkbuddy(workbuddy) {
+    if (!workbuddy || workbuddy.available !== true) {
+      return { text: '不可用 — ' + ((workbuddy && workbuddy.reason) || '没有接入原生会话控制通道'), className: 'warn' };
+    }
+    return { text: '已连接', className: 'ok' };
+  }
+
+  function showIdentityResult(text, className) {
+    const result = document.getElementById('identityResult');
+    result.textContent = text;
+    result.className = 'note' + (className ? ' ' + className : '');
+  }
+
   async function refresh() {
     try {
       const response = await fetch('/api/status', { headers: { Accept: 'application/json' } });
       const state = await response.json();
       const bridge = state.bridge || {};
       set('link', bridge.connected ? '已连接' : '尚未连接', bridge.connected ? 'ok' : 'warn');
-      set('client', bridge.clientName || '—');
+      const identity = state.identity || {};
+      set('client', identity.ownerName ? identity.ownerName + (bridge.clientName ? '（' + bridge.clientName + '）' : '') : (bridge.clientName || '—'));
       set('relay', bridge.relayUrl || '—');
       const links = describeLinks(bridge);
       set('caps', links.text, links.className);
@@ -209,10 +247,73 @@
       set('codex', codex.text, codex.className);
       const dsh = describeDsh(state.dsh);
       set('dsh', dsh.text, dsh.className);
+      const workbuddy = describeWorkbuddy(state.workbuddy);
+      set('workbuddy', workbuddy.text, workbuddy.className);
+      const nameField = document.getElementById('ownerName');
+      if (nameField.dataset.initialized !== 'true') {
+        nameField.value = identity.ownerName || '';
+        nameField.dataset.initialized = 'true';
+      }
+      const relayField = document.getElementById('relayUrl');
+      if (relayField.dataset.initialized !== 'true') {
+        relayField.value = bridge.relayUrl || '';
+        relayField.dataset.initialized = 'true';
+      }
     } catch (error) {
       set('link', '本机页面连不上自己的服务', 'bad');
     }
   }
+
+  async function postLocal(path, value) {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
+      body: JSON.stringify(value),
+    });
+    const result = await response.json();
+    if (!result.ok) throw new Error((result.error && result.error.message) || '本机服务没有应答');
+    return result;
+  }
+
+  document.getElementById('saveIdentity').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const result = await postLocal('/api/identity', { ownerName: document.getElementById('ownerName').value });
+      showIdentityResult(result.helloUpdated ? '名称已保存，并已通过现有连接更新。' : '名称已保存在本机；桥接程序连接后会发送。', 'ok');
+      document.getElementById('ownerName').value = result.identity.ownerName;
+    } catch (error) {
+      showIdentityResult(String(error.message || error), 'bad');
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  document.getElementById('enroll').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const code = document.getElementById('enrollmentCode');
+    button.disabled = true;
+    try {
+      const result = await postLocal('/api/enroll', {
+        code: code.value,
+        ownerName: document.getElementById('ownerName').value,
+        relayUrl: document.getElementById('relayUrl').value,
+      });
+      const message = result.connected
+        ? '电脑已注册，正在使用新凭据连接。'
+        : result.connecting
+          ? '电脑已注册，桥接正在使用新凭据重新连接。'
+          : '电脑已注册；桥接连接当前未运行。';
+      showIdentityResult(message, result.connected || result.connecting ? 'ok' : 'warn');
+      document.getElementById('ownerName').value = result.identity.ownerName;
+      document.getElementById('relayUrl').value = result.relayUrl;
+    } catch (error) {
+      showIdentityResult(String(error.message || error), 'bad');
+    } finally {
+      code.value = '';
+      button.disabled = false;
+    }
+  });
 
   document.getElementById('pair').addEventListener('click', async () => {
     const button = document.getElementById('pair');

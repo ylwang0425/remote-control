@@ -316,6 +316,41 @@ test('a decision is submitted once, with the exact clientId, eventId and outcome
   assert.equal(backend.results().length, 1, 'a second tap never reaches native');
 });
 
+test('one native approval is submitted once when allow and reject race in flight', async (t) => {
+  const backend = await startNativeBackend(t);
+  const { stream } = startStream(backend);
+  t.after(() => stream.close());
+  stream.start();
+  assert.ok(await waitFor(() => backend.peers.length === 1));
+  const peer = backend.peers[0];
+  peer.sendItem({ type: 'ready', clientId: 'client-A', host: {} });
+  assert.ok(await waitFor(() => stream.connected));
+  peer.sendItem(approvalFrame());
+  assert.ok(await waitFor(() => stream.approvalsFor(SESSION_ID).length === 1));
+
+  const gate = {};
+  const released = new Promise((resolve) => { gate.resolve = resolve; });
+  const realPostResult = stream.postResult;
+  let submissions = 0;
+  stream.postResult = async (request) => {
+    submissions += 1;
+    await released;
+    return realPostResult.call(stream, request);
+  };
+  const first = stream.submitApproval({ sessionId: SESSION_ID, approvalId: APPROVAL_ID, decision: 'allow-once' });
+  assert.ok(await waitFor(() => submissions === 1));
+  const second = await stream.submitApproval({ sessionId: SESSION_ID, approvalId: APPROVAL_ID, decision: 'reject' }).catch((error) => error);
+  assert.equal(second.code, 'session_not_found', 'the second action cannot take the already-claimed native event');
+  assert.deepEqual(stream.approvalsFor(SESSION_ID), [], 'the original pending card disappears before the native result is sent');
+
+  gate.resolve();
+  assert.deepEqual(await first, { accepted: true, state: 'submitted' });
+  assert.equal(submissions, 1);
+  assert.deepEqual(backend.results(), [
+    { clientId: 'client-A', eventId: APPROVAL_ID, outcome: { kind: 'result', value: 'allowed-once' } },
+  ]);
+});
+
 test('an unknown, wrong-session or already-cancelled approval is refused without sending', async (t) => {
   const backend = await startNativeBackend(t);
   const { stream } = startStream(backend);

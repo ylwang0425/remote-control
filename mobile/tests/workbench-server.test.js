@@ -80,7 +80,10 @@ async function startSession(options) {
       const setCookie = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
       setCookie.forEach((value) => {
         const match = /^(rc_session=[A-Za-z0-9_-]{43})/.exec(value);
-        if (match) jar.cookie = match[1];
+        const adminMatch = /^(rc_admin=[A-Za-z0-9_-]{43})/.exec(value);
+        if (match) jar.cookie = [jar.cookie.split('; ').filter((item) => !item.startsWith('rc_session=')).join('; '), match[1]].filter(Boolean).join('; ');
+        if (adminMatch) jar.cookie = [jar.cookie.split('; ').filter((item) => !item.startsWith('rc_admin=')).join('; '), adminMatch[1]].filter(Boolean).join('; ');
+        if (/^rc_admin=;/.test(value)) jar.cookie = jar.cookie.split('; ').filter((item) => !item.startsWith('rc_admin=')).join('; ');
       });
       return response;
     });
@@ -125,6 +128,64 @@ test('sessions.list and session.read carry the workbench projections over real H
       capabilities: WORKBENCH_CAPS, tool: 'dsh', read: read.result
     })[0].id, APPROVAL_ID);
     assert.equal(core.readNeedsInput({ capabilities: WORKBENCH_CAPS, tool: 'dsh', read: read.result }), true);
+  } finally {
+    await session.mock.close();
+  }
+});
+
+test('admin login, identity, roster, exact targeting, offline failure and logout stay separate from pairing', async () => {
+  const session = await startSession({
+    computers: [
+      { clientId: 'same-name-a', ownerName: 'Alex', clientName: 'Work PC', online: true,
+        lastSeen: '2026-10-11T09:00:00Z', tools: [{ id: 'workbuddy', available: false, reason: '聊天 API 尚未连接' }],
+        sessions: [{ id: 'same-session', tool: 'workbuddy', title: 'A session', status: 'idle' }],
+        capabilities: { 'sessions.list': true, tools: ['workbuddy'] } },
+      { clientId: 'same-name-b', ownerName: 'Alex', clientName: 'Work PC', online: false,
+        lastSeen: '2026-10-10T09:00:00Z', tools: [{ id: 'codex', available: true }], sessions: [] }
+    ]
+  });
+  try {
+    const before = await session.api.me();
+    assert.equal(before.ok, true);
+    assert.equal(before.result.role, 'user');
+    assert.equal(before.result.clientId, 'client-user-1');
+
+    const login = await session.api.adminLogin('admin', 'mock-admin-password');
+    assert.equal(login.ok, true);
+    const admin = await session.api.me();
+    assert.deepEqual(admin.result, { role: 'admin' });
+    const roster = await session.api.adminComputers();
+    assert.equal(roster.ok, true);
+    assert.deepEqual(roster.result.computers.map((computer) => computer.clientId), ['same-name-a', 'same-name-b']);
+    assert.equal(roster.result.computers[0].tools[0].id, 'workbuddy');
+    assert.equal(roster.result.computers[0].tools[0].available, false);
+
+    const listed = await session.api.adminRpc('same-name-a', { method: 'sessions.list', params: {} });
+    assert.equal(listed.ok, true);
+    assert.equal(listed.result.sessions[0].id, 'same-session');
+    const offline = await session.api.adminRpc('same-name-b', { method: 'sessions.list', params: {} });
+    assert.equal(offline.ok, false);
+    assert.equal(offline.status, 503);
+    assert.equal(offline.code, 'target_offline');
+    const unknown = await session.api.adminRpc('missing-client', { method: 'sessions.list', params: {} });
+    assert.equal(unknown.ok, false);
+    assert.equal(unknown.status, 503);
+    assert.equal(unknown.code, 'target_offline');
+    assert.deepEqual(session.mock.state.adminRpcCalls.map((call) => call.clientId), ['same-name-a', 'same-name-b']);
+
+    const code = await session.api.adminEnrollmentCodes();
+    assert.equal(code.result.code, 'MOCK-ENROLLMENT-CODE');
+    const loggedOut = await session.api.adminLogout();
+    assert.equal(loggedOut.ok, true);
+    const ordinary = await session.api.me();
+    assert.equal(ordinary.result.role, 'user', 'the paired session survives independent admin logout');
+    const browserReadRequests = session.mock.state.log.filter((entry) =>
+      entry.path === '/api/me' || entry.path === '/api/admin/computers');
+    assert.ok(browserReadRequests.length >= 4);
+    assert.ok(browserReadRequests.every((entry) => entry.method === 'POST' && entry.origin === ALLOWED_ORIGIN),
+      'identity and roster browser reads use Origin-guarded same-origin POSTs');
+    assert.ok(session.mock.state.log.some((entry) => entry.path === '/api/admin/logout'));
+    assert.equal(JSON.stringify(session.mock.state.log).includes('mock-admin-password'), false);
   } finally {
     await session.mock.close();
   }

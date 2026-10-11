@@ -1,14 +1,14 @@
 'use strict';
 /**
- * The local status and pairing page, on `127.0.0.1:18989`.
+ * The local status and computer registration page, on `127.0.0.1:18989`.
  *
- * What it is for: showing whether the relay link and the two adapters are up,
- * and letting the person at the computer mint a pairing code for their phone.
+ * What it is for: showing whether the relay link and adapters are up, letting
+ * the person at the computer name/enroll this machine, and minting a phone code.
  *
  * What it deliberately is not:
  * - **not a remote control for the machine.** There is no shell, no exec, no
- *   file path and no command parameter anywhere in this surface. The only write
- *   it accepts is "make a pairing code".
+ *   file path and no command parameter anywhere in this surface. Its writes are
+ *   limited to identity settings, one explicit relay enrollment and pairing.
  * - **not open to other origins.** Any request carrying a foreign `Origin` is
  *   refused, so a page the user happens to have open cannot talk to this server.
  * - **not writable without the CSRF token.** The token is handed out inside the
@@ -19,6 +19,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { validClientId } = require('../config');
 
 const ALLOWED_ORIGIN_PREFIX = 'http://127.0.0.1:';
 const ALLOWED_ORIGIN_ALIASES = ['http://localhost:', 'http://[::1]:'];
@@ -43,12 +44,16 @@ class LocalUiServer {
    * @param {number} [options.port] 0 picks a free port (tests)
    * @param {() => object} options.state current bridge/adapter state
    * @param {() => Promise<{code: string, url: string, expiresAt: string}>} [options.onPairCreate]
+   * @param {(identity: {ownerName: string}) => Promise<object>} [options.onIdentityUpdate]
+   * @param {(enrollment: {code: string, ownerName: string, relayUrl: string}) => Promise<object>} [options.onEnroll]
    * @param {string} [options.htmlPath]
    */
   constructor(options) {
     this.port = options.port ?? 18989;
     this.state = options.state ?? (() => ({}));
     this.onPairCreate = options.onPairCreate ?? null;
+    this.onIdentityUpdate = options.onIdentityUpdate ?? null;
+    this.onEnroll = options.onEnroll ?? null;
     this.htmlPath = options.htmlPath ?? path.join(__dirname, '..', '..', 'ui', 'index.html');
     this.csrfToken = crypto.randomBytes(32).toString('base64url');
     this.address = null;
@@ -114,16 +119,16 @@ class LocalUiServer {
     return new Promise((resolve) => {
       let size = 0;
       const chunks = [];
+      let tooLarge = false;
       req.on('data', (chunk) => {
         size += chunk.length;
         if (size > MAX_BODY_BYTES) {
-          req.destroy();
-          resolve(null);
-          return;
+          tooLarge = true;
+        } else if (!tooLarge) {
+          chunks.push(chunk);
         }
-        chunks.push(chunk);
       });
-      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      req.on('end', () => resolve(tooLarge ? null : Buffer.concat(chunks).toString('utf8')));
     });
   }
 
@@ -150,9 +155,108 @@ class LocalUiServer {
       await this.handlePair(req, res);
       return;
     }
+    if (req.method === 'POST' && url.pathname === '/api/identity') {
+      await this.handleIdentity(req, res);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/enroll') {
+      await this.handleEnroll(req, res);
+      return;
+    }
     // Everything else - including anything that looks like a command surface -
     // is simply not there.
     json(res, 404, { ok: false, error: { code: 'not_found', message: 'not found' } });
+  }
+
+  hasCsrf(req) {
+    const token = req.headers['x-csrf-token'];
+    return typeof token === 'string' && token.length > 0 && safeEqual(token, this.csrfToken);
+  }
+
+  async readJsonBody(req, res) {
+    if (!String(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) {
+      json(res, 415, { ok: false, error: { code: 'json_required', message: 'send a JSON request body' } });
+      return null;
+    }
+    const raw = await this.readBody(req);
+    if (raw === null) {
+      json(res, 413, { ok: false, error: { code: 'body_too_large', message: 'request body is too large' } });
+      return null;
+    }
+    let value;
+    try { value = JSON.parse(raw); } catch {
+      json(res, 400, { ok: false, error: { code: 'invalid_json', message: 'request body must be valid JSON' } });
+      return null;
+    }
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      json(res, 400, { ok: false, error: { code: 'invalid_params', message: 'request body must be an object' } });
+      return null;
+    }
+    return value;
+  }
+
+  async handleIdentity(req, res) {
+    if (!this.hasCsrf(req)) {
+      json(res, 403, { ok: false, error: { code: 'csrf_required', message: 'a CSRF token is required for writes' } });
+      return;
+    }
+    const body = await this.readJsonBody(req, res);
+    if (body === null) return;
+    if (Object.keys(body).some((key) => key !== 'ownerName') || typeof body.ownerName !== 'string') {
+      json(res, 400, { ok: false, error: { code: 'invalid_params', message: 'ownerName is required' } });
+      return;
+    }
+    if (this.onIdentityUpdate === null) {
+      json(res, 503, { ok: false, error: { code: 'identity_unavailable', message: 'computer registration is not available' } });
+      return;
+    }
+    try {
+      const updated = await this.onIdentityUpdate({ ownerName: body.ownerName });
+      json(res, 200, {
+        ok: true,
+        identity: publicIdentity(updated?.identity),
+        helloUpdated: updated?.helloUpdated === true,
+      });
+    } catch (error) {
+      this.actionFailure(res, error, 'Could not save the computer name.');
+    }
+  }
+
+  async handleEnroll(req, res) {
+    if (!this.hasCsrf(req)) {
+      json(res, 403, { ok: false, error: { code: 'csrf_required', message: 'a CSRF token is required for writes' } });
+      return;
+    }
+    const body = await this.readJsonBody(req, res);
+    if (body === null) return;
+    if (Object.keys(body).some((key) => !['code', 'ownerName', 'relayUrl'].includes(key)) ||
+        typeof body.code !== 'string' || typeof body.ownerName !== 'string' || typeof body.relayUrl !== 'string') {
+      json(res, 400, { ok: false, error: { code: 'invalid_params', message: 'code, ownerName and relayUrl are required' } });
+      return;
+    }
+    if (this.onEnroll === null) {
+      json(res, 503, { ok: false, error: { code: 'enrollment_unavailable', message: 'computer enrollment is not available' } });
+      return;
+    }
+    try {
+      const enrolled = await this.onEnroll({ code: body.code, ownerName: body.ownerName, relayUrl: body.relayUrl });
+      json(res, 200, {
+        ok: true,
+        identity: publicIdentity(enrolled?.identity),
+        relayUrl: typeof enrolled?.relayUrl === 'string' && enrolled.relayUrl.length <= 2048 ? enrolled.relayUrl : '',
+        connected: enrolled?.connected === true,
+        connecting: enrolled?.connecting === true,
+      });
+    } catch (error) {
+      this.actionFailure(res, error, 'Could not enroll this computer.');
+    }
+  }
+
+  actionFailure(res, error, fallback) {
+    const status = Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode <= 599 ? error.statusCode : 500;
+    const code = typeof error?.code === 'string' && /^[a-z_]{1,40}$/.test(error.code) ? error.code : 'operation_failed';
+    const message = status < 500 && typeof error?.message === 'string' ? error.message : fallback;
+    json(res, status, { ok: false, error: { code, message } });
   }
 
   servePage(res) {
@@ -179,9 +283,12 @@ class LocalUiServer {
   }
 
   async handlePair(req, res) {
-    await this.readBody(req);
-    const token = req.headers['x-csrf-token'];
-    if (typeof token !== 'string' || token.length === 0 || !safeEqual(token, this.csrfToken)) {
+    const body = await this.readBody(req);
+    if (body === null) {
+      json(res, 413, { ok: false, error: { code: 'body_too_large', message: 'request body is too large' } });
+      return;
+    }
+    if (!this.hasCsrf(req)) {
       json(res, 403, { ok: false, error: { code: 'csrf_required', message: 'a CSRF token is required for writes' } });
       return;
     }
@@ -202,6 +309,13 @@ function safeEqual(a, b) {
   const left = Buffer.from(String(a), 'utf8');
   const right = Buffer.from(String(b), 'utf8');
   return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function publicIdentity(value) {
+  if (value === null || typeof value !== 'object' || !validClientId(value.clientId) || typeof value.ownerName !== 'string') {
+    return null;
+  }
+  return { clientId: value.clientId, ownerName: value.ownerName };
 }
 
 module.exports = { LocalUiServer, ALLOWED_ORIGIN_PREFIX, BIND_ADDRESS };

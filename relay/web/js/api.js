@@ -35,9 +35,15 @@
 
   var PATHS = {
     health: '/health',
+    me: '/api/me',
     pair: '/api/pair',
     rpc: '/api/rpc',
-    logout: '/api/logout'
+    logout: '/api/logout',
+    adminLogin: '/api/admin/login',
+    adminLogout: '/api/admin/logout',
+    adminComputers: '/api/admin/computers',
+    adminRpc: '/api/admin/rpc',
+    adminEnrollmentCodes: '/api/admin/enrollment-codes'
   };
 
   var JSON_HEADERS = { 'Content-Type': 'application/json' };
@@ -161,6 +167,9 @@
       health: function () {
         return send(PATHS.health, { method: 'GET', credentials: 'include' });
       },
+      me: function () {
+        return postJson(PATHS.me, {});
+      },
       // protocol-v1 7.2: exactly {code, deviceName}.
       pair: function (code, deviceName) {
         return postJson(PATHS.pair, { code: code, deviceName: deviceName });
@@ -168,6 +177,25 @@
       // protocol-v1 7.3: exactly {method, params}.
       rpc: function (body) {
         return postJson(PATHS.rpc, { method: body.method, params: body.params || {} });
+      },
+      adminLogin: function (username, password) {
+        return postJson(PATHS.adminLogin, { username: username, password: password });
+      },
+      adminLogout: function () {
+        return postJson(PATHS.adminLogout, {});
+      },
+      adminComputers: function () {
+        return postJson(PATHS.adminComputers, {});
+      },
+      adminRpc: function (clientId, body) {
+        return postJson(PATHS.adminRpc, {
+          clientId: clientId,
+          method: body.method,
+          params: body.params || {}
+        });
+      },
+      adminEnrollmentCodes: function () {
+        return postJson(PATHS.adminEnrollmentCodes, {});
       },
       logout: function () {
         return postJson(PATHS.logout, {});

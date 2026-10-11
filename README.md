@@ -12,6 +12,9 @@ An Android workbench for the Codex Desktop and DSH Desktop chats running on your
 - Markdown headings, tables, code blocks and copying; folded tool activity with expansion preserved during polling.
 - DSH stop and native question answering, including questions nested inside tool execution. Permission controls appear only for actual pending native events.
 - Stable drafts, focus and cursor position while polling; mobile layouts keep controls reachable in shorter viewports.
+- Named computers with persistent IDs and independent, one-use desktop enrollment invitations.
+- Separate administrator login and a roster of online/offline computers and their available tools. Administrators explicitly select a target; ordinary phones remain bound to their paired computer.
+- WorkBuddy's official mobile setup guide is available as an interim entry. WorkBuddy conversations are not yet controlled inside this workbench.
 
 ## Architecture
 
@@ -42,7 +45,9 @@ The AI tools execute on the computer. The relay forwards a fixed RPC allowlist a
 
 Prerequisites: Node.js 22 or later, and the relevant desktop tool already running and signed in. No npm dependencies are needed.
 
-Create `%USERPROFILE%\.dsh\ai-remote-desktop.json` locally:
+For normal enrollment, start the bridge and open [its local page](http://127.0.0.1:18989/). Enter your name, relay address and the administrator's one-use invitation. The bridge stores its independent credential in `%USERPROFILE%\.dsh\ai-remote-desktop.json`; the page never receives it.
+
+The first bootstrap computer may instead use the relay's initial private credential:
 
 ```json
 {
@@ -59,7 +64,15 @@ node desktop/src/index.js --self-check
 node desktop/src/index.js
 ```
 
-Open [the local pairing page](http://127.0.0.1:18989/), generate a one-use pairing code and enter it on the phone. Keep the bridge and desktop AI applications running.
+Save the computer name, enroll it, generate a one-use pairing code and enter it on the phone. Keep the bridge and desktop AI applications running. The bootstrap credential is durably pinned to one computer; additional computers enroll with independent credentials.
+
+## Administrator and multiple computers
+
+Initialize the first administrator on the server with `ai-remote-relay --init-admin --config /etc/ai-remote-relay/relay.json --admin-username admin`, providing an independent password on stdin. The command refuses to overwrite an existing administrator and stores only a salted PBKDF2-SHA256 verifier (310,000 iterations); passwords are not command-line arguments.
+
+Choose administrator login on the mobile login screen. The roster groups computers by display name, shows online/offline status and tool availability, and creates one-use desktop enrollment codes that expire after ten minutes. Names are labels; persistent IDs distinguish computers with the same name.
+
+Phone pairing binds to the originating computer. Administrator RPCs require the exact target ID and fail when it is offline. Chat state, drafts, model catalogs, questions and approvals are isolated by computer. Audits record actor, target, method and outcome without transcript content. See [the protocol extension](docs/design/api/multi-computer.md).
 
 ## Tests
 
@@ -120,6 +133,7 @@ The delivered workbench was checked against real desktop chats: Codex project cr
 - Codex reads the native recent-ten-turn window, with additional protocol message/frame limits; this is not a complete history export.
 - DSH model selection also changes its native default for future chats.
 - The native permission submission path has automated coverage; a real manual permission approval has not been exercised on this machine's current approval settings.
+- Installed WorkBuddy 5.7.7 requires a trusted native extension context for its guest SDK; no supported self-service local registration/grant route was found. The interim [official mobile setup guide](https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice) uses WorkBuddy's own mobile app and the same desktop account. Workbench credentials are not shared with it, and control capabilities remain false.
 - Physical Android installation, the real keyboard and device safe areas remain unverified.
 
 Credentials, native tool extracts, logs, deployment records, binaries and signing keys are excluded from this source repository. Bundled browser-library notices are in [mobile/web/vendor](mobile/web/vendor/README.md).

@@ -123,7 +123,8 @@ test('the vendored libraries are the current releases and are byte-pinned', () =
   assert.match(marked, /marked v18\./, 'marked must be the current v18 build');
 });
 
-test('the web UI is same-origin only: no relay reference, no absolute backend URL', () => {
+test('the web UI uses same-origin APIs and only the approved official WorkBuddy guide link', () => {
+  const officialWorkBuddyGuide = 'https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice';
   ourWebFiles()
     .filter((f) => /\.(js|html|css)$/i.test(f))
     .forEach((file) => {
@@ -132,11 +133,12 @@ test('the web UI is same-origin only: no relay reference, no absolute backend UR
       // A bare 'http://' string is a scheme comparison (the link allow-list in
       // core.js); 'http://host' is a hard-coded cleartext URL and is banned.
       assert.ok(!/http:\/\/(?!["']|$)/i.test(text), rel(file) + ' must never hard-code a cleartext http:// URL');
-      // The only allowed absolute host is the documented public entry point.
+      // The only absolute URLs allowed are the documented service origin and
+      // the user-requested official WorkBuddy mobile multi-device guide.
       const absolute = text.match(/https?:\/\/[^\s"'<>)]+/gi) || [];
       absolute.forEach((url) => {
         assert.ok(
-          url.startsWith('https://101.43.98.18'),
+          url.startsWith('https://101.43.98.18') || url === officialWorkBuddyGuide,
           rel(file) + ' references an unexpected absolute URL: ' + url
         );
       });

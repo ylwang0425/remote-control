@@ -110,7 +110,7 @@ func ValidateParams(method string, params json.RawMessage) (Code, bool) {
 	if !ok {
 		return CodeInvalidParams, false
 	}
-	if hasTool && tool != "codex" && tool != "dsh" {
+	if hasTool && !IsSupportedTool(tool) {
 		return CodeInvalidParams, false
 	}
 
@@ -233,6 +233,10 @@ func validateSendModel(fields map[string]json.RawMessage, tool string) (Code, bo
 		if present["provider"] {
 			return CodeInvalidParams, false
 		}
+	case "workbuddy":
+		if present["provider"] {
+			return CodeInvalidParams, false
+		}
 	}
 	return "", true
 }
@@ -271,7 +275,7 @@ func validateSendText(fields map[string]json.RawMessage) (Code, bool) {
 // request with workspaceId only. The relay's share is to keep both fields
 // intact, bounded and free of control characters, which is what it does here.
 func validateSessionCreate(fields map[string]json.RawMessage, tool string) (Code, bool) {
-	if tool != "codex" && tool != "dsh" {
+	if !IsSupportedTool(tool) {
 		return CodeInvalidParams, false
 	}
 	if _, ok := requiredString(fields, "model", maxModelRunes); !ok {
@@ -304,6 +308,10 @@ func validateSessionCreate(fields map[string]json.RawMessage, tool string) (Code
 			return CodeInvalidParams, false
 		}
 	case "codex":
+		if hasProvider {
+			return CodeInvalidParams, false
+		}
+	case "workbuddy":
 		if hasProvider {
 			return CodeInvalidParams, false
 		}
@@ -340,6 +348,12 @@ func validateSessionCreate(fields map[string]json.RawMessage, tool string) (Code
 		// desktop treats an absent and an empty one the same way.
 	}
 	return "", true
+}
+
+// IsSupportedTool is the relay's closed tool ID set. WorkBuddy is a native
+// session source with the same bounded method/result contract as Codex and DSH.
+func IsSupportedTool(tool string) bool {
+	return tool == "codex" || tool == "dsh" || tool == "workbuddy"
 }
 
 // stringField decodes an optional string field. It reports whether the field was

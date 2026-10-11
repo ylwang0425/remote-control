@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/ai-remote/relay/internal/bridge"
 	"github.com/ai-remote/relay/internal/config"
@@ -25,6 +27,8 @@ import (
 
 // sessionCookieName is the one cookie the relay sets (§5.2).
 const sessionCookieName = "rc_session"
+
+const adminCookieName = "rc_admin"
 
 // sessionMaxAgeSeconds is §5.2's Max-Age: 30 days.
 const sessionMaxAgeSeconds = 2592000
@@ -47,19 +51,12 @@ type Server struct {
 	log    *slog.Logger
 	limits *limiters
 
-	mu sync.Mutex
-	// codeOwners remembers which bridge connection minted a pairing code, so
-	// the relay can tell that desktop its code was used (§8.4.6). It is memory
-	// only and dies with the process, exactly like the notification does.
-	codeOwners map[string]codeOwner
+	adminMu       sync.Mutex
+	adminSessions map[string]time.Time
+	adminKDFSlots chan struct{}
 
 	pairMu     sync.Mutex
 	pairCreate map[*bridge.Conn]*counters
-}
-
-type codeOwner struct {
-	conn   *bridge.Conn
-	codeID string
 }
 
 // New builds a server.
@@ -76,14 +73,15 @@ func New(opts Options) (*Server, error) {
 		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 	s := &Server{
-		cfg:        opts.Config,
-		st:         opts.Store,
-		hub:        opts.Hub,
-		now:        now,
-		log:        logger,
-		limits:     newLimiters(),
-		codeOwners: make(map[string]codeOwner),
-		pairCreate: make(map[*bridge.Conn]*counters),
+		cfg:           opts.Config,
+		st:            opts.Store,
+		hub:           opts.Hub,
+		now:           now,
+		log:           logger,
+		limits:        newLimiters(),
+		pairCreate:    make(map[*bridge.Conn]*counters),
+		adminSessions: make(map[string]time.Time),
+		adminKDFSlots: make(chan struct{}, 2),
 	}
 	go s.sweepLoop()
 	return s, nil
@@ -100,6 +98,9 @@ func (s *Server) sweepLoop() {
 		if _, err := s.st.PurgePairCodes(now); err != nil {
 			s.log.Warn("pair code sweep failed")
 		}
+		if _, err := s.st.PurgeEnrollmentCodes(now); err != nil {
+			s.log.Warn("enrollment code sweep failed")
+		}
 		if _, err := s.st.PurgeAudit(now); err != nil {
 			s.log.Warn("audit sweep failed")
 		}
@@ -114,6 +115,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/pair", s.handlePair)
 	mux.HandleFunc("/api/rpc", s.handleRPC)
 	mux.HandleFunc("/api/logout", s.handleLogout)
+	mux.HandleFunc("/api/me", s.handleMe)
+	mux.HandleFunc("/api/admin/login", s.handleAdminLogin)
+	mux.HandleFunc("/api/admin/logout", s.handleAdminLogout)
+	mux.HandleFunc("/api/admin/computers", s.handleAdminComputers)
+	mux.HandleFunc("/api/admin/enrollment-codes", s.handleAdminEnrollmentCode)
+	mux.HandleFunc("/api/admin/rpc", s.handleAdminRPC)
+	mux.HandleFunc("/api/desktop/enroll", s.handleDesktopEnroll)
 	mux.HandleFunc("/bridge", s.handleBridge)
 	mux.HandleFunc("/downloads/", s.handleDownload)
 	mux.HandleFunc("/downloads", s.handleDownload)
@@ -284,6 +292,25 @@ func readJSONBody(w http.ResponseWriter, r *http.Request, maxBody int64, dst any
 	return ""
 }
 
+// readEmptyJSONObject accepts exactly one JSON object with no members. It is
+// used by read-only POST routes that need a browser-generated Origin while
+// keeping the request body contract closed and bounded.
+func readEmptyJSONObject(w http.ResponseWriter, r *http.Request, maxBody int64) protocol.Code {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return protocol.CodePayloadTooLarge
+		}
+		return protocol.CodeInvalidJSON
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil || len(fields) != 0 {
+		return protocol.CodeInvalidJSON
+	}
+	return ""
+}
+
 // ---- sessions --------------------------------------------------------------
 
 // sessionFromRequest resolves the rc_session cookie to a live device.
@@ -397,7 +424,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	hash := store.HashToken(normalized)
 	now := s.now()
 
-	outcome, _, err := s.st.ConsumePairCode(hash, now)
+	outcome, codeID, clientID, err := s.st.ConsumePairCodeBound(hash, now)
 	if err != nil {
 		s.log.Error("pair consume failed")
 		s.fail(w, protocol.CodeInternal)
@@ -419,6 +446,12 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		s.failWith(w, protocol.CodeInvalidCredentials, "pairing code is not valid")
 		return
 	}
+	if clientID == "" {
+		// New pairing codes are always computer-bound. A legacy unbound code can
+		// only work after the bootstrap pin transaction has migrated it.
+		s.fail(w, protocol.CodeInvalidCredentials)
+		return
+	}
 
 	token, err := store.NewToken()
 	if err != nil {
@@ -426,13 +459,13 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, protocol.CodeInternal)
 		return
 	}
-	if _, err := s.st.CreateDevice(store.HashToken(token), name, now); err != nil {
+	if _, err := s.st.CreateDeviceForClient(store.HashToken(token), name, clientID, now); err != nil {
 		s.log.Error("device create failed")
 		s.fail(w, protocol.CodeInternal)
 		return
 	}
 	s.setSessionCookie(w, token)
-	s.notifyPairUsed(hash, name, now)
+	s.notifyPairUsed(clientID, codeID, name, now)
 	_ = s.st.Audit("pair.success", "", "device paired", now)
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -442,7 +475,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 func cleanDeviceName(raw string) string {
 	var sb strings.Builder
 	for _, r := range raw {
-		if r < 0x20 || r == 0x7f {
+		if unicode.IsControl(r) {
 			continue
 		}
 		sb.WriteRune(r)
@@ -454,46 +487,11 @@ func cleanDeviceName(raw string) string {
 	return name
 }
 
-// notifyPairUsed tells the desktop that minted the code who paired (§8.4.6).
-//
-// The frame goes to the connection that asked for the code. If that connection
-// has since gone away — a desktop that reconnected between `pair.create` and the
-// phone pairing is the ordinary case, not an exotic one — the frame is delivered
-// to any bridge that is online instead of being dropped. §8.4.6 exists so the
-// person at the computer can see that somebody paired; silently losing it would
-// defeat the whole frame. The `codeId` still names the code that was used, so a
-// desktop can tell whether it recognises it.
-func (s *Server) notifyPairUsed(codeHash, deviceName string, at time.Time) {
-	s.mu.Lock()
-	owner, ok := s.codeOwners[codeHash]
-	delete(s.codeOwners, codeHash)
-	s.mu.Unlock()
-	if !ok {
-		// No record of the minting connection: either the relay restarted, or
-		// the code was minted before this process started. Fall through and
-		// broadcast rather than stay silent.
-		s.broadcastPairUsed("", deviceName, at)
-		return
-	}
-	frame := map[string]any{
-		"type":       "pair.used",
-		"codeId":     owner.codeID,
-		"deviceName": deviceName,
-		"at":         at.UTC().Format(time.RFC3339),
-	}
-	if err := s.hub.Send(owner.conn, frame); err == nil {
-		return
-	}
-	s.broadcastPairUsed(owner.codeID, deviceName, at)
-}
-
-// broadcastPairUsed sends the frame to whichever bridge connection is online.
-func (s *Server) broadcastPairUsed(codeID, deviceName string, at time.Time) {
-	conn, ok := s.hub.Pick()
-	if !ok {
-		return
-	}
-	_ = s.hub.Send(conn, map[string]any{
+// notifyPairUsed informs only the desktop identity that minted the consumed
+// pairing code. If that computer is offline the event is dropped; it must never
+// appear on another person's bridge.
+func (s *Server) notifyPairUsed(clientID, codeID, deviceName string, at time.Time) {
+	_ = s.hub.SendToComputer(clientID, map[string]any{
 		"type":       "pair.used",
 		"codeId":     codeID,
 		"deviceName": deviceName,
@@ -504,8 +502,10 @@ func (s *Server) broadcastPairUsed(codeID, deviceName string, at time.Time) {
 // ---- POST /api/rpc ---------------------------------------------------------
 
 type rpcRequest struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
+	Method         string          `json:"method"`
+	Params         json.RawMessage `json:"params"`
+	ClientID       string          `json:"clientId,omitempty"`
+	TargetClientID string          `json:"targetClientId,omitempty"`
 	// TimeoutMs is a top-level field of the request body. It is deliberately
 	// not part of params: §7.3's whitelist is closed, and §11 step 14 shows an
 	// in-params timeoutMs being refused as invalid_params.
@@ -526,7 +526,8 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, protocol.CodeBridgeBusy)
 		return
 	}
-	if _, _, ok := s.sessionFromRequest(r); !ok {
+	device, _, ok := s.sessionFromRequest(r)
+	if !ok {
 		s.fail(w, protocol.CodeUnauthenticated)
 		return
 	}
@@ -540,6 +541,12 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, protocol.CodeInvalidRequest)
 		return
 	}
+	for _, requested := range []string{body.ClientID, body.TargetClientID} {
+		if requested != "" && requested != device.ClientID {
+			s.fail(w, protocol.CodeForbidden)
+			return
+		}
+	}
 	if code, ok := protocol.ValidateParams(body.Method, body.Params); !ok {
 		s.writeJSON(w, http.StatusOK, protocol.Failure(code))
 		return
@@ -548,7 +555,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	// §7.3: the phone may ask for a different budget, but it is clamped to
 	// 1000–60000 ms and a missing value takes the method's default.
 	timeout := time.Duration(protocol.ClampTimeoutMs(body.TimeoutMs, protocol.DefaultTimeoutMs(body.Method))) * time.Millisecond
-	reply := s.hub.Call(r.Context(), body.Method, body.Params, timeout)
+	reply := s.hub.CallComputer(r.Context(), device.ClientID, body.Method, body.Params, timeout)
 	s.answerRPC(w, reply)
 }
 
@@ -557,6 +564,9 @@ func (s *Server) answerRPC(w http.ResponseWriter, reply bridge.Reply) {
 	case reply.Code == protocol.CodeBridgeOffline:
 		w.Header().Set("Retry-After", "1")
 		s.fail(w, protocol.CodeBridgeOffline)
+	case reply.Code == protocol.CodeTargetOffline:
+		w.Header().Set("Retry-After", "1")
+		s.fail(w, protocol.CodeTargetOffline)
 	case reply.Code == protocol.CodeBridgeBusy:
 		w.Header().Set("Retry-After", "1")
 		s.fail(w, protocol.CodeBridgeBusy)

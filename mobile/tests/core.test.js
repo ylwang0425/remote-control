@@ -192,6 +192,8 @@ test('errorMessage maps protocol-v1 6.2 codes to Chinese text', () => {
   assert.equal(core.errorMessage('bridge_busy'), '电脑端正忙，请稍后重试');
   assert.equal(core.errorMessage('bridge_timeout'), '电脑没有及时回应');
   assert.equal(core.errorMessage('bridge_bad_response'), '电脑返回的数据无法识别');
+  assert.equal(core.errorMessage('target_offline'), '目标电脑当前不可用，请刷新电脑列表后重试');
+  assert.equal(core.errorMessage('identity_conflict'), '配对身份与当前登录身份冲突，请先退出后重试');
   assert.equal(core.errorMessage('not_capable'), '该会话不支持这个操作');
   assert.equal(core.errorMessage('session_not_found'), '会话不存在或不可见，请刷新列表');
   assert.equal(core.errorMessage('session_gone'), '会话已经结束，请刷新列表');

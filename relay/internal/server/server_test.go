@@ -385,7 +385,7 @@ func TestRPCOfflineIs503(t *testing.T) {
 			if resp.Header.Get("Retry-After") != "1" {
 				t.Fatalf("Retry-After = %q, want 1", resp.Header.Get("Retry-After"))
 			}
-			decodeFailure(t, resp, 503, protocol.CodeBridgeOffline)
+	decodeFailure(t, resp, 503, protocol.CodeTargetOffline)
 			return
 		}
 		readBody(t, resp)

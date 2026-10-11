@@ -18,6 +18,10 @@
 
 <header id="appbar">
   <h1 id="appbar-title">AI 工作台</h1>
+  <div id="admin-context" class="admin-context" hidden>
+    <span id="admin-context-name" class="admin-context-name"></span>
+    <button id="admin-context-back" class="chip chip-quiet" type="button">电脑列表</button>
+  </div>
   <div id="appbar-actions" class="appbar-actions">
     <!-- The new-chat action. It used to be a full-width footer button that ate
          the bottom of the list; as a header action it is always reachable and
@@ -54,16 +58,53 @@
 
   <!-- ============================ pairing ============================ -->
   <section id="pair-screen" class="screen" hidden>
-    <p class="lead">在电脑端生成配对码，然后在这里输入。</p>
-    <label class="field-label" for="pair-code-input">配对码</label>
-    <input id="pair-code-input" class="field code-field" type="text"
-           inputmode="text" autocomplete="one-time-code" autocapitalize="characters"
-           spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX">
-    <label class="field-label" for="pair-name-input">设备名称</label>
-    <input id="pair-name-input" class="field" type="text" maxlength="64"
-           autocomplete="off" placeholder="例如 Pixel 8">
-    <button id="pair-submit" class="primary big" type="button">配对</button>
-    <p id="pair-error" class="error-text" role="alert"></p>
+    <div id="pair-user-form">
+      <p class="lead">在电脑端生成配对码，然后在这里输入。</p>
+      <p class="muted small">普通配对只连接生成配对码的电脑。管理员登录会显示获授权的电脑列表。</p>
+      <label class="field-label" for="pair-code-input">配对码</label>
+      <input id="pair-code-input" class="field code-field" type="text"
+             inputmode="text" autocomplete="one-time-code" autocapitalize="characters"
+             spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX">
+      <label class="field-label" for="pair-name-input">设备名称</label>
+      <input id="pair-name-input" class="field" type="text" maxlength="64"
+             autocomplete="off" placeholder="例如 Pixel 8">
+      <button id="pair-submit" class="primary big" type="button">配对</button>
+      <p id="pair-error" class="error-text" role="alert"></p>
+    </div>
+    <button id="pair-admin-login-toggle" class="secondary" type="button">管理员登录</button>
+    <div id="admin-login-panel" class="admin-login-panel" hidden>
+      <label class="field-label" for="admin-username-input">管理员账号</label>
+      <input id="admin-username-input" class="field" type="text" autocomplete="username">
+      <label class="field-label" for="admin-password-input">管理员密码</label>
+      <input id="admin-password-input" class="field" type="password" autocomplete="current-password">
+      <div class="admin-login-actions">
+        <button id="admin-login-submit" class="primary" type="button">登录管理</button>
+        <button id="admin-login-back" class="secondary" type="button">返回</button>
+      </div>
+      <p id="admin-login-error" class="error-text" role="alert"></p>
+      <p class="muted small">管理员账号用于查看获授权电脑的在线状态和 AI 工具，不会保存在这台手机上。</p>
+    </div>
+  </section>
+
+  <!-- Admin inventory: every row is one exact computer identity. Duplicate
+       display names remain distinguishable by their client ID. -->
+  <section id="admin-roster-screen" class="screen" hidden>
+    <div class="admin-roster-head">
+      <div>
+        <h2 class="detail-title">已连接的电脑</h2>
+        <p class="muted small">按人员查看电脑和实际报告的 AI 工具。离线电脑仍会显示。</p>
+      </div>
+      <button id="admin-logout-button" class="secondary" type="button">管理员退出</button>
+    </div>
+    <div id="admin-tool-filter" class="chip-row" role="group" aria-label="按 AI 工具筛选电脑"></div>
+    <div class="admin-enrollment">
+      <button id="admin-enrollment-button" class="secondary" type="button">生成电脑登记码</button>
+      <p class="muted small">在电脑的本地登记页输入此一次性代码；只有点击后才会生成并显示。</p>
+      <p id="admin-enrollment-result" class="admin-enrollment-result" hidden></p>
+    </div>
+    <p id="admin-roster-error" class="error-text" role="alert" hidden></p>
+    <p id="admin-roster-empty" class="muted" hidden>没有找到电脑。</p>
+    <div id="admin-computer-list" class="admin-computer-list"></div>
   </section>
 
   <!-- ============ workbench: 会话 / 任务 / 设置 ======================= -->
@@ -152,7 +193,12 @@
     <div id="tool-choices" class="choice-row"></div>
 
     <p id="new-availability" class="notice notice-error" hidden></p>
+    <div id="workbuddy-official-help" class="workbuddy-official-help" hidden>
+      <p>WorkBuddy 暂未接入此工作台。可在官方手机 App 登录与电脑相同的账号，继续已有聊天。</p>
+      <a class="workbuddy-official-link" href="https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice" rel="noopener noreferrer">查看 WorkBuddy 官方手机端多设备接入说明</a>
+    </div>
 
+    <div id="new-native-controls" class="new-native-controls">
     <label class="field-label" for="model-select">模型</label>
     <select id="model-select" class="field" disabled></select>
 
@@ -182,6 +228,7 @@
 
     <button id="new-submit" class="primary big" type="button" disabled>创建并打开</button>
     <p id="new-error" class="error-text" role="alert"></p>
+    </div>
   </section>
 
   <!-- ============================= settings ========================== -->
@@ -205,6 +252,8 @@
     </div>
 
     <p class="settings-group">账号</p>
+    <p id="account-summary" class="muted small"></p>
+    <button id="settings-admin-login" class="secondary" type="button">管理员登录</button>
     <!-- Signing out lives HERE and nowhere else. The id is the one this control
          has always had, so existing behaviour and any bookmark of it survive;
          it is no longer a footer button taking up room under the chat list. -->

@@ -367,7 +367,8 @@ func TestCase08MethodAndParamsWhitelist(t *testing.T) {
 }
 
 // TestCase09BridgeOffline — traceability: T-relay DoD item R10 (offline) and
-// §7.3's 503 bridge_offline, with Retry-After: 1 (§5.5).
+// §7.3's 503 offline failure, with Retry-After: 1 (§5.5). The multi-computer
+// extension binds this phone to the seed computer and returns target_offline.
 func TestCase09BridgeOffline(t *testing.T) {
 	caseFilter(t)
 	inst := NewRelay(t, InstanceOpts{})
@@ -410,14 +411,14 @@ func TestCase09BridgeOffline(t *testing.T) {
 			t.Fatalf("%s with no bridge online status = %d, want 503; body %s", method, res.Status, res.Body)
 		}
 		got := decodeResp(t, res)
-		if got.Error.Code != "bridge_offline" {
-			t.Fatalf("%s error.code = %q, want bridge_offline; body %s", method, got.Error.Code, res.Body)
+		if got.Error.Code != "target_offline" {
+			t.Fatalf("%s error.code = %q, want target_offline for the paired computer; body %s", method, got.Error.Code, res.Body)
 		}
 		if got.Error.Message == "" {
 			t.Fatalf("%s has an empty message", method)
 		}
-		if got.Error.Message != "bridge offline" {
-			t.Logf("note: bridge_offline message is %q (contract table does not pin this text)", got.Error.Message)
+		if got.Error.Message != "target computer is offline" {
+			t.Logf("note: target_offline message is %q (contract table does not pin this text)", got.Error.Message)
 		}
 		if ra := res.Header.Get("Retry-After"); ra != "1" {
 			t.Fatalf("%s Retry-After = %q, want 1 (§5.5)", method, ra)

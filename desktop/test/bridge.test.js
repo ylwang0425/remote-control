@@ -26,6 +26,7 @@ class FakeRelay {
     this.received = [];
     this.connections = [];
     this.answerHelloOk = options.answerHelloOk !== false;
+    this.acceptedTokens = new Set(options.acceptedTokens ?? [TOKEN]);
     this.helloOkOverrides = options.helloOkOverrides ?? {};
     this.onFrame = options.onFrame ?? null;
     this.server = null;
@@ -35,7 +36,7 @@ class FakeRelay {
     this.server = await startWsServer({
       onUpgrade: (req) => {
         const authorization = req.headers.authorization ?? '';
-        if (authorization !== `Bearer ${TOKEN}`) {
+        if (!this.acceptedTokens.has(authorization.slice('Bearer '.length)) || !authorization.startsWith('Bearer ')) {
           this.lastReject = { statusCode: 401, body: '{"ok":false,"error":{"code":"unauthenticated"}}' };
           return { accept: false, statusCode: 401, body: this.lastReject.body };
         }
@@ -187,6 +188,60 @@ test('contract 1: the connection carries Bearer and no Origin, and the first fra
   for (const frame of relay.received) {
     assert.ok(allowed.includes(frame.type), `the bridge never sends ${frame.type}`);
   }
+});
+
+test('saving a computer name refreshes identity on the authenticated bridge without replacing its session', async (t) => {
+  const clientId = '98c9e96b-5d91-4a04-8d89-e2bdd29e30a5';
+  const { relay, bridge } = await connectedBridge(t, {
+    bridge: { clientId, ownerName: 'Before' },
+  });
+  assert.equal(relay.received[0].clientId, clientId);
+  assert.equal(relay.received[0].ownerName, 'Before');
+  const connectionsBefore = relay.connections.length;
+
+  assert.equal(bridge.updateIdentity({ clientId, ownerName: 'admin', clientName: CLIENT_NAME }), true);
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline && relay.received.filter((frame) => frame.type === 'hello').length < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const hellos = relay.received.filter((frame) => frame.type === 'hello');
+  assert.equal(hellos.length, 2);
+  assert.equal(hellos[1].clientId, clientId, 'the UUID remains stable');
+  assert.equal(hellos[1].ownerName, 'admin');
+  assert.equal(relay.connections.length, connectionsBefore, 'a label edit does not replace or restart the authenticated connection');
+});
+
+test('enrollment replaces only the bridge credentials and reconnects with the new identity', async (t) => {
+  const nextToken = 'enrolled-token-0123456789';
+  const clientId = '98c9e96b-5d91-4a04-8d89-e2bdd29e30a5';
+  const { relay, bridge } = await connectedBridge(t, {
+    relay: { acceptedTokens: [TOKEN, nextToken] },
+    bridge: { clientId, ownerName: 'Before' },
+  });
+  const connectionsBefore = relay.connections.length;
+
+  bridge.updateConnection({
+    url: relay.url,
+    token: nextToken,
+    clientId,
+    ownerName: 'Kitchen PC',
+    clientName: CLIENT_NAME,
+  });
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && relay.connections.length === connectionsBefore) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  while (Date.now() < deadline && !bridge.connected) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  assert.equal(relay.connections.length, connectionsBefore + 1, 'only the bridge transport is replaced');
+  const lastRequest = relay.server.requests[relay.server.requests.length - 1];
+  assert.equal(lastRequest.headers.authorization, `Bearer ${nextToken}`);
+  const lastHello = relay.received.filter((frame) => frame.type === 'hello').at(-1);
+  assert.equal(lastHello.clientId, clientId);
+  assert.equal(lastHello.ownerName, 'Kitchen PC');
+  assert.equal(bridge.connected, true);
 });
 
 test('contract 1: with no hello.ok the bridge keeps trying instead of hanging for ever', async (t) => {

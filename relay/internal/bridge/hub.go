@@ -41,6 +41,8 @@ type Reply struct {
 type Conn struct {
 	mu         sync.Mutex
 	send       SendFunc
+	clientID   string
+	ownerName  string
 	clientName string
 	caps       protocol.Capabilities
 	helloed    bool
@@ -98,12 +100,57 @@ func (h *Hub) Register(send SendFunc) *Conn {
 // Hello marks a connection as online with the capabilities it declared. It is
 // idempotent: a second hello simply replaces the declaration (§8.4.1).
 func (h *Hub) Hello(c *Conn, clientName string, caps protocol.Capabilities) {
+	h.HelloIdentity(c, "", "", clientName, caps)
+}
+
+// HelloIdentity marks a connection online with its authenticated, durable
+// computer identity and the capabilities it declared.
+func (h *Hub) HelloIdentity(c *Conn, clientID, ownerName, clientName string, caps protocol.Capabilities) {
 	c.mu.Lock()
+	c.clientID = clientID
+	c.ownerName = ownerName
 	c.clientName = clientName
 	c.caps = caps
 	c.helloed = true
 	c.lastSeen = time.Now()
 	c.mu.Unlock()
+}
+
+// ComputerOnline reports whether the exact authenticated computer has a live
+// hello-complete connection.
+func (h *Hub) ComputerOnline(clientID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, c := range h.conns {
+		c.mu.Lock()
+		online := c.clientID == clientID && c.helloed && !c.closed
+		c.mu.Unlock()
+		if online {
+			return true
+		}
+	}
+	return false
+}
+
+// SendToComputer delivers a non-RPC frame only to the exact identity that owns
+// it. It never broadcasts a phone event to an unrelated online computer.
+func (h *Hub) SendToComputer(clientID string, frame any) error {
+	h.mu.Lock()
+	var chosen *Conn
+	for _, c := range h.conns {
+		c.mu.Lock()
+		online := c.clientID == clientID && c.helloed && !c.closed
+		c.mu.Unlock()
+		if online {
+			chosen = c
+			break
+		}
+	}
+	h.mu.Unlock()
+	if chosen == nil {
+		return ErrSendFailed
+	}
+	return h.Send(chosen, frame)
 }
 
 // Touch records that any frame arrived, which is what the idle judgement uses.
@@ -118,6 +165,14 @@ func (h *Hub) Capabilities(c *Conn) protocol.Capabilities {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.caps
+}
+
+// ClientID returns the authenticated identity attached to a connection after
+// its hello has completed.
+func (h *Hub) ClientID(c *Conn) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clientID
 }
 
 // Unregister drops a connection and fails everything it had in flight (§10.2).
@@ -223,12 +278,16 @@ func (h *Hub) Send(c *Conn, v any) error {
 	return send(ctx, payload)
 }
 
-// Deliver routes one response frame to the call waiting for that id. An id that
-// is unknown, already answered, or already reclaimed is dropped without
-// touching any other call's state (§8.5, §10.2).
-func (h *Hub) Deliver(id string, frame []byte) {
+// DeliverFrom routes one response frame only when it came from the connection
+// that received the corresponding call. Unknown, stale and cross-connection IDs
+// are dropped without changing pending state (§8.5, §10.2).
+func (h *Hub) DeliverFrom(conn *Conn, id string, frame []byte) bool {
 	h.mu.Lock()
 	call, ok := h.pending[id]
+	if ok && call.conn != conn {
+		h.mu.Unlock()
+		return false
+	}
 	if ok {
 		delete(h.pending, id)
 		call.conn.mu.Lock()
@@ -237,12 +296,13 @@ func (h *Hub) Deliver(id string, frame []byte) {
 	}
 	h.mu.Unlock()
 	if !ok {
-		return
+		return false
 	}
 	call.conn.mu.Lock()
 	caps := call.conn.caps
 	call.conn.mu.Unlock()
 	call.resolve(interpretResponse(call.method, frame, caps))
+	return true
 }
 
 // resolve completes a call exactly once, whichever side gets there first.
@@ -311,13 +371,42 @@ func trimSessionsList(result json.RawMessage) json.RawMessage {
 // It never sends the request twice: after a timeout or a disconnect the call is
 // finished, and a late frame for that id is dropped on arrival (§10.2, §11.7).
 func (h *Hub) Call(ctx context.Context, method string, params json.RawMessage, timeout time.Duration) Reply {
+	return h.call(ctx, "", method, params, timeout)
+}
+
+// CallComputer routes a request only to one authenticated desktop identity.
+// Offline identities never fall through to another live computer.
+func (h *Hub) CallComputer(ctx context.Context, clientID, method string, params json.RawMessage, timeout time.Duration) Reply {
+	return h.call(ctx, clientID, method, params, timeout)
+}
+
+func (h *Hub) call(ctx context.Context, clientID, method string, params json.RawMessage, timeout time.Duration) Reply {
 	if timeout <= 0 {
 		timeout = time.Duration(protocol.DefaultTimeoutMs(method)) * time.Millisecond
 	}
 
 	h.mu.Lock()
-	conn, ok := h.pickLocked()
+	var conn *Conn
+	var ok bool
+	if clientID == "" {
+		conn, ok = h.pickLocked()
+	} else {
+		conn, ok = h.pickClientLocked(clientID)
+	}
 	if !ok {
+		if clientID != "" {
+			for _, c := range h.conns {
+				c.mu.Lock()
+				online := c.clientID == clientID && c.helloed && !c.closed
+				c.mu.Unlock()
+				if online {
+					h.mu.Unlock()
+					return Reply{Code: protocol.CodeBridgeBusy}
+				}
+			}
+			h.mu.Unlock()
+			return Reply{Code: protocol.CodeTargetOffline}
+		}
 		anyOnline := false
 		for _, c := range h.conns {
 			c.mu.Lock()
@@ -360,6 +449,9 @@ func (h *Hub) Call(ctx context.Context, method string, params json.RawMessage, t
 	}
 	if err := conn.send(ctx, payload); err != nil {
 		h.reclaim(id, conn)
+		if clientID != "" {
+			return Reply{Code: protocol.CodeTargetOffline}
+		}
 		return Reply{Code: protocol.CodeBridgeOffline}
 	}
 
@@ -375,6 +467,26 @@ func (h *Hub) Call(ctx context.Context, method string, params json.RawMessage, t
 		h.reclaim(id, conn)
 		return Reply{Code: protocol.CodeBridgeBadResponse}
 	}
+}
+
+func (h *Hub) pickClientLocked(clientID string) (*Conn, bool) {
+	var best *Conn
+	var bestPending int
+	var bestSeen time.Time
+	for _, c := range h.conns {
+		c.mu.Lock()
+		online := c.clientID == clientID && c.helloed && !c.closed && c.pending < h.maxPer
+		pending := c.pending
+		seen := c.lastSeen
+		c.mu.Unlock()
+		if !online {
+			continue
+		}
+		if best == nil || pending < bestPending || (pending == bestPending && seen.After(bestSeen)) {
+			best, bestPending, bestSeen = c, pending, seen
+		}
+	}
+	return best, best != nil
 }
 
 func defaultParams(params json.RawMessage) []byte {

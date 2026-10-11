@@ -206,7 +206,8 @@ test('a project option is recognised by either identity, and never as "no filter
 test('the tool display names are product names, and an unknown tool keeps its own id', () => {
   assert.equal(core.toolLabel('codex'), 'Codex');
   assert.equal(core.toolLabel('dsh'), 'DSH');
-  // A tool the phone does not know is never mislabelled as one of the two.
+  assert.equal(core.toolLabel('workbuddy'), 'WorkBuddy');
+  // A tool the phone does not know keeps its own id instead of borrowing a label.
   assert.equal(core.toolLabel('trae'), 'trae');
   assert.equal(core.toolLabel(''), '');
   assert.equal(core.toolLabel(null), '');

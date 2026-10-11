@@ -38,7 +38,7 @@ timeout 30000
 
 Rules the relay enforces:
 
-- `tool` is required and is `codex` or `dsh`; `sessionId` matches the §4.1
+- `tool` is required and is `codex`, `dsh` or `workbuddy`; `sessionId` matches the §4.1
   session id shape; `callId` is a required bounded string.
 - At most **8** answers; each needs a non-blank `id` of at most 128 characters,
   and an `id` may appear **once**. A duplicate id would either answer one
@@ -162,6 +162,12 @@ desktop that cannot tell simply omits it, which the phone renders as no badge.
 inferred, never defaulted, never given a bit the desktop did not send. The relay
 does not consult these keys to gate anything: the desktop owns that, and the
 phone renders from the desktop's own declaration.
+
+The `tools` list may include `workbuddy`. An optional `toolStatus` map can
+report an installed provider that is currently unavailable; it is limited to
+the exact IDs `codex`, `dsh` and `workbuddy`, with a printable reason of at
+most 500 characters. The administrator roster uses explicit status when sent,
+and otherwise falls back to membership in `tools`.
 
 - `session.send:model:codex` / `:dsh` — a model choice can ride a send.
 - `session.answer:codex` / `:dsh` — a real pending question can be answered.

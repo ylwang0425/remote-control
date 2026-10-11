@@ -3,18 +3,24 @@
  * Configuration for the desktop bridge.
  *
  * Precedence, lowest first: built-in defaults, the config file, the environment.
- * The bridge token is a secret: it is read, used for one handshake header, and
- * never printed. `redactedConfig` is the only shape that may be logged or shown
- * in the UI.
+ * The bridge token is a secret: it is stored only in the private config file or
+ * environment, used for the handshake header, and never printed. `redactedConfig`
+ * is the only shape that may be logged or shown in the UI.
  */
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
+
+const CLIENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const OWNER_NAME_MAX_CHARS = 64;
 
 const DEFAULTS = Object.freeze({
   relayUrl: 'wss://101.43.98.18/bridge',
   clientName: null, // null = use the machine host name
+  clientId: null,
+  ownerName: null,
   uiPort: 18989,
   bridgeToken: null,
   codex: { pipePath: null, contextThreadId: null },
@@ -22,6 +28,27 @@ const DEFAULTS = Object.freeze({
   tools: ['codex', 'dsh'],
   autoStartBridge: true,
 });
+
+/** A trimmed, printable label. It is never used as an authentication value. */
+function normalizeOwnerName(value) {
+  if (typeof value !== 'string' || /\p{Cc}/u.test(value)) {
+    throw new TypeError('Computer name must be 1–64 printable characters');
+  }
+  const name = value.trim();
+  const count = [...name].length;
+  if (count < 1 || count > OWNER_NAME_MAX_CHARS) {
+    throw new TypeError('Computer name must be 1–64 printable characters');
+  }
+  return name;
+}
+
+function newClientId() {
+  return crypto.randomUUID();
+}
+
+function validClientId(value) {
+  return typeof value === 'string' && CLIENT_ID.test(value);
+}
 
 /** Where the config file lives, unless the environment names another one. */
 function configPath(options = {}) {
@@ -56,11 +83,21 @@ function loadConfig(options = {}) {
   const fromFile = readConfigFile(file);
   const pick = (key, fallback) => (fromFile[key] === undefined ? fallback : fromFile[key]);
   const token = env.AI_REMOTE_BRIDGE_TOKEN ?? pick('bridgeToken', DEFAULTS.bridgeToken);
+  let ownerName = null;
+  try {
+    if (typeof fromFile.ownerName === 'string') ownerName = normalizeOwnerName(fromFile.ownerName);
+  } catch {
+    // A damaged/old label is treated as unset and can be repaired in the local UI.
+  }
   const config = {
     relayUrl: env.AI_REMOTE_RELAY_URL ?? pick('relayUrl', DEFAULTS.relayUrl),
     clientName: env.AI_REMOTE_CLIENT_NAME ?? pick('clientName', DEFAULTS.clientName),
+    clientId: validClientId(fromFile.clientId) ? fromFile.clientId : null,
+    ownerName,
     uiPort: asNumber(env.AI_REMOTE_UI_PORT ?? pick('uiPort', DEFAULTS.uiPort), DEFAULTS.uiPort),
     bridgeToken: typeof token === 'string' && token.length > 0 ? token : null,
+    bridgeTokenOverridden: env.AI_REMOTE_BRIDGE_TOKEN !== undefined,
+    relayUrlOverridden: env.AI_REMOTE_RELAY_URL !== undefined,
     codex: {
       pipePath: env.AI_REMOTE_CODEX_PIPE ?? fromFile.codex?.pipePath ?? DEFAULTS.codex.pipePath,
       contextThreadId: env.CODEX_THREAD_ID ?? fromFile.codex?.contextThreadId ?? DEFAULTS.codex.contextThreadId,
@@ -74,6 +111,40 @@ function loadConfig(options = {}) {
     configFile: file,
   };
   return config;
+}
+
+/**
+ * Merge a small settings update into the existing private config without
+ * discarding adapter options or future fields. The temporary file keeps a
+ * failed write from leaving half a JSON document behind.
+ */
+function saveConfig(file, updates) {
+  let current;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('invalid configuration shape');
+    }
+    current = parsed;
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      current = {};
+    } else {
+      throw new Error('the existing configuration could not be read safely');
+    }
+  }
+  const next = { ...current, ...updates };
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true });
+  const temp = `${file}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    fs.renameSync(temp, file);
+  } catch (error) {
+    try { fs.unlinkSync(temp); } catch { /* no temporary file to remove */ }
+    throw error;
+  }
+  return next;
 }
 
 /**
@@ -99,4 +170,16 @@ function redactedConfig(config) {
   };
 }
 
-module.exports = { DEFAULTS, configPath, loadConfig, readTokenFile, redactedConfig };
+module.exports = {
+  DEFAULTS,
+  CLIENT_ID,
+  OWNER_NAME_MAX_CHARS,
+  configPath,
+  loadConfig,
+  readTokenFile,
+  redactedConfig,
+  normalizeOwnerName,
+  newClientId,
+  validClientId,
+  saveConfig,
+};

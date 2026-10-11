@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -61,11 +64,27 @@ func (s *Server) handleBridge(w http.ResponseWriter, r *http.Request) {
 	}
 
 	presented, ok := bearerToken(r)
-	if !ok || !constantTimeEqual(presented, s.cfg.BridgeToken) {
+	if !ok {
 		// §8.1: audit the refusal, and never the token itself.
 		_ = s.st.Audit("bridge.reject", "", "invalid bridge token", s.now())
 		s.failWith(w, protocol.CodeUnauthenticated, "invalid bridge token")
 		return
+	}
+	bootstrap := constantTimeEqual(presented, s.cfg.BridgeToken)
+	authClientID := ""
+	if !bootstrap {
+		computer, err := s.st.DesktopByTokenHash(store.HashToken(presented))
+		if err != nil {
+			_ = s.st.Audit("bridge.reject", "", "invalid bridge token", s.now())
+			s.fail(w, protocol.CodeInternal)
+			return
+		}
+		if computer == nil {
+			_ = s.st.Audit("bridge.reject", "", "invalid bridge token", s.now())
+			s.failWith(w, protocol.CodeUnauthenticated, "invalid bridge token")
+			return
+		}
+		authClientID = computer.ClientID
 	}
 
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -88,7 +107,7 @@ func (s *Server) handleBridge(w http.ResponseWriter, r *http.Request) {
 	defer s.hub.Unregister(conn)
 	defer s.forgetPairCreate(conn)
 
-	s.bridgeLoop(r.Context(), ws, conn)
+	s.bridgeLoop(r.Context(), ws, conn, bootstrap, authClientID)
 }
 
 type readResult struct {
@@ -99,7 +118,7 @@ type readResult struct {
 
 // bridgeLoop reads frames until the connection dies or breaks a rule. All
 // heartbeat state lives in this one goroutine, so it needs no lock.
-func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridge.Conn) {
+func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridge.Conn, bootstrap bool, authClientID string) {
 	readCh := make(chan readResult, 1)
 	readerCtx, cancelReader := context.WithCancel(ctx)
 	defer cancelReader()
@@ -124,6 +143,7 @@ func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridg
 
 	helloSent := false
 	var lastSeen = time.Now()
+	var lastPersistentSeen time.Time
 	var pingSentAt time.Time
 
 	for {
@@ -157,6 +177,14 @@ func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridg
 				_ = ws.Close(websocket.StatusProtocolError, "malformed frame")
 				return
 			}
+			if helloSent && now.Sub(lastPersistentSeen) >= time.Minute {
+				if clientID := s.hub.ClientID(conn); clientID != "" {
+					if err := s.st.TouchComputer(clientID, now); err != nil {
+						s.log.Warn("computer last-seen update failed")
+					}
+					lastPersistentSeen = now
+				}
+			}
 
 			if !helloSent {
 				if frame.Type != protocol.FrameHello {
@@ -168,7 +196,11 @@ func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridg
 					_ = ws.Close(websocket.StatusPolicyViolation, "bad hello")
 					return
 				}
-				s.hub.Hello(conn, frame.ClientName, derefCaps(frame.Capabilities))
+				if err := s.bindHello(conn, frame, bootstrap, authClientID); err != nil {
+					_ = s.st.Audit("bridge.identity_reject", authClientID, identityAuditReason(err), s.now())
+					_ = ws.Close(websocket.StatusPolicyViolation, "identity rejected")
+					return
+				}
 				helloSent = true
 				if err := s.sendHelloOK(conn); err != nil {
 					return
@@ -184,7 +216,11 @@ func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridg
 					_ = ws.Close(websocket.StatusPolicyViolation, "bad hello")
 					return
 				}
-				s.hub.Hello(conn, frame.ClientName, derefCaps(frame.Capabilities))
+				if err := s.bindHello(conn, frame, bootstrap, authClientID); err != nil {
+					_ = s.st.Audit("bridge.identity_reject", authClientID, identityAuditReason(err), s.now())
+					_ = ws.Close(websocket.StatusPolicyViolation, "identity rejected")
+					return
+				}
 				if err := s.sendHelloOK(conn); err != nil {
 					return
 				}
@@ -197,7 +233,7 @@ func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridg
 			case protocol.FramePairCreate:
 				s.handlePairCreate(conn, frame)
 			case protocol.FrameResponse:
-				s.hub.Deliver(frame.ID, res.data)
+				s.hub.DeliverFrom(conn, frame.ID, res.data)
 			default:
 				// §8.5: an unknown type is ignored and the connection continues.
 				_ = s.st.Audit("bridge.unknown_frame", "", string(frame.Type), s.now())
@@ -211,6 +247,63 @@ func (s *Server) bridgeLoop(ctx context.Context, ws *websocket.Conn, conn *bridg
 			return
 		}
 	}
+}
+
+func (s *Server) bindHello(conn *bridge.Conn, frame *protocol.Frame, bootstrap bool, authClientID string) error {
+	caps := derefCaps(frame.Capabilities)
+	capabilities, err := json.Marshal(caps)
+	if err != nil {
+		return err
+	}
+	ownerName := strings.TrimSpace(frame.OwnerName)
+	clientID := frame.ClientID
+	if bootstrap {
+		pinned, err := s.st.BootstrapClientID()
+		if err != nil {
+			return err
+		}
+		if ownerName == "" && pinned != "" {
+			if existing, err := s.st.DesktopByClientID(pinned); err != nil {
+				return err
+			} else if existing != nil {
+				ownerName = existing.OwnerName
+			}
+		}
+		if ownerName == "" {
+			ownerName = frame.ClientName
+		}
+		clientID, err = s.st.PinBootstrapComputer(clientID, ownerName, frame.ClientName, store.HashToken(s.cfg.BridgeToken), capabilities, s.now())
+		if err != nil {
+			return err
+		}
+	} else {
+		if authClientID == "" || frame.ClientID == "" || frame.ClientID != authClientID {
+			return store.ErrIdentityConflict
+		}
+		clientID = authClientID
+		existing, err := s.st.DesktopByClientID(clientID)
+		if err != nil {
+			return err
+		}
+		if existing == nil {
+			return store.ErrIdentityConflict
+		}
+		if ownerName == "" {
+			ownerName = existing.OwnerName
+		}
+		if err := s.st.UpdateComputerHello(clientID, ownerName, frame.ClientName, capabilities, s.now()); err != nil {
+			return err
+		}
+	}
+	s.hub.HelloIdentity(conn, clientID, ownerName, frame.ClientName, caps)
+	return nil
+}
+
+func identityAuditReason(err error) string {
+	if errors.Is(err, store.ErrIdentityConflict) {
+		return string(protocol.CodeIdentityConflict)
+	}
+	return "invalid_identity"
 }
 
 // sendHelloOK tells the desktop the connection is ready and hands it the
@@ -258,14 +351,14 @@ func (s *Server) handlePairCreate(conn *bridge.Conn, frame *protocol.Frame) {
 	now := s.now()
 	expiresAt := now.Add(300 * time.Second)
 
-	if err := s.st.InsertPairCode(hash, frame.ID, now, expiresAt); err != nil {
+	clientID := s.hub.ClientID(conn)
+	if clientID == "" {
+		return
+	}
+	if err := s.st.InsertPairCodeForClient(hash, frame.ID, clientID, now, expiresAt); err != nil {
 		s.log.Error("pair code insert failed")
 		return
 	}
-	s.mu.Lock()
-	s.codeOwners[hash] = codeOwner{conn: conn, codeID: frame.ID}
-	s.mu.Unlock()
-
 	if err := s.hub.Send(conn, map[string]any{
 		"type":      "pair.created",
 		"id":        frame.ID,

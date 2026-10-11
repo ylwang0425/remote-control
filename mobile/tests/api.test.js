@@ -140,6 +140,56 @@ test('logout posts to /api/logout with an empty body', async () => {
   assert.deepEqual(JSON.parse(f.calls[0].init.body), {});
 });
 
+test('identity and admin roster use same-origin empty JSON POSTs with cookies', async () => {
+  const f = fakeFetch({ status: 200, body: { ok: true, result: { role: 'admin' } } });
+  const client = api.createApi({ fetch: f });
+  const me = await client.me();
+  const computers = await client.adminComputers();
+  assert.equal(me.ok, true);
+  assert.equal(f.calls[0].url, '/api/me');
+  assert.equal(f.calls[0].init.method, 'POST');
+  assert.equal(f.calls[0].init.credentials, 'include');
+  assert.deepEqual(JSON.parse(f.calls[0].init.body), {});
+  assert.equal(computers.ok, true);
+  assert.equal(f.calls[1].url, '/api/admin/computers');
+  assert.equal(f.calls[1].init.method, 'POST');
+  assert.equal(f.calls[1].init.credentials, 'include');
+  assert.deepEqual(JSON.parse(f.calls[1].init.body), {});
+});
+
+test('admin login and logout use their separate session endpoints', async () => {
+  const f = fakeFetch({ status: 200, body: { ok: true, result: { role: 'admin' } } });
+  const client = api.createApi({ fetch: f });
+  await client.adminLogin('operator', 'one-time-password');
+  await client.adminLogout();
+  assert.equal(f.calls[0].url, '/api/admin/login');
+  assert.equal(f.calls[0].init.method, 'POST');
+  assert.equal(f.calls[0].init.credentials, 'include');
+  assert.deepEqual(JSON.parse(f.calls[0].init.body), { username: 'operator', password: 'one-time-password' });
+  assert.equal(f.calls[1].url, '/api/admin/logout');
+  assert.deepEqual(JSON.parse(f.calls[1].init.body), {});
+});
+
+test('admin RPC always includes the exact selected computer ID', async () => {
+  const f = fakeFetch({ status: 200, body: { ok: true, result: { sessions: [] } } });
+  const client = api.createApi({ fetch: f });
+  const body = { method: 'session.answer', params: { tool: 'workbuddy', sessionId: 'same-id', callId: 'call-a', answers: [] } };
+  await client.adminRpc('computer-b', body);
+  assert.equal(f.calls[0].url, '/api/admin/rpc');
+  assert.deepEqual(JSON.parse(f.calls[0].init.body), {
+    clientId: 'computer-b', method: 'session.answer', params: body.params
+  });
+});
+
+test('enrollment code is generated only by the explicit admin action', async () => {
+  const f = fakeFetch({ status: 200, body: { ok: true, result: { code: 'one-use', expiresAt: 'soon' } } });
+  const client = api.createApi({ fetch: f });
+  const out = await client.adminEnrollmentCodes();
+  assert.equal(f.calls[0].url, '/api/admin/enrollment-codes');
+  assert.deepEqual(JSON.parse(f.calls[0].init.body), {});
+  assert.equal(out.result.code, 'one-use');
+});
+
 test('a hung request is aborted so polling can never stack forever', async () => {
   // fetch that never settles unless aborted
   const fetchImpl = function (url, init) {

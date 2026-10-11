@@ -160,7 +160,7 @@
   // shows the product name a person recognises. The ID is never rewritten --
   // every RPC keeps sending exactly what the desktop reported -- and a tool the
   // phone does not know keeps its own id instead of being mislabelled.
-  var TOOL_LABELS = { codex: 'Codex', dsh: 'DSH' };
+  var TOOL_LABELS = { codex: 'Codex', dsh: 'DSH', workbuddy: 'WorkBuddy' };
 
   function toolLabel(tool) {
     var key = str(tool);
@@ -279,6 +279,8 @@
     bridge_busy: '电脑端正忙，请稍后重试',
     bridge_timeout: '电脑没有及时回应',
     bridge_bad_response: '电脑返回的数据无法识别',
+    target_offline: '目标电脑当前不可用，请刷新电脑列表后重试',
+    identity_conflict: '配对身份与当前登录身份冲突，请先退出后重试',
     unknown_method: '客户端请求有误（方法不被支持）',
     invalid_params: '客户端请求有误（参数不合法）',
     session_not_found: '会话不存在或不可见，请刷新列表',

@@ -69,14 +69,18 @@ test('hello carries version 1, the client name and the capability object', () =>
     'session.stop': true,
     'stop:codex': false,
     'stop:dsh': true,
+    'stop:workbuddy': false,
     'models.list': false,
     'session.create': false,
     'session.send:model:codex': false,
     'session.send:model:dsh': false,
+    'session.send:model:workbuddy': false,
     'session.answer:codex': false,
     'session.answer:dsh': false,
+    'session.answer:workbuddy': false,
     'session.approve:codex': false,
     'session.approve:dsh': false,
+    'session.approve:workbuddy': false,
     tools: ['codex', 'dsh'],
   });
 });
@@ -84,6 +88,17 @@ test('hello carries version 1, the client name and the capability object', () =>
 test('a hello with an empty client name is refused rather than sent', () => {
   assert.throws(() => buildHello({ clientName: '   ', capabilities: buildCapabilities(['codex']) }), /clientName/);
   assert.throws(() => buildHello({ clientName: 'x'.repeat(65), capabilities: buildCapabilities(['codex']) }), /clientName/);
+});
+
+test('hello carries canonical computer identity fields and refuses malformed labels', () => {
+  const clientId = '98c9e96b-5d91-4a04-8d89-e2bdd29e30a5';
+  const capabilities = buildCapabilities(['codex', 'dsh']);
+  const frame = buildHello({ clientName: 'DESKTOP-7F3A', clientId, ownerName: '书房电脑', capabilities });
+  assert.equal(frame.clientId, clientId);
+  assert.equal(frame.ownerName, '书房电脑');
+  assert.throws(() => buildHello({ clientName: 'DESKTOP', clientId: 'not-a-uuid', ownerName: 'admin', capabilities }), /clientId/);
+  assert.throws(() => buildHello({ clientName: 'DESKTOP', clientId, ownerName: ' admin ', capabilities }), /ownerName/);
+  assert.throws(() => buildHello({ clientName: 'DESKTOP', clientId, ownerName: 'bad\nname', capabilities }), /ownerName/);
 });
 
 test('capabilities never claim a tool twice, and never claim nothing', () => {
@@ -100,6 +115,28 @@ test('capabilities never claim a tool twice, and never claim nothing', () => {
   assert.deepEqual(only.tools, ['codex']);
   assert.equal(only['stop:codex'], true);
   assert.equal(only['stop:dsh'], false);
+});
+
+test('toolStatus reports installed-but-unavailable software without claiming a session tool', () => {
+  const capabilities = buildCapabilities(['codex', 'dsh'], {
+    sendModelWorkbuddy: true,
+    answerWorkbuddy: true,
+    approveWorkbuddy: true,
+    stopWorkbuddy: true,
+    toolStatus: {
+      codex: { available: true },
+      dsh: { available: true },
+      workbuddy: { available: false, reason: 'No authorized attachable session API is exposed.' },
+    },
+  });
+  assert.deepEqual(capabilities.tools, ['codex', 'dsh']);
+  assert.equal(capabilities['stop:workbuddy'], false);
+  assert.equal(capabilities['session.send:model:workbuddy'], false);
+  assert.equal(capabilities['session.answer:workbuddy'], false);
+  assert.equal(capabilities['session.approve:workbuddy'], false);
+  assert.equal(capabilities.toolStatus.workbuddy.available, false);
+  assert.ok(capabilities.toolStatus.workbuddy.reason.length <= 500);
+  assert.throws(() => buildCapabilities([], { toolStatus: { workbuddy: { available: false, reason: 'x'.repeat(501) } } }), /500/);
 });
 
 test('pair.create mints a UUID v4 on this side, as CRD 0003 pins', () => {

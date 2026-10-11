@@ -239,7 +239,7 @@ func ValidateResult(method string, result json.RawMessage) (Code, bool) {
 			if s.ID == nil || !SessionIDPattern.MatchString(*s.ID) {
 				return CodeBridgeBadResponse, false
 			}
-			if s.Tool == nil || (*s.Tool != "codex" && *s.Tool != "dsh") {
+			if s.Tool == nil || !IsSupportedTool(*s.Tool) {
 				return CodeBridgeBadResponse, false
 			}
 			if s.Title == nil || *s.Title == "" || len([]rune(*s.Title)) > 200 || containsNewline(*s.Title) {
@@ -279,7 +279,7 @@ func ValidateResult(method string, result json.RawMessage) (Code, bool) {
 		if r.ID == nil || !SessionIDPattern.MatchString(*r.ID) {
 			return CodeBridgeBadResponse, false
 		}
-		if r.Tool == nil || (*r.Tool != "codex" && *r.Tool != "dsh") {
+		if r.Tool == nil || !IsSupportedTool(*r.Tool) {
 			return CodeBridgeBadResponse, false
 		}
 		if r.Title == nil || *r.Title == "" || len([]rune(*r.Title)) > 200 || containsNewline(*r.Title) {
@@ -451,7 +451,7 @@ func ValidateResult(method string, result json.RawMessage) (Code, bool) {
 		if err := json.Unmarshal(result, &r); err != nil {
 			return CodeBridgeBadResponse, false
 		}
-		if r.Tool == nil || (*r.Tool != "codex" && *r.Tool != "dsh") {
+		if r.Tool == nil || !IsSupportedTool(*r.Tool) {
 			return CodeBridgeBadResponse, false
 		}
 		if r.Models == nil {
@@ -509,7 +509,7 @@ func ValidateResult(method string, result json.RawMessage) (Code, bool) {
 		if r.SessionID == nil || !SessionIDPattern.MatchString(*r.SessionID) {
 			return CodeBridgeBadResponse, false
 		}
-		if r.Tool == nil || (*r.Tool != "codex" && *r.Tool != "dsh") {
+		if r.Tool == nil || !IsSupportedTool(*r.Tool) {
 			return CodeBridgeBadResponse, false
 		}
 		if r.Model == nil || !printableField(*r.Model, maxModelRunes) {

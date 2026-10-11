@@ -30,7 +30,17 @@ const path = require('node:path');
 const WEB_DIR = path.join(__dirname, '..', 'web');
 
 const ALLOWED_ORIGIN = 'https://101.43.98.18';
-const BODY_LIMITS = { '/api/pair': 4096, '/api/rpc': 65536, '/api/logout': 1024 };
+const BODY_LIMITS = {
+  '/api/me': 1024,
+  '/api/pair': 4096,
+  '/api/rpc': 65536,
+  '/api/logout': 1024,
+  '/api/admin/login': 4096,
+  '/api/admin/computers': 1024,
+  '/api/admin/logout': 1024,
+  '/api/admin/rpc': 65536,
+  '/api/admin/enrollment-codes': 1024
+};
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -90,6 +100,13 @@ function createMockServer(options) {
     rpcBodies: [],
     pairingCodes: new Map(opts.pairingCodes || [['K7QP3MZD9XTB2RCV6HNF0JWS', { used: false }]]),
     sessions: new Set(opts.sessionCookies || []),
+    adminSessions: new Set(opts.adminCookies || []),
+    adminCredentials: opts.adminCredentials || { username: 'admin', password: 'mock-admin-password' },
+    identity: opts.identity || { clientId: 'client-user-1', ownerName: '测试用户', clientName: '测试电脑' },
+    computers: (opts.computers || []).map((computer) => Object.assign({}, computer)),
+    adminRpcCalls: [],
+    enrollmentCode: opts.enrollmentCode || 'MOCK-ENROLLMENT-CODE',
+    enrollmentExpiresAt: opts.enrollmentExpiresAt || '2026-10-11T12:00:00Z',
     bridgeOnline: opts.bridgeOnline === undefined ? true : opts.bridgeOnline,
     capabilityOverride: opts.capabilities || null,
     readResult: opts.readResult || null,
@@ -149,6 +166,12 @@ function createMockServer(options) {
   function cookieSession(req) {
     const raw = req.headers.cookie || '';
     const match = /(?:^|;\s*)rc_session=([A-Za-z0-9_-]{43})/.exec(raw);
+    return match ? match[1] : null;
+  }
+
+  function cookieAdmin(req) {
+    const raw = req.headers.cookie || '';
+    const match = /(?:^|;\s*)rc_admin=([A-Za-z0-9_-]{43})/.exec(raw);
     return match ? match[1] : null;
   }
 
@@ -252,6 +275,36 @@ function createMockServer(options) {
     }
     if (!parsed || typeof parsed !== 'object') return fail(res, 400, 'invalid_json', 'invalid json body');
 
+    // Browser-readable identity/roster lookups use same-origin POSTs so the
+    // browser supplies Origin to the relay's CSRF guard. They accept no fields.
+    if (route === '/api/me') {
+      if (Object.keys(parsed).length !== 0) return fail(res, 400, 'invalid_request', 'invalid request body');
+      const admin = cookieAdmin(req);
+      if (admin && state.adminSessions.has(admin)) return succeed(res, { role: 'admin' });
+      const session = cookieSession(req);
+      if (!session || !state.sessions.has(session)) return fail(res, 401, 'unauthenticated', 'unauthenticated');
+      return succeed(res, Object.assign({ role: 'user' }, state.identity));
+    }
+
+    if (route === '/api/admin/computers') {
+      if (Object.keys(parsed).length !== 0) return fail(res, 400, 'invalid_request', 'invalid request body');
+      const admin = cookieAdmin(req);
+      if (!admin || !state.adminSessions.has(admin)) return fail(res, 401, 'unauthenticated', 'unauthenticated');
+      return succeed(res, { computers: state.computers });
+    }
+
+    // ---- POST /api/admin/login: independent administrator cookie ---------
+    if (route === '/api/admin/login') {
+      if (parsed.username !== state.adminCredentials.username || parsed.password !== state.adminCredentials.password) {
+        return fail(res, 401, 'invalid_credentials', 'invalid administrator credentials');
+      }
+      const admin = cryptoRandom();
+      state.adminSessions.add(admin);
+      return json(res, 200, { ok: true, result: { role: 'admin' } }, {
+        'Set-Cookie': 'rc_admin=' + admin + '; Path=/; HttpOnly; Secure; SameSite=Strict'
+      });
+    }
+
     // ---- POST /api/pair (7.2) --------------------------------------------
     if (route === '/api/pair') {
       if (typeof parsed.code !== 'string') return fail(res, 400, 'invalid_request', 'invalid request body');
@@ -269,6 +322,76 @@ function createMockServer(options) {
       return json(res, 200, { ok: true }, {
         'Set-Cookie': 'rc_session=' + session + '; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict'
       });
+    }
+
+    // ---- Admin-only endpoints use the independent rc_admin cookie --------
+    const admin = cookieAdmin(req);
+    if (route === '/api/admin/logout') {
+      if (!admin || !state.adminSessions.has(admin)) return fail(res, 401, 'unauthenticated', 'unauthenticated');
+      state.adminSessions.delete(admin);
+      return json(res, 200, { ok: true }, {
+        'Set-Cookie': 'rc_admin=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict'
+      });
+    }
+    if (route === '/api/admin/enrollment-codes') {
+      if (!admin || !state.adminSessions.has(admin)) return fail(res, 401, 'unauthenticated', 'unauthenticated');
+      return succeed(res, { code: state.enrollmentCode, expiresAt: state.enrollmentExpiresAt });
+    }
+    if (route === '/api/admin/rpc') {
+      if (!admin || !state.adminSessions.has(admin)) return fail(res, 401, 'unauthenticated', 'unauthenticated');
+      if (typeof parsed.clientId !== 'string' || typeof parsed.method !== 'string' ||
+          !parsed.params || typeof parsed.params !== 'object' || Array.isArray(parsed.params)) {
+        return fail(res, 400, 'invalid_request', 'invalid request body');
+      }
+      const computer = state.computers.find((row) => row.clientId === parsed.clientId);
+      if (!computer) return fail(res, 503, 'target_offline', 'target offline or unavailable');
+      state.adminRpcCalls.push({ clientId: parsed.clientId, method: parsed.method, params: parsed.params });
+      if (computer.online !== true) return fail(res, 503, 'target_offline', 'target offline or unavailable');
+      const method = parsed.method;
+      const params = parsed.params;
+      const allowedMethods = ['sessions.list', 'session.read', 'session.send', 'session.stop', 'models.list', 'session.create', 'session.answer', 'session.approve'];
+      if (!allowedMethods.includes(method)) return business(res, 'unknown_method', 'unknown method');
+      const configured = computer.rpcResults && computer.rpcResults[method];
+      const configuredResult = typeof configured === 'function' ? configured(parsed, state, computer) : configured;
+      if (configuredResult !== undefined) {
+        return configuredResult && configuredResult.ok !== undefined
+          ? json(res, 200, configuredResult)
+          : succeed(res, configuredResult);
+      }
+      if (method === 'sessions.list') {
+        return succeed(res, {
+          sessions: computer.sessions || [],
+          capabilities: computer.capabilities || { 'sessions.list': true, tools: [] }
+        });
+      }
+      if (method === 'models.list') {
+        const catalog = computer.catalogs && computer.catalogs[params.tool] || computer.catalog;
+        if (catalog) return succeed(res, catalog);
+        return business(res, 'not_capable', 'this tool does not support listing models');
+      }
+      if (method === 'session.read') {
+        const reads = computer.reads || {};
+        const read = reads[params.sessionId] || computer.readResult;
+        if (read) return succeed(res, read);
+        const session = (computer.sessions || []).find((row) => row.id === params.sessionId);
+        if (!session) return business(res, 'session_not_found', 'not found');
+        return succeed(res, Object.assign({ messages: [], canStop: false }, session));
+      }
+      if (method === 'session.create') {
+        const created = computer.createResult;
+        if (created) return succeed(res, typeof created === 'function' ? created(parsed, state, computer) : created);
+        return business(res, 'session_create_failed', 'no create fixture configured');
+      }
+      if (method === 'session.send') return succeed(res, { accepted: true, sessionId: params.sessionId });
+      if (method === 'session.stop') return succeed(res, { accepted: true, sessionId: params.sessionId });
+      if (method === 'session.answer') {
+        state.answered.push({ clientId: parsed.clientId, method, params });
+        return succeed(res, { accepted: true, sessionId: params.sessionId, callId: params.callId });
+      }
+      if (method === 'session.approve') {
+        state.approved.push({ clientId: parsed.clientId, method, params });
+        return succeed(res, { accepted: true, sessionId: params.sessionId, approvalId: params.approvalId, state: 'submitted' });
+      }
     }
 
     // Everything below needs a session cookie (7.3, 7.4).

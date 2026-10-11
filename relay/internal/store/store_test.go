@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +17,104 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+func TestLegacySchemaMigrationBindsOnlyToPinnedBootstrapAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.db")
+	legacy, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	now := time.Now()
+	legacyDDL := []string{
+		`CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE pair_codes (code_hash TEXT PRIMARY KEY, code_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0)`,
+	}
+	for _, statement := range legacyDDL {
+		if _, err := legacy.Exec(statement); err != nil {
+			t.Fatalf("create legacy table: %v", err)
+		}
+	}
+	phoneTokenHash := HashToken("legacy-phone-token-for-migration")
+	if _, err := legacy.Exec(`INSERT INTO devices (id,name,token_hash,created_at,expires_at,last_seen_at) VALUES ('phone-1','Legacy Phone',?,?,?,0)`, phoneTokenHash, now.UnixNano(), now.Add(deviceTTL).UnixNano()); err != nil {
+		t.Fatalf("insert legacy device: %v", err)
+	}
+	legacyCodeHash := HashToken("legacy-unconsumed-pair-code")
+	if _, err := legacy.Exec(`INSERT INTO pair_codes (code_hash,code_id,created_at,expires_at,attempts) VALUES (?,'pair-1',?,?,0)`, legacyCodeHash, now.UnixNano(), now.Add(5*time.Minute).UnixNano()); err != nil {
+		t.Fatalf("insert legacy pair code: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migrated db: %v", err)
+	}
+	bootstrapID, err := st.PinBootstrapComputer("", "Owner", "DESKTOP-OLD", HashToken("bootstrap-token"), []byte(`{"tools":["codex"]}`), now)
+	if err != nil {
+		t.Fatalf("pin bootstrap identity: %v", err)
+	}
+	device, err := st.DeviceByTokenHash(phoneTokenHash, now)
+	if err != nil || device == nil || device.ClientID != bootstrapID {
+		t.Fatalf("legacy device = %+v, err=%v; want bootstrap binding %s", device, err, bootstrapID)
+	}
+	outcome, _, pairClientID, err := st.ConsumePairCodeBound(legacyCodeHash, now)
+	if err != nil || outcome != PairCodeOK || pairClientID != bootstrapID {
+		t.Fatalf("legacy pair code binding = %q, %v, %v; want %q", pairClientID, outcome, err, bootstrapID)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrated db: %v", err)
+	}
+	defer reopened.Close()
+	if got, err := reopened.BootstrapClientID(); err != nil || got != bootstrapID {
+		t.Fatalf("bootstrap identity after restart = %q, %v; want %q", got, err, bootstrapID)
+	}
+	device, err = reopened.DeviceByTokenHash(phoneTokenHash, now)
+	if err != nil || device == nil || device.ClientID != bootstrapID {
+		t.Fatalf("phone binding after restart = %+v, err=%v", device, err)
+	}
+	if _, err := reopened.PinBootstrapComputer("3f2504e0-4f89-41d3-9a0c-0305e82c3301", "Attacker", "OTHER", HashToken("bootstrap-token"), nil, now); err != ErrIdentityConflict {
+		t.Fatalf("a second bootstrap identity returned %v; want ErrIdentityConflict", err)
+	}
+}
+
+func TestEnrollmentCodeIsOneUseAndSecretsAreOnlyHashed(t *testing.T) {
+	st := openTestStore(t)
+	now := time.Now()
+	code := "ABCDEFGHJKMNPQRSTVWXYZ012"
+	codeHash := HashToken(code)
+	bridgeToken := "per-computer-secret-token"
+	clientID := "0f1c7a2e-9b64-4c5f-8f1a-2d3e4b5c6a70"
+	if err := st.InsertEnrollmentCode(codeHash, now, now.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := st.EnrollComputer(codeHash, clientID, "Laptop", "DESKTOP-ONE", HashToken(bridgeToken), now)
+	if err != nil || outcome != EnrollmentOK {
+		t.Fatalf("first enrollment = %v, %v", outcome, err)
+	}
+	outcome, err = st.EnrollComputer(codeHash, "3f2504e0-4f89-41d3-9a0c-0305e82c3301", "Other", "DESKTOP-TWO", HashToken("another-token"), now)
+	if err != nil || outcome != EnrollmentAlreadyUsed {
+		t.Fatalf("second enrollment = %v, %v; want EnrollmentAlreadyUsed", outcome, err)
+	}
+	computer, err := st.DesktopByTokenHash(HashToken(bridgeToken))
+	if err != nil || computer == nil || computer.ClientID != clientID {
+		t.Fatalf("token lookup = %+v, %v", computer, err)
+	}
+	dump := st.rawDumpForTest(t)
+	for _, secret := range []string{code, bridgeToken} {
+		if strings.Contains(dump, secret) {
+			t.Fatalf("plaintext enrollment secret %q is in the database", secret)
+		}
+	}
+	if !strings.Contains(dump, codeHash) || !strings.Contains(dump, HashToken(bridgeToken)) {
+		t.Fatal("database is missing a stored SHA-256 token/code hash")
+	}
 }
 
 // TestPairCodeSingleUseIsAtomic covers protocol-v1 §7.2 rule 1: the code is
@@ -231,13 +330,16 @@ func TestDeviceExpiresAfterThirtyDays(t *testing.T) {
 	}
 }
 
-// TestSchemaHoldsNoChatText covers R13 and §3.4: persistence is limited to
-// token hashes, pairing-code hashes and audit metadata. There is no table that
-// could hold a message body, and no column named like one.
+// TestSchemaHoldsNoChatText covers the persistence boundary: persistence is
+// limited to token hashes, pair/enrollment-code hashes, computer metadata,
+// capabilities declarations and audit metadata. No table can hold a message.
 func TestSchemaHoldsNoChatText(t *testing.T) {
 	st := openTestStore(t)
 	got := st.TablesForTest(t)
-	want := map[string]bool{"devices": true, "pair_codes": true, "audit": true, "schema_meta": true}
+	want := map[string]bool{
+		"devices": true, "pair_codes": true, "audit": true, "schema_meta": true,
+		"desktop_clients": true, "enrollment_codes": true,
+	}
 	for _, name := range got {
 		if !want[name] {
 			t.Errorf("unexpected table %q: persistence must hold only token hashes and audit metadata", name)

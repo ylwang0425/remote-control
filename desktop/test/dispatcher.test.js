@@ -274,3 +274,42 @@ test('a source that cannot be opened takes its own capabilities down, never the 
     dispatcher.close();
   }
 });
+
+test('WorkBuddy remains visible as unavailable without inventing sessions or decision paths', async () => {
+  const codexAdapter = fakeAdapter({ canAnswer: () => false, canApprove: () => false });
+  const dshAdapter = fakeAdapter();
+  const dispatcher = makeDispatcher(codexAdapter, dshAdapter);
+  try {
+    const listed = await dispatcher.dispatch({ method: 'sessions.list', params: {} });
+    assert.deepEqual(listed.capabilities.tools, ['codex', 'dsh'], 'only opened adapters count as session sources');
+    assert.equal(listed.capabilities.toolStatus.workbuddy.available, false);
+    assert.match(listed.capabilities.toolStatus.workbuddy.reason, /未接入此桥接器的受信会话控制通道/);
+    for (const capability of [
+      'stop:workbuddy',
+      'session.send:model:workbuddy',
+      'session.answer:workbuddy',
+      'session.approve:workbuddy',
+    ]) {
+      assert.equal(listed.capabilities[capability], false, capability);
+    }
+
+    const sessions = await dispatcher.dispatch({ method: 'sessions.list', params: { tool: 'workbuddy' } }).catch((error) => error);
+    const answer = await dispatcher.dispatch({
+      method: 'session.answer',
+      params: { tool: 'workbuddy', sessionId: 'wb-1', callId: 'native-call-1', answers: [{ id: 'q-1', selected: ['yes'] }] },
+    }).catch((error) => error);
+    assert.equal(sessions.code, 'not_capable');
+    const approval = await dispatcher.dispatch({
+      method: 'session.approve',
+      params: { tool: 'workbuddy', sessionId: 'wb-1', approvalId: '11111111-2222-4333-8444-555555555555', decision: 'allow-once' },
+    }).catch((error) => error);
+    assert.equal(answer.code, 'not_capable');
+    assert.equal(approval.code, 'not_capable');
+    assert.deepEqual(codexAdapter.calls.answer, []);
+    assert.deepEqual(dshAdapter.calls.answer, []);
+    assert.deepEqual(codexAdapter.calls.approve, []);
+    assert.deepEqual(dshAdapter.calls.approve, []);
+  } finally {
+    dispatcher.close();
+  }
+});

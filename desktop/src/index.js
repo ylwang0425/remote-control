@@ -18,7 +18,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { loadConfig, readTokenFile, redactedConfig, configPath } = require('./config');
+const { loadConfig, readTokenFile, redactedConfig, configPath, normalizeOwnerName, newClientId, saveConfig } = require('./config');
+const { EnrollmentError, normalizeRelayAddress, enrollDesktop } = require('./enrollment');
 const {
   buildCapabilities,
   buildSessionsListResult,
@@ -45,6 +46,8 @@ const { CreateLog, fingerprintOf } = require('./creates');
  */
 const CODEX_LIST_TIMEOUT_MS = 8000;
 const DSH_LIST_TIMEOUT_MS = 5000;
+const WORKBUDDY_UNAVAILABLE_REASON =
+  'WorkBuddy 未接入此桥接器的受信会话控制通道。已检视的本机接口依赖 WorkBuddy 内部上下文；当前本桥接器不能真实读取或操作它的会话、模型、项目、提问与审批。';
 
 const VERSION = require('../package.json').version;
 
@@ -265,19 +268,35 @@ function createDispatcher(config, log, factories = {}) {
     };
   }
 
+  function capabilityToolStatus(codexAdapter, dshAdapter) {
+    return {
+      codex: codexAdapter === null
+        ? { available: false, reason: 'no Codex app-tools pipe answered yet' }
+        : { available: true },
+      dsh: dshAdapter === null
+        ? { available: false, reason: 'no DSH backend answered on loopback yet' }
+        : { available: true },
+      workbuddy: { available: false, reason: WORKBUDDY_UNAVAILABLE_REASON },
+    };
+  }
+
   async function capabilities() {
     const [codexAdapter, dshAdapter] = await Promise.all([pair(codex), pair(dsh)]);
     const tools = [];
     if (codexAdapter !== null) tools.push('codex');
     if (dshAdapter !== null) tools.push('dsh');
+    const toolStatus = capabilityToolStatus(codexAdapter, dshAdapter);
     // No default-on: with no session source the hello carries an empty `tools`
     // and false bits, which is the contract's "connected but nothing to show".
-    return buildCapabilities(tools, capabilityOptions(codexAdapter, dshAdapter));
+    return buildCapabilities(tools, { ...capabilityOptions(codexAdapter, dshAdapter), toolStatus });
   }
 
   function route(params, capabilitiesNow) {
     if (params.tool === 'codex') return { open: codex, stopTool: 'codex', capabilities: capabilitiesNow };
     if (params.tool === 'dsh') return { open: dsh, stopTool: 'dsh', capabilities: capabilitiesNow };
+    if (params.tool === 'workbuddy') {
+      throw new BridgeError('not_capable', 'WorkBuddy session control is unavailable on this desktop');
+    }
     throw new BridgeError('invalid_params', 'params.tool must be "codex" or "dsh"');
   }
 
@@ -409,12 +428,18 @@ function createDispatcher(config, log, factories = {}) {
     }
 
     if (method === 'sessions.list') {
+      if (params.tool === 'workbuddy') {
+        throw new BridgeError('not_capable', 'WorkBuddy sessions are unavailable on this desktop');
+      }
       const [codexAdapter, dshAdapter] = await Promise.all([pair(codex), pair(dsh)]);
       const tools = [];
       if (codexAdapter !== null) tools.push('codex');
       if (dshAdapter !== null) tools.push('dsh');
       const sessions = [];
-      const capabilitiesNow = buildCapabilities(tools, capabilityOptions(codexAdapter, dshAdapter));
+      const capabilitiesNow = buildCapabilities(tools, {
+        ...capabilityOptions(codexAdapter, dshAdapter),
+        toolStatus: capabilityToolStatus(codexAdapter, dshAdapter),
+      });
       for (const [tool, adapter] of [
         ['codex', codexAdapter],
         ['dsh', dshAdapter],
@@ -554,6 +579,7 @@ function createDispatcher(config, log, factories = {}) {
         sessions: metrics.dsh.sessions,
         reason: state.dsh === null ? 'no DSH backend answered on loopback yet' : null,
       },
+      workbuddy: { available: false, reason: WORKBUDDY_UNAVAILABLE_REASON },
     }),
   };
 }
@@ -561,24 +587,115 @@ function createDispatcher(config, log, factories = {}) {
 async function run(config, args, log) {
   const clientName = config.clientName ?? os.hostname().slice(0, 64) ?? 'DESKTOP';
   const dispatcher = createDispatcher(config, log);
+  const bridgeRequested = config.autoStartBridge && !args.noBridge;
+  let token = config.bridgeToken;
+  if (token === null && typeof args.tokenFile === 'string') token = readTokenFile(args.tokenFile);
+  let identityPersisted = true;
+  if (config.clientId === null && (token !== null || config.ownerName !== null)) {
+    const clientId = newClientId();
+    try {
+      saveConfig(config.configFile, { clientId });
+      config.clientId = clientId;
+    } catch {
+      identityPersisted = false;
+      log('could not save a stable computer ID; the relay link stays down until the local config can be written');
+    }
+  }
+  const bridgeEnabled = bridgeRequested && identityPersisted;
   const status = {
-    bridge: { connected: false, clientName, relayUrl: config.relayUrl, capabilities: { tools: config.tools } },
+    identity: { clientId: config.clientId, ownerName: config.ownerName },
+    bridge: {
+      connected: false,
+      clientName,
+      clientId: config.clientId,
+      ownerName: config.ownerName,
+      relayUrl: config.relayUrl,
+      capabilities: {},
+    },
     codex: { available: false, reason: 'not connected yet' },
     dsh: { available: false, reason: 'not connected yet' },
+    workbuddy: { available: false, reason: WORKBUDDY_UNAVAILABLE_REASON },
     pairing: null,
   };
 
   let bridge = null;
+
+  function updateStatusFromAdapters() {
+    const described = dispatcher.describe();
+    status.codex = { ...described.codex };
+    status.dsh = { ...described.dsh };
+    status.workbuddy = { ...described.workbuddy };
+    return described;
+  }
+
+  async function currentCapabilities() {
+    try {
+      const listed = await dispatcher.dispatch({ method: 'sessions.list', params: {} });
+      updateStatusFromAdapters();
+      return listed.capabilities;
+    } catch {
+      const described = updateStatusFromAdapters();
+      const toolStatus = {
+        codex: described.codex.available ? { available: true } : { available: false, reason: described.codex.reason },
+        dsh: described.dsh.available ? { available: true } : { available: false, reason: described.dsh.reason },
+        workbuddy: { available: false, reason: WORKBUDDY_UNAVAILABLE_REASON },
+      };
+      // If the combined session list itself failed, membership is unknown. Do
+      // not claim any configured tool as an opened native session adapter.
+      return buildCapabilities([], { toolStatus });
+    }
+  }
+
+  function setBridgeListeners(instance) {
+    instance.on('ready', (negotiated) => {
+      status.bridge.connected = true;
+      log(`relay link ready (heartbeat ${negotiated.heartbeatIntervalMs} ms)`);
+    });
+    instance.on('close', () => {
+      status.bridge.connected = false;
+      log('relay link closed; reconnecting with backoff');
+    });
+    instance.on('auth.rejected', () => log('the relay refused the token: retrying slowly, check the token'));
+    instance.on('pair.used', (event) => log(`a phone paired: ${event.deviceName}`));
+    instance.on('error', (error) => log(`bridge error: ${safeMessage(error)}`));
+    instance.on('request.received', (request) => log(`request: ${request.method}`));
+  }
+
+  async function startBridge(token, relayUrl = config.relayUrl) {
+    const capabilities = await currentCapabilities();
+    status.bridge.capabilities = capabilities;
+    status.bridge.relayUrl = relayUrl;
+    status.bridge.clientId = config.clientId;
+    status.bridge.ownerName = config.ownerName;
+    const instance = new BridgeClient({
+      url: relayUrl,
+      token,
+      clientId: config.clientId,
+      ownerName: config.ownerName,
+      clientName,
+      capabilities,
+      dispatch: dispatcher.dispatch,
+    });
+    bridge = instance;
+    setBridgeListeners(instance);
+    await instance.start();
+    const connected = await instance.waitUntilConnected(15000);
+    status.bridge.connected = connected;
+    log(connected ? 'connected to the relay' : 'the relay link is not up yet; the bridge keeps retrying');
+  }
+
   const ui = new LocalUiServer({
     port: config.uiPort,
     state: () => {
-      const described = dispatcher.describe();
+      const described = updateStatusFromAdapters();
       // Only measured numbers travel; the page decides how to say "not measured".
       return {
         ...status,
+        identity: { ...status.identity },
         bridge: { ...status.bridge, connected: bridge === null ? false : bridge.connected },
         codex: { ...described.codex },
         dsh: { ...described.dsh },
+        workbuddy: { ...described.workbuddy },
       };
     },
     onPairCreate: async () => {
@@ -589,62 +706,119 @@ async function run(config, args, log) {
       status.pairing = { codeId: created.id, expiresAt: created.expiresAt };
       return created;
     },
+    onIdentityUpdate: async ({ ownerName: rawOwnerName }) => {
+      let ownerName;
+      try { ownerName = normalizeOwnerName(rawOwnerName); } catch (error) {
+        throw new EnrollmentError('invalid_params', error.message, 400);
+      }
+      const clientId = config.clientId ?? newClientId();
+      try {
+        saveConfig(config.configFile, { clientId, ownerName });
+      } catch {
+        throw new EnrollmentError('config_write_failed', 'Could not save the computer settings.', 500);
+      }
+      config.clientId = clientId;
+      config.ownerName = ownerName;
+      identityPersisted = true;
+      status.identity = { clientId, ownerName };
+      status.bridge.clientId = clientId;
+      status.bridge.ownerName = ownerName;
+      let helloSent = bridge === null ? false : bridge.updateIdentity({ clientId, ownerName, clientName });
+      if (bridge === null && bridgeRequested && token !== null) {
+        await startBridge(token);
+        helloSent = bridge?.connected === true;
+      }
+      return { identity: { clientId, ownerName }, helloUpdated: helloSent };
+    },
+    onEnroll: async ({ code, ownerName: rawOwnerName, relayUrl: rawRelayUrl }) => {
+      if (config.bridgeTokenOverridden || config.relayUrlOverridden || args.relay !== undefined) {
+        throw new EnrollmentError(
+          'config_override',
+          'Enrollment is disabled while the relay URL or bridge credential is set by an environment or command-line override.',
+          409,
+        );
+      }
+      let ownerName;
+      try { ownerName = normalizeOwnerName(rawOwnerName); } catch (error) {
+        throw new EnrollmentError('invalid_params', error.message, 400);
+      }
+      const clientId = config.clientId ?? newClientId();
+      try {
+        // Check that the private config can be atomically replaced before the
+        // relay consumes this one-use invitation. This does not save its code.
+        saveConfig(config.configFile, {});
+      } catch {
+        throw new EnrollmentError('config_write_failed', 'Make the local config file writable before using an enrollment code.', 500);
+      }
+      const enrollment = await enrollDesktop({
+        relayAddress: rawRelayUrl,
+        code,
+        clientId,
+        ownerName,
+        clientName,
+      });
+      try {
+        saveConfig(config.configFile, {
+          clientId,
+          ownerName,
+          relayUrl: enrollment.relayUrl,
+          bridgeToken: enrollment.bridgeToken,
+        });
+      } catch {
+        throw new EnrollmentError(
+          'config_write_failed',
+          'The relay accepted the invitation, but the private computer credential could not be saved. Ask for a fresh invitation before retrying.',
+          500,
+        );
+      }
+      config.clientId = clientId;
+      config.ownerName = ownerName;
+      identityPersisted = true;
+      config.relayUrl = enrollment.relayUrl;
+      config.bridgeToken = enrollment.bridgeToken;
+      token = enrollment.bridgeToken;
+      status.identity = { clientId, ownerName };
+      status.bridge.clientId = clientId;
+      status.bridge.ownerName = ownerName;
+      status.bridge.relayUrl = enrollment.relayUrl;
+      if (bridge !== null) {
+        bridge.updateConnection({
+          url: enrollment.relayUrl,
+          token: enrollment.bridgeToken,
+          clientId,
+          ownerName,
+          clientName,
+        });
+        status.bridge.connected = false;
+      } else if (bridgeRequested) {
+        await startBridge(enrollment.bridgeToken, enrollment.relayUrl);
+      }
+      return {
+        identity: { clientId, ownerName },
+        relayUrl: enrollment.relayUrl,
+        connected: bridge === null ? false : bridge.connected,
+        connecting: bridge !== null && ['connecting', 'handshaking', 'reconnecting'].includes(bridge.state),
+      };
+    },
   });
   const started = await ui.start();
   log(`local UI on ${started.url} (loopback only)`);
   log(`config: ${JSON.stringify(redactedConfig(config))}`);
 
-  if (!config.autoStartBridge || args.noBridge) {
-    log('relay link disabled (--no-bridge): the local UI is up, nothing is connected');
-    return { ui, bridge: null, clientName };
-  }
-
-  let token = config.bridgeToken;
-  if (token === null && typeof args.tokenFile === 'string') {
-    token = readTokenFile(args.tokenFile);
+  if (!bridgeEnabled) {
+    if (!bridgeRequested) {
+      log('relay link disabled (--no-bridge): the local UI is up, nothing is connected');
+    }
+    return { ui, get bridge() { return bridge; }, clientName };
   }
   if (token === null) {
     log('no bridge token configured: the local UI is up, the relay link stays down');
     log('set bridgeToken in the config file, or AI_REMOTE_BRIDGE_TOKEN, or pass --token-file <path>');
-    return { ui, bridge: null, clientName };
+    return { ui, get bridge() { return bridge; }, clientName };
   }
 
-  const capabilities = await (async () => {
-    try {
-      const listed = await dispatcher.dispatch({ method: 'sessions.list', params: {} });
-      status.codex = { available: true };
-      status.dsh = { available: true };
-      return listed.capabilities;
-    } catch {
-      return buildCapabilities(config.tools, { stopCodex: false, stopDsh: true });
-    }
-  })();
-  status.bridge.capabilities = capabilities;
-
-  bridge = new BridgeClient({
-    url: config.relayUrl,
-    token,
-    clientName,
-    capabilities,
-    dispatch: dispatcher.dispatch,
-  });
-  bridge.on('ready', (negotiated) => {
-    status.bridge.connected = true;
-    log(`relay link ready (heartbeat ${negotiated.heartbeatIntervalMs} ms)`);
-  });
-  bridge.on('close', () => {
-    status.bridge.connected = false;
-    log('relay link closed; reconnecting with backoff');
-  });
-  bridge.on('auth.rejected', () => log('the relay refused the token: retrying slowly, check the token'));
-  bridge.on('pair.used', (event) => log(`a phone paired: ${event.deviceName}`));
-  bridge.on('error', (error) => log(`bridge error: ${safeMessage(error)}`));
-  bridge.on('request.received', (request) => log(`request: ${request.method}`));
-  await bridge.start();
-  const ok = await bridge.waitUntilConnected(15000);
-  status.bridge.connected = ok;
-  log(ok ? 'connected to the relay' : 'the relay link is not up yet; the bridge keeps retrying');
-  return { ui, bridge, clientName };
+  await startBridge(token);
+  return { ui, get bridge() { return bridge; }, clientName };
 }
 
 async function main(argv = process.argv.slice(2)) {

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -68,6 +70,15 @@ type Capabilities struct {
 	// approval with an instruction to act at the computer.
 	ApproveCodex bool `json:"session.approve:codex"`
 	ApproveDSH   bool `json:"session.approve:dsh"`
+
+	// ToolStatus preserves explicit discovery results for installed providers
+	// that are temporarily unavailable. Missing entries use membership in Tools.
+	ToolStatus map[string]ToolStatus `json:"toolStatus,omitempty"`
+}
+
+type ToolStatus struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // Frame carries every field any frame in §8.3 may use. One struct keeps the
@@ -76,6 +87,8 @@ type Frame struct {
 	Type FrameType `json:"type"`
 
 	Version      int           `json:"version"`
+	ClientID     string        `json:"clientId"`
+	OwnerName    string        `json:"ownerName"`
 	ClientName   string        `json:"clientName"`
 	Capabilities *Capabilities `json:"capabilities"`
 
@@ -138,12 +151,51 @@ func (f *Frame) ValidateHello() error {
 	if f.Capabilities == nil {
 		return errors.New("hello has no capabilities object")
 	}
-	name := strings.TrimSpace(f.ClientName)
-	if name == "" {
-		return errors.New("hello clientName is blank")
+	if !IsHostnameLabel(f.ClientName) {
+		return errors.New("hello clientName is not a hostname label")
 	}
-	if utf8.RuneCountInString(f.ClientName) > 64 {
-		return errors.New("hello clientName is longer than 64 characters")
+	if f.ClientID != "" && !IsCanonicalUUID(f.ClientID) {
+		return errors.New("hello clientId is not a canonical UUID")
+	}
+	if f.OwnerName != "" {
+		name := strings.TrimSpace(f.OwnerName)
+		if name == "" || utf8.RuneCountInString(name) > 64 {
+			return errors.New("hello ownerName is invalid")
+		}
+		for _, r := range name {
+			if unicode.IsControl(r) {
+				return errors.New("hello ownerName contains a control character")
+			}
+		}
+	}
+	if len(f.Capabilities.ToolStatus) > 3 {
+		return errors.New("hello capabilities.toolStatus has too many entries")
+	}
+	for id, status := range f.Capabilities.ToolStatus {
+		if !IsSupportedTool(id) {
+			return errors.New("hello capabilities.toolStatus has an unknown tool id")
+		}
+		if utf8.RuneCountInString(status.Reason) > 500 {
+			return errors.New("hello capabilities.toolStatus reason is too long")
+		}
+		for _, r := range status.Reason {
+			if unicode.IsControl(r) {
+				return errors.New("hello capabilities.toolStatus reason contains a control character")
+			}
+		}
 	}
 	return nil
 }
+
+var (
+	canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	hostnameLabelPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+)
+
+// IsCanonicalUUID accepts one lower-case, hyphenated UUID without imposing a
+// UUID version. Native desktop identity IDs are generated as v4, while clients
+// may already have a stable canonical UUID from another source.
+func IsCanonicalUUID(s string) bool { return canonicalUUIDPattern.MatchString(s) }
+
+// IsHostnameLabel accepts one DNS hostname label, not a dotted FQDN.
+func IsHostnameLabel(s string) bool { return hostnameLabelPattern.MatchString(s) }

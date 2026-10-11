@@ -17,11 +17,43 @@
   分组里。**id 与行为都没变**（仍是 `POST /api/logout` 后回到配对页），
   原来的 `#settings-logout-button` 重复控件已删除；会话列表里不再有任何
   整宽页脚按钮。
-- 会话卡片上的工具标签显示 **产品名**（`Codex` / `DSH`），不是线上的小写 id；
+- 会话卡片上的工具标签显示 **产品名**（`Codex` / `DSH` / `WorkBuddy`），不是线上的小写 id；
   手机不认识的工具仍显示它自己的 id，绝不冒充这两个之一
   （`core.toolLabel` / `core.TOOL_LABELS`）。搜索索引同时含 id 与显示名，
   所以照着屏幕上看到的字搜索也能命中。
 - 样式是中性浅/深两套色、单一强调色；图标圆点、分组标题与间距只做层级提示。
+
+## 0.1 普通配对与管理员工作台
+
+- 普通用户仍通过配对码进入自己配对的电脑；账号设置显示服务器返回的电脑名称，
+  `/api/rpc` 请求不带电脑选择参数，目标由服务端配对会话固定。
+- 配对页和设置页都能打开管理员登录。管理员账号密码只发给
+  `POST /api/admin/login`，密码输入框在请求发出前清空；密码与管理员 cookie 都不写入
+  `localStorage`。管理员 cookie 由服务端独立设置，登出走
+  `POST /api/admin/logout`。
+- `POST /api/me`（空 JSON 对象）用来判断当前 cookie 身份。浏览器读取身份和名册时使用
+  同源 POST，让浏览器自动附带 Origin 供服务端校验；旧服务端不支持该接口时，页面仍按原有
+  普通配对流程工作；管理员入口只在独立登录接口可用时工作，不会把管理员请求
+  回退到普通用户 RPC。
+- 管理员名册来自 `POST /api/admin/computers`（空 JSON 对象），按机主分组，每台电脑都按 `clientId`
+  单独呈现，所以重复的机主名、电脑名不会合并。离线电脑继续显示，但不能打开。
+  卡片列出服务端报告的真实 AI 工具与可用状态；WorkBuddy 若当前不可用，会标示
+  「未接入」，原始服务端原因保留在状态提示中。
+- 管理员选择在线电脑后，原有会话、问题、单次审批、新建会话、模型和项目界面会
+  通过 `POST /api/admin/rpc` 操作该 `clientId`。目标失效会明确失败，不会改投另一台
+  电脑。顶部会显示机主和电脑名称，可随时返回名册。
+- 管理员可以主动生成一次性电脑登记码。只有点击生成后才请求
+  `POST /api/admin/enrollment-codes` 并展示返回的码与有效期。
+- 当 WorkBuddy 尚未接入此工作台时，名册和新建会话页会提供官方
+  [多设备接入说明](https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice)。
+  用户可在 WorkBuddy 官方手机 App 登录与电脑相同的账号，继续已有聊天；此状态下
+  新建会话页不显示 WorkBuddy 模型和创建控件。Android 壳把外站 HTTPS 链接交给系统浏览器。
+- **仅允许本次 / 拒绝**是针对电脑当前上报的单条执行权限请求；待答问题是 AI 对话
+  上报的真实澄清表单。它们都必须先由电脑真实上报，手机只调用既有的
+  `session.approve` / `session.answer`，不处理 AI 账号 API key，也不代替电脑确认结果。
+- 草稿、问题答案和审批回执、展开状态、详情、会话/新建模型目录及项目名称都按所选
+  `clientId` 与原生 id 一起隔离。切换电脑会令旧请求失效，迟到的响应会被丢弃；两台
+  电脑即使报告相同的 sessionId、callId、approvalId、modelId 或 projectId，也不会串用。
 
 ## 1. 工作台三个视图
 
@@ -32,7 +64,7 @@
 | --- | --- | --- |
 | 会话 | 全部会话，可搜索、按工具筛选、按项目筛选、置顶 | `sessions.list` |
 | 任务 | 只留 `status=working`、`status=error` 或 `needsInput=true` 的会话，并给一行中文总览 | `sessions.list` 的真实状态 |
-| 设置 | 外观（跟随系统/浅色/深色）、筛选记忆、置顶统计、退出登录 | 本机 `localStorage` |
+| 设置 | 外观（跟随系统/浅色/深色）、筛选记忆、置顶统计、配对电脑名称、用户退出登录 | 本机偏好与 `/api/me` |
 `#tab-tasks-badge` 上的数字 = **真实**的工作中 + 出错 + 待确认会话数；
 一个会话都没有时徽标整体隐藏。**不编造进度、不编造卡片**。
 
@@ -40,7 +72,7 @@
 
 - **搜索**：纯文本匹配标题 / 工具 / 状态中文名 / `cwd` / `id`（`core.filterSessions`）。
   搜索词**刻意不持久化** —— 记住搜索词会让"重启后列表莫名空白"。
-- **工具筛选**：`全部 / Codex / DSH` 由**列表里真实出现的 tool** 生成
+- **工具筛选**：`全部 / Codex / DSH / WorkBuddy` 等由**列表里真实出现的 tool** 生成
   （`core.toolChips`）。出现一个手机不认识的工具（例如 `trae`），它会有**自己的筛选项**，
   而不是被过滤到看不见。
 - **项目筛选**：底部抽屉（sheet）。候选项目 = **各工具实时 `models.list.projects`
@@ -95,8 +127,8 @@
 
 | 面板 | 键 | 签名内容 |
 | --- | --- | --- |
-| 待答问题 | 原生 `callId` | 每个问题的 id / 单多选 / header / 题面 / detail / **选项 label 与描述的顺序**，加上该批次的回执状态 |
-| 权限审批 | 原生 `approvalId` | sessionId / approvalId / toolName / callId / reason，加上回执状态 |
+| 待答问题 | 当前电脑 + sessionId + 原生 `callId` | 每个问题的 id / 单多选 / header / 题面 / detail / **选项 label 与描述的顺序**，加上该批次的回执状态 |
+| 权限审批 | 当前电脑 + sessionId + 原生 `approvalId` | sessionId / approvalId / toolName / callId / reason，加上回执状态 |
 | 模型选择器 | 单个容器 | 工具 / 已选模型键 / effort / 目录状态 / 电脑报告的当前模型 / 选项键序列 |
 
 - **签名不变 ⇒ 同一个 DOM 元素原封不动**：不重建、不换节点，因此
@@ -139,7 +171,7 @@
 
 ## 4.1 新建会话：项目 id 必须来自**所选工具自己的**实时目录
 
-`models.list` 的结果按**工具**分别缓存（`state.sessionCatalogs`）。
+`models.list` 的结果按**当前电脑范围 + 工具**分别缓存（`state.sessionCatalogs`）。
 新建面板的下拉框只列**当前所选工具**那一份清单，并且：
 
 - 从列表页带进来的目录（`prefillProjectId`）会**先按所选工具的清单解析**
@@ -199,24 +231,26 @@
 D:\env\node.exe --test D:\workspace\codex-workspace\remote-control\mobile\tests\*.test.js
 ```
 
-最近一次真实输出：`# tests 166 / # pass 166 / # fail 0`。
+本次实现后的真实输出：`# tests 181 / # pass 181 / # fail 0 / # skipped 0`。
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `tests/core.test.js` | 原有纯逻辑（配对码、状态、body、折叠…） |
-| `tests/core-workbench.test.js` | 视图/工具/项目筛选、置顶、任务统计；**目录规范化与相等**（`canonicalPath`：分隔符 / 尾分隔符 / 大小写 / 首尾空白，以及根与空值）；**一组目录一个导航选项**（`mergeProjectOptions`：目录相同写法不同合并、真不同则分列、工具线索、同一 id 不重复）；**工具显示名**；`session.send` 的模型覆盖；`session.answer`/`session.approve` body；问题/审批投影与**边界拒绝**；`validateAnswers` 基数规则；`prefs` 往返与投毒存储 |
+| `tests/core-workbench.test.js` | 视图/工具/项目筛选、置顶、任务统计；**目录规范化与相等**（`canonicalPath`：分隔符 / 尾分隔符 / 大小写 / 首尾空白，以及根与空值）；**一组目录一个导航选项**（`mergeProjectOptions`：目录相同写法不同合并、真不同则分列、工具线索、同一 id 不重复）；`Codex` / `DSH` / `WorkBuddy` 工具显示名；`session.send` 的模型覆盖；`session.answer`/`session.approve` body；问题/审批投影与**边界拒绝**；`validateAnswers` 基数规则；`prefs` 往返与投毒存储 |
 | `tests/app.test.js` | 原有 UI 行为、两个异步竞态、模型下拉唯一值；会话卡片显示**产品名而不是线上 id** |
-| `tests/app-workbench.test.js` | 三视图、筛选、抽屉、置顶、主题、筛选记忆；**顶栏新建动作与「设置里唯一的退出登录」**（含 id 不变、列表内无整宽页脚按钮）；**同一目录两种写法只出现一行且带双工具线索**；**新建会话按所选工具解析 projectId**（含切工具重新解析、跨工具 id 拒绝提交）；模型芯片/选择器/effort；**问题作答一次性与竞态**；**相同轮询不重建控件 / 焦点与光标保留**；**表单变化则真重建、表单消失则控件移除、陈旧控件提交被拦**；**审批与模型控件不churn**；草稿隔离、阅读位置、晚到回包 |
-| `tests/workbench-server.test.js` | **真实 `api.js` + 真实本地 HTTP**（mock relay）：投影往返、answer/approve 往返、过期拒绝、参数白名单、Origin/鉴权、静态页面字节 |
+| `tests/app-workbench.test.js` | 三视图、筛选、抽屉、置顶、主题、筛选记忆；**顶栏新建动作与「设置里唯一的退出登录」**（含 id 不变、列表内无整宽页脚按钮）；**同一目录两种写法只出现一行且带双工具线索**；**新建会话按所选工具解析 projectId**（含切工具重新解析、跨工具 id 拒绝提交）；模型芯片/选择器/effort；**问题作答一次性与竞态**；**相同轮询不重建控件 / 焦点与光标保留**；**表单变化则真重建、表单消失则控件移除、陈旧控件提交被拦**；**审批与模型控件不重绘**；草稿隔离、阅读位置、晚到回包；管理员名册身份、重复名称、在线/离线、真实工具状态、登记码；管理员登录/登出与密码清理；相同原生 id 跨电脑隔离；WorkBuddy 使用目标电脑的真实目录和模型；WorkBuddy 不可用时显示后端原因、官方多设备说明链接并隐藏模型/创建控件 |
+| `tests/workbench-server.test.js` | **真实 `api.js` + 真实本地 HTTP**（mock relay）：普通身份与管理员身份/名册、管理员精确目标 RPC 和离线拒绝、登记码、登出、问题/审批往返、过期拒绝、参数白名单、Origin/鉴权、静态页面字节 |
+| `tests/api.test.js` | HTTP 客户端契约；`/api/me`、管理员登录/登出、名册、精确目标 RPC 和显式登记码 |
 | `tests/source-guards.test.js` | 静态守卫（无注入、无 CDN、无秘密、Android 壳安全） |
-| `tests/api.test.js` | HTTP 客户端契约 |
 
 `tests/dom-harness.js` 是**最小 DOM 替身**：它按需补上了真实的
 文本选区接口（`selectionStart/End/Direction`、`setSelectionRange`），
 因为"轮询后光标还在原处"没有这个就没法测；它仍然**故意不提供** `find`/`findAll`
 之类的非标准方法，也仍然把 `innerHTML` 设成抛异常。
 
-`tests/mock-server.js` 的**旧默认值全部保留**，只新增可选注入：
+`tests/mock-server.js` 的**普通用户旧默认值全部保留**；管理员身份、隔离 cookie、电脑
+名册与 exact-target RPC 只在测试明确传入时启用。它不用于生产会话、目录、模型或权限状态。
+既有桌面会话 mock 只新增可选注入：
 `catalog/modelsResult/currentModel/pendingQuestions/pendingApprovals/createResult/
 sendResult/stopResult/answerResult/approveResult/onAnswer/onApprove/sessions`。
 不传就与旧行为一致。
@@ -229,6 +263,8 @@ sendResult/stopResult/answerResult/approveResult/onAnswer/onApprove/sessions`。
 
 1. **没有与真实 relay/desktop 联调**：`session.answer` / `session.approve` /
    `models.list` / `session.create` 全部打在 mock relay 上。
+   管理员接口契约也仅通过本地 mock server 测试，本层尚未实测实际部署的
+   `/api/me`、`/api/admin/*` cookie 行为或每台电脑的 WorkBuddy 后端可用性。
    **目录去重与工具线索依赖真实 `models.list.projects` 的写法**：本层只用
    mock 的目录（互不相同、只差分隔符）验证过；真实桌面若给出同一目录的
    **第三种**写法（例如 UNC `\\server\share` 与映射盘符 `Z:\`），

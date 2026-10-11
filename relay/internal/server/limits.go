@@ -39,7 +39,11 @@ var (
 	// bucketBridge bounds handshake attempts. The contract's §6.3 table does not
 	// name /bridge, but every handshake past this bucket may write an audit row,
 	// so it needs a ceiling of its own.
-	bucketBridge = bucket{window: time.Minute, quota: 60}
+	bucketBridge      = bucket{window: time.Minute, quota: 60}
+	bucketAdminLogin  = bucket{window: time.Minute, quota: 5}
+	bucketAdminRPC    = bucket{window: time.Minute, quota: 120, burst: 20}
+	bucketAdminEnroll = bucket{window: time.Minute, quota: 10}
+	bucketEnrollment  = bucket{window: time.Minute, quota: 10}
 )
 
 // bucketTTL is how long an idle per-IP counter is kept before the sweep drops
@@ -98,6 +102,14 @@ func specFor(name string) bucket {
 		return bucketDown
 	case "bridge":
 		return bucketBridge
+	case "admin_login":
+		return bucketAdminLogin
+	case "admin_rpc":
+		return bucketAdminRPC
+	case "admin_enrollment":
+		return bucketAdminEnroll
+	case "enrollment":
+		return bucketEnrollment
 	default:
 		return bucketHealth
 	}
