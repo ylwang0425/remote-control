@@ -56,3 +56,5 @@ Windows bridge 1.1.1 is delivered at `/downloads/AI-Remote-Windows-1.1.1.zip` an
 `/downloads/AI-Remote-Windows.zip`. The relay's download whitelist includes only these naming
 forms in addition to APKs; unrelated ZIPs, hidden files, symlinks and traversal attempts remain
 unavailable. Both platform downloads are checked against their reviewed package sizes and SHA-256.
+Validated release downloads have a bounded ten-minute write deadline, independently of the relay's
+ordinary 90-second response limit, so slow connections can receive the full Windows package.

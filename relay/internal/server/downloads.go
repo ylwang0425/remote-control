@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ai-remote/relay/internal/protocol"
 )
@@ -87,6 +88,11 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
+	// Release files are much larger than RPC responses. The relay's ordinary
+	// 90-second write limit truncates a ZIP on a slow mobile connection.
+	// Extend only a validated download, keeping the transfer bounded.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Minute))
 
 	contentType := "application/vnd.android.package-archive"
 	if windowsZipNamePattern.MatchString(name) {

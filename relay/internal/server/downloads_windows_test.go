@@ -2,10 +2,12 @@ package server
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ai-remote/relay/internal/protocol"
 )
@@ -95,4 +97,38 @@ func TestWindowsDownloadRejectsSymlink(t *testing.T) {
 		t.Skipf("symlinks unavailable on this host: %v", err)
 	}
 	decodeFailure(t, e.request(http.MethodGet, "/downloads/AI-Remote-Windows.zip", "", "", "", ""), http.StatusNotFound, protocol.CodeNotFound)
+}
+
+type slowReleaseWriter struct {
+	http.ResponseWriter
+}
+
+func (w slowReleaseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w slowReleaseWriter) Write(body []byte) (int, error) {
+	time.Sleep(1200 * time.Millisecond)
+	return w.ResponseWriter.Write(body)
+}
+
+func TestReleaseDownloadOutlivesRPCWriteTimeout(t *testing.T) {
+	e := newEnv(t)
+	const contents = "PK\x03\x04 slow Windows download"
+	if err := os.WriteFile(filepath.Join(e.download, "AI-Remote-Windows.zip"), []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e.s.Handler().ServeHTTP(slowReleaseWriter{w}, r)
+	}))
+	server.Config.WriteTimeout = time.Second
+	server.Start()
+	t.Cleanup(server.Close)
+	resp, err := server.Client().Get(server.URL + "/downloads/AI-Remote-Windows.zip")
+	if err != nil {
+		t.Fatalf("download hit the ordinary server write deadline: %v", err)
+	}
+	if body := readBody(t, resp); resp.StatusCode != http.StatusOK || body != contents {
+		t.Fatalf("slow release download was truncated: status %d", resp.StatusCode)
+	}
 }
