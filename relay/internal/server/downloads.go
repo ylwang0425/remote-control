@@ -14,14 +14,18 @@ import (
 // apkNamePattern is §7.5 rule 3: 1–128 characters, ending in .apk.
 var apkNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.apk$`)
 
-// handleDownload serves the APK whitelist and nothing else.
+// Windows downloads are limited to the reviewed release name and its numeric
+// versioned form. Other ZIP files in DownloadsDir remain private.
+var windowsZipNamePattern = regexp.MustCompile(`^AI-Remote-Windows(-[0-9]+\.[0-9]+\.[0-9]+)?\.zip$`)
+
+// handleDownload serves public APKs and the named Windows releases.
 //
 // Every refusal is the same 404 with the same message, so this endpoint cannot
 // be turned into a filesystem probe (§7.5). It never falls back to the static
 // site, and the static site never falls back here (R19 item 1).
 //
 // Origin rule, which is deliberately looser here than on /api/*:
-// the APK is a PUBLIC whitelisted file. A browser address-bar download, a phone
+// the release is a PUBLIC whitelisted file. A browser address-bar download, a phone
 // "save link" and a plain `curl` all send NO Origin header — requiring one would
 // make the download impossible for exactly the users it exists for. So a missing
 // Origin is accepted on GET/HEAD, while a PRESENT Origin that is not the exact
@@ -44,7 +48,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name, ok := apkFromPath(r.URL.Path)
+	name, ok := downloadFromPath(r.URL.Path)
 	if !ok {
 		s.fail(w, protocol.CodeNotFound)
 		return
@@ -84,15 +88,19 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	w.Header().Set("Content-Type", "application/vnd.android.package-archive")
+	contentType := "application/vnd.android.package-archive"
+	if windowsZipNamePattern.MatchString(name) {
+		contentType = "application/zip"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, name, info.ModTime(), file)
 }
 
-// apkFromPath applies §7.5 rules 1–5 and returns the file name to serve.
-func apkFromPath(rawPath string) (string, bool) {
+// downloadFromPath applies §7.5 rules 1–5 with the Windows release extension.
+func downloadFromPath(rawPath string) (string, bool) {
 	const prefix = "/downloads/"
 	if !strings.HasPrefix(rawPath, prefix) {
 		return "", false
@@ -112,9 +120,10 @@ func apkFromPath(rawPath string) (string, bool) {
 		strings.ContainsRune(decoded, 0) || strings.Contains(decoded, ":") {
 		return "", false
 	}
-	// Rules 3 and 4: an .apk name with no path segment in it. A JSON, log, key
-	// or database file can never satisfy this, so it is 404 by construction.
-	if !apkNamePattern.MatchString(decoded) {
+	// Only an APK or the exact Windows release naming convention can pass.
+	// Arbitrary ZIPs, JSON, logs, keys and databases cannot satisfy this rule.
+	if !apkNamePattern.MatchString(decoded) &&
+		!(len(decoded) <= 128 && windowsZipNamePattern.MatchString(decoded)) {
 		return "", false
 	}
 	if path.Base(decoded) != decoded {

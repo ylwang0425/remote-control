@@ -87,11 +87,34 @@ decisions are scoped by computer ID. Switching targets invalidates old requests
 and discards late replies. Identical session/project/model IDs on two computers
 must not mix state or send a decision to the wrong native request.
 
-`session.answer` and `session.approve` retain their existing shapes. Approval
-decisions remain `allow-once` or `reject`, with honest `submitted`/`confirmed`
-receipts and no automatic retries. Every displayed question/approval must come
-from an actual native event. Unsupported tools advertise false capability bits.
-No CLI session is substituted for an already-open desktop conversation.
+`session.answer` and `session.approve` retain their request shapes. Answer
+receipts may add `state: "submitted" | "confirmed"`; an old bridge may omit
+`state`. `submitted` means one native answer was sent, while `confirmed` is
+reserved for evidence that the exact answer reached native state. Approval
+decisions remain `allow-once` or `reject`, with honest receipt states and no
+automatic retries.
+
+Codex and WorkBuddy question items may preserve `allowCustom:boolean`, matching
+the native `isOther` rule. Explicit false hides custom text and validation
+rejects a custom answer; omission retains legacy DSH behavior. A form with no
+native options and custom text forbidden is displayed read-only.
+
+The phone-facing `approvalId` and `pendingApprovals[].id` are UUIDv4 bridge
+handles. A native adapter privately maps each live handle to the exact native
+request ID and conversation/turn/item; typed native IDs never go over the phone
+wire. Codex and WorkBuddy approval projections use a closed, bounded context:
+command plus working directory, network host/protocol and optional port, or a
+file-change summary plus grant root. Their reason and context must fit in full;
+the bridge refuses an unknown scope, missing field, overlong text, or unsafe
+control character rather than truncating what the person is asked to approve.
+Command, summary and reason preserve CR/LF/TAB for display with pre-wrapped
+text. A supplied network port is shown and validated from 1 through 65535.
+
+Every displayed question/approval must come from actual native state. A false
+per-tool capability remains false; a complete pending approval may still be
+shown read-only with an instruction to act at the computer. Unsupported tools
+advertise false capability bits. No CLI-created substitute is used for an
+already-open desktop conversation.
 
 WorkBuddy's local archive adapter declares `session.send:workbuddy:false` while
 remaining available for listing and reading. The optional per-tool sending flag

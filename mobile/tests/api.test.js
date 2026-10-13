@@ -86,6 +86,55 @@ test('rpc posts {method, params} to /api/rpc', async () => {
   assert.deepEqual(out.result, { sessions: [], capabilities: {} });
 });
 
+test('normal and admin RPCs carry per-call server timeouts at top level and extend only their own client timer', async () => {
+  const f = fakeFetch({ status: 200, body: { ok: true, result: { accepted: true } } });
+  const timers = [];
+  const client = api.createApi({
+    fetch: f,
+    setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout() {}
+  });
+  const options = { timeoutMs: 60000, clientTimeoutMs: 65000 };
+  const params = { tool: 'workbuddy', sessionId: 'wb-chat', text: 'hello' };
+
+  await client.rpc({ method: 'session.send', params }, options);
+  await client.adminRpc('computer-b', { method: 'session.send', params }, options);
+
+  assert.deepEqual(JSON.parse(f.calls[0].init.body), {
+    method: 'session.send', params, timeoutMs: 60000
+  }, 'normal RPC keeps timeoutMs outside the closed params object');
+  assert.deepEqual(JSON.parse(f.calls[1].init.body), {
+    clientId: 'computer-b', method: 'session.send', params, timeoutMs: 60000
+  }, 'admin RPC uses the same budget and preserves its exact selected computer');
+  assert.deepEqual(timers.map((timer) => timer.ms), [65000, 65000],
+    'the local abort timer sits five seconds beyond each relay deadline');
+  assert.equal(f.calls.length, 2, 'each explicit RPC is submitted once; no timeout retry is added');
+});
+
+test('per-call RPC options reject invalid ranges and unexpected keys without sending', async () => {
+  const f = fakeFetch({ status: 200, body: { ok: true } });
+  const client = api.createApi({ fetch: f });
+  const body = { method: 'session.send', params: { tool: 'workbuddy', sessionId: 'wb-chat', text: 'hello' } };
+  const invalid = [
+    [{ timeoutMs: 999, clientTimeoutMs: 65000 }, /timeoutMs must be an integer between 1000 and 60000/],
+    [{ timeoutMs: 60001, clientTimeoutMs: 65000 }, /timeoutMs must be an integer between 1000 and 60000/],
+    [{ timeoutMs: 60000 }, /clientTimeoutMs must exceed timeoutMs/],
+    [{ timeoutMs: 60000, clientTimeoutMs: 60000 }, /clientTimeoutMs must be greater than timeoutMs/],
+    [{ timeoutMs: 60000, clientTimeoutMs: 65000, retry: true }, /may contain only timeoutMs and clientTimeoutMs/],
+    [[60000, 65000], /must be an object/]
+  ];
+
+  for (const [options, message] of invalid) {
+    const out = await client.rpc(body, options);
+    assert.equal(out.ok, false);
+    assert.equal(out.code, null);
+    assert.match(out.message, message);
+  }
+  const admin = await client.adminRpc('computer-b', body, { timeoutMs: 60000 });
+  assert.equal(admin.ok, false, 'admin RPC applies the same validation as normal RPC');
+  assert.equal(f.calls.length, 0, 'invalid budgets are refused locally before network submission');
+});
+
 test('a business error arrives as HTTP 200 + ok:false (protocol-v1 6.1)', async () => {
   const f = fakeFetch({
     status: 200,

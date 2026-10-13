@@ -79,6 +79,8 @@ test('the page is served on loopback with the status JSON beside it', async (t) 
   assert.match(page.headers['content-type'], /text\/html/);
   assert.match(page.body, /AI Remote/);
   assert.match(page.body, /id="ownerName" type="text" maxlength="128"/);
+  assert.match(page.body, /id="workbuddyUiAutomationEnabled" type="checkbox"/);
+  assert.match(page.body, /id="saveWorkbuddyUiAutomation"/);
   const inlineScript = page.body.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   assert.ok(inlineScript, 'the local page has its identity form script');
   assert.doesNotThrow(() => new Function(inlineScript), 'the inline page script parses');
@@ -244,7 +246,7 @@ test('the pairing code is never cached and never logged by the response headers'
   assert.equal(response.headers['access-control-allow-origin'], undefined, 'no CORS headers, ever');
 });
 
-test('there is no shell, no exec and no path surface', async (t) => {
+test('there is no generic shell, exec or file-path surface', async (t) => {
   const { port, csrfToken } = await startUi(t);
   const origin = `${ALLOWED_ORIGIN_PREFIX}${port}`;
   for (const path of ['/api/exec', '/api/shell', '/api/run', '/shell', '/api/files?path=C:\\']) {
@@ -262,6 +264,57 @@ test('there is no shell, no exec and no path surface', async (t) => {
   }
   const source = require('node:fs').readFileSync(require.resolve('../src/ui/server'), 'utf8');
   assert.ok(!/\bexecFile\b|\bspawn\b|child_process/.test(source), 'the UI server never imports a shell');
+});
+
+test('WorkBuddy UIA settings are an explicit CSRF-protected local write with a redacted receipt', async (t) => {
+  let calls = 0;
+  let received;
+  const { port, csrfToken } = await startUi(t, {
+    onWorkBuddyUiAutomationUpdate: async (settings) => {
+      calls += 1;
+      received = settings;
+      return {
+        uiAutomation: { enabled: true, executablePathConfigured: true, configurationValid: true, executablePath: 'C:\\Private\\WorkBuddy.exe' },
+        workbuddyAvailable: true,
+        readOnly: true,
+        capabilitiesUpdated: true,
+        nativeDebugBody: 'must-not-reach-the-page',
+      };
+    },
+  });
+  const origin = `${ALLOWED_ORIGIN_PREFIX}${port}`;
+  const headers = { Origin: origin, 'Content-Type': 'application/json' };
+  const denied = await request(port, {
+    method: 'POST', path: '/api/workbuddy-ui-automation', headers,
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(calls, 0);
+
+  const extra = await request(port, {
+    method: 'POST', path: '/api/workbuddy-ui-automation',
+    headers: { ...headers, 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ enabled: true, bridgeToken: 'secret' }),
+  });
+  assert.equal(extra.status, 400);
+  assert.equal(calls, 0, 'unknown config fields cannot be persisted');
+
+  const enabled = await request(port, {
+    method: 'POST', path: '/api/workbuddy-ui-automation',
+    headers: { ...headers, 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ enabled: true, executablePath: 'C:\\Private\\WorkBuddy.exe' }),
+  });
+  assert.equal(enabled.status, 200);
+  assert.deepEqual(received, { enabled: true, executablePath: 'C:\\Private\\WorkBuddy.exe' });
+  assert.deepEqual(JSON.parse(enabled.body), {
+    ok: true,
+    uiAutomation: { enabled: true, executablePathConfigured: true, configurationValid: true },
+    workbuddyAvailable: true,
+    readOnly: true,
+    capabilitiesUpdated: true,
+  });
+  assert.ok(!enabled.body.includes('C:\\Private\\WorkBuddy.exe'));
+  assert.ok(!enabled.body.includes('must-not-reach-the-page'));
 });
 
 test('the server binds loopback only', async (t) => {
@@ -294,11 +347,27 @@ test('config: defaults, file values and environment overrides', async () => {
     assert.equal(fromFile.bridgeToken, 'from-file-token');
     assert.equal(fromFile.uiPort, 19999);
     assert.deepEqual(fromFile.tools, ['codex']);
+    assert.equal(fromFile.codex.nativeControl.enabled, false, 'the new configured native route stays disabled by default');
 
     const fromEnv = loadConfig({ path: file, env: { AI_REMOTE_BRIDGE_TOKEN: 'from-env-token', AI_REMOTE_UI_PORT: '20001' } });
     assert.equal(fromEnv.bridgeToken, 'from-env-token');
     assert.equal(fromEnv.uiPort, 20001);
     assert.equal(fromEnv.bridgeTokenOverridden, true);
+
+    const controlRunId = '3f1a6f4e-2b0c-4d5e-8a91-0c2b7d6e5f40';
+    const controlRegistry = path.join(os.tmpdir(), 'ai-remote-native-control-test');
+    const optedIn = loadConfig({ path: file, env: {
+      AI_REMOTE_CODEX_NATIVE_CONTROL: '1',
+      CODEX_NATIVE_CONTROL_DIR: controlRegistry,
+      CODEX_NATIVE_RUN_ID: controlRunId,
+    } });
+    assert.deepEqual(optedIn.codex.nativeControl, { enabled: true, registryDir: controlRegistry, runId: controlRunId });
+    const controlSummary = JSON.stringify(redactedConfig(optedIn));
+    assert.ok(!controlSummary.includes(controlRegistry) && !controlSummary.includes(controlRunId),
+      'per-run native registry identity never appears in printable configuration');
+    assert.throws(() => loadConfig({ path: file, env: { AI_REMOTE_CODEX_NATIVE_CONTROL: '1' } }),
+      /registry directory and UUID v4 run ID/,
+      'explicit opt-in without the launch-matched private registry fails closed');
 
     const relayOverride = loadConfig({ path: file, env: { AI_REMOTE_RELAY_URL: '' } });
     assert.equal(relayOverride.relayUrlOverridden, true, 'even an empty explicit environment override must block a misleading enrollment');

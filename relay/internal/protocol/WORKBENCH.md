@@ -32,7 +32,7 @@ original methods are untouched; `session.send`'s three optional model fields and
 
 ```
 params  {tool, sessionId, callId, answers:[{id, selected:[string], custom?}]}
-result  {accepted:true, sessionId, callId}
+result  {accepted:true, sessionId, callId, state?:"submitted"|"confirmed"}
 timeout 30000
 ```
 
@@ -65,20 +65,9 @@ result  {accepted:true, sessionId, approvalId, state:"submitted"|"confirmed"}
 timeout 30000
 ```
 
-- `approvalId` must have the canonical UUID shape. It is checked
-  **version-agnostically**: it is minted by the desktop's own gateway, so
-  forcing v4 would reject a genuine event id from a host that mints another
-  version.
-- **Known seam divergence.** The desktop's own validator
-  (`desktop/src/protocol.js`, `UUID_V4`) requires a lower-case **v4**
-  specifically, which is stricter than this relay's check. The desktop's check
-  is therefore the binding one and it runs first, so the relay's looseness
-  cannot admit anything the desktop would have taken. The reverse direction is
-  the one to watch: if the real gateway ever mints a non-v4 event id, the
-  desktop will refuse its own genuine request. That is a desktop-side assumption
-  to verify against the real gateway, not something the relay may paper over. If
-  it turns out to hold, the desktop's check should be relaxed, not this one
-  tightened.
+- `approvalId` is a UUIDv4 handle minted for the phone wire. A native adapter
+  privately maps each live handle to the exact typed native ID and its
+  conversation/turn/item; native IDs themselves are never sent to the phone.
 - `decision` is a closed two-value set. There is deliberately **no**
   `allow-always`, no policy edit and no blanket approval. An unrecognised
   decision is refused rather than rounded to the one that grants access.
@@ -105,6 +94,28 @@ Consequences the relay enforces:
 - The relay never retries an approval. Exactly one frame per explicit human
   click reaches the desktop.
 
+Codex and WorkBuddy `pendingApprovals` carry a bounded, closed `context` union:
+`{kind:"command",command,cwd}`, `{kind:"network",networkHost,protocol,networkPort?}`,
+or `{kind:"file-change",summary,grantRoot}`. The `reason` remains required and
+may be a clear adapter explanation when native provides none. Command,
+summary and reason preserve CR/LF/TAB but reject other control characters;
+paths, hosts, protocols and identifiers remain single-line. The projection is
+accepted only when every field fits and is shown in full. It is refused whole
+when incomplete, unknown, overlong or carrying an unrendered authorization
+field. A supplied network port must be an integer from 1 through 65535 and is
+shown to the person.
+
+`session.answer` results may add `state:"submitted"` or `state:"confirmed"`;
+older desktops may omit it. `submitted` means transport submission only.
+`confirmed` requires native proof of that exact answer; a generic
+request-resolved event does not prove it.
+
+Pending question items may carry `allowCustom:boolean`, which preserves the
+native `isOther` answer rule. Explicit false hides phone custom text and is
+revalidated before submission; omission keeps the older DSH behavior. If a
+question has no native options and custom text is forbidden, it is shown as
+read-only rather than as an impossible answer form.
+
 ## 4. `session.read` projections
 
 ### `pendingQuestions`
@@ -112,7 +123,8 @@ Consequences the relay enforces:
 ```
 [{callId, state:"open"|"continued",
   questions:[{id, question, header?, detail?,
-              options?:[{label, description?}], multiSelect?:boolean}]}]
+              options?:[{label, description?}], multiSelect?:boolean,
+              allowCustom?:boolean}]}]
 ```
 
 Bounds: at most **4** batches, **8** questions each, **12** options each;
@@ -169,12 +181,27 @@ the exact IDs `codex`, `dsh` and `workbuddy`, with a printable reason of at
 most 500 characters. The administrator roster uses explicit status when sent,
 and otherwise falls back to membership in `tools`.
 
-- `session.send:model:codex` / `:dsh` — a model choice can ride a send.
-- `session.answer:codex` / `:dsh` — a real pending question can be answered.
-  DSH has a native answer call; Codex has none, so a capable desktop declares
-  `:dsh` only.
-- `session.approve:codex` / `:dsh` — a genuine native permission request can be
-  answered. Same split.
+The bridge stores the hello capability declaration and the administrator
+roster exposes the known method keys below. Optional WorkBuddy keys use
+presence-aware values so an older bridge's omission remains distinct from an
+explicit `false`. No capability is inferred from the tool name. The workbench
+response to `sessions.list` still carries the desktop's complete declaration
+through the relay unchanged.
+
+- `session.send:codex` / `:workbuddy` — optional per-tool overrides for the
+  shared send bit. Absence keeps compatibility with older desktops; explicit
+  false blocks sending for that tool.
+- `stop:codex` / `:dsh` / `:workbuddy` — the selected tool has a native stop
+  path.
+- `models.list` / `session.create` are shared method bits;
+  `models.list:workbuddy` and `session.create:workbuddy` are WorkBuddy's
+  per-tool declarations.
+- `session.send:model:codex` / `:dsh` / `:workbuddy` — a model choice can
+  ride the selected tool's send path.
+- `session.answer:codex` / `:dsh` / `:workbuddy` — a real pending question
+  can be answered for the selected tool.
+- `session.approve:codex` / `:dsh` / `:workbuddy` — a genuine native
+  permission request can be decided for the selected tool.
 
 When a capability is false or absent, the phone shows the **actual** pending
 information plus a clear instruction to act at the computer. It does not show a

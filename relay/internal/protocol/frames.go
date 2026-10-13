@@ -29,17 +29,15 @@ const (
 // Capabilities is the bridge's declaration from §9.5. A key that is absent
 // reads as false — there is no default-allow.
 //
-// The last six are additive: a desktop that does not send them is simply not
-// offering those methods, and an older relay ignores keys it does not know. The
-// wire version stays 1 for exactly that reason.
+// Optional per-method and per-tool fields are additive: a desktop that does not
+// send a key is not declaring that capability, and an older relay ignores keys
+// it does not know. The wire version stays 1 for exactly that reason.
 //
-// The three per-tool pairs are deliberately three separate booleans rather than
-// one "supports answering" bit, because the two tools genuinely differ: DSH has
-// a native question-answer call and a native permission-approval transport,
-// while Codex has neither, and a model-selection send works on both but through
-// different native mechanisms. Collapsing them would make the relay — or, worse,
-// the phone — infer which of them is really available, and an inferred
-// capability is how a button appears that cannot work.
+// Per-tool keys remain separate declarations. Codex, DSH and WorkBuddy can
+// have different model, stop, question and approval routes. Collapsing them
+// would make the relay — or, worse, the phone — infer which operation is
+// really available, and an inferred capability is how a button appears that
+// cannot work.
 //
 // These fields describe the desktop's OWN declaration. Nothing here is ever
 // derived by the relay from the tool name, from a session, or from a version
@@ -53,26 +51,31 @@ type Capabilities struct {
 	SessionStop   bool `json:"session.stop"`
 	ModelsList    bool `json:"models.list"`
 	SessionCreate bool `json:"session.create"`
-	// An optional per-tool override distinguishes a local history reader from
-	// a tool that can continue a conversation. Nil preserves legacy clients.
+	// Optional per-tool overrides distinguish a readable local archive from a
+	// tool that can continue a conversation. Nil preserves legacy clients; an
+	// explicit false must survive hello, storage and the admin roster.
+	SendCodex     *bool    `json:"session.send:codex,omitempty"`
 	SendWorkBuddy *bool    `json:"session.send:workbuddy,omitempty"`
 	StopCodex     bool     `json:"stop:codex"`
 	StopDSH       bool     `json:"stop:dsh"`
+	StopWorkBuddy *bool    `json:"stop:workbuddy,omitempty"`
 	Tools         []string `json:"tools"`
 
-	// SendModelCodex / SendModelDSH: session.send can carry a model choice.
-	SendModelCodex bool `json:"session.send:model:codex"`
-	SendModelDSH   bool `json:"session.send:model:dsh"`
-	// AnswerCodex / AnswerDSH: session.answer can answer a real pending
-	// question. Codex has no native answer call today, so a desktop that can
-	// answer questions sends AnswerDSH only.
-	AnswerCodex bool `json:"session.answer:codex"`
-	AnswerDSH   bool `json:"session.answer:dsh"`
-	// ApproveCodex / ApproveDSH: session.approve can answer a genuine native
-	// permission request. Absent means the phone shows the real pending
-	// approval with an instruction to act at the computer.
-	ApproveCodex bool `json:"session.approve:codex"`
-	ApproveDSH   bool `json:"session.approve:dsh"`
+	// A per-message model can be carried through the selected tool's send path.
+	SendModelCodex         bool  `json:"session.send:model:codex"`
+	SendModelDSH           bool  `json:"session.send:model:dsh"`
+	SendModelWorkBuddy     *bool `json:"session.send:model:workbuddy,omitempty"`
+	ModelsListWorkBuddy    *bool `json:"models.list:workbuddy,omitempty"`
+	SessionCreateWorkBuddy *bool `json:"session.create:workbuddy,omitempty"`
+	// session.answer can answer a real pending question on the named tool.
+	AnswerCodex     bool  `json:"session.answer:codex"`
+	AnswerDSH       bool  `json:"session.answer:dsh"`
+	AnswerWorkBuddy *bool `json:"session.answer:workbuddy,omitempty"`
+	// session.approve can answer a genuine native permission request on the
+	// named tool.
+	ApproveCodex     bool  `json:"session.approve:codex"`
+	ApproveDSH       bool  `json:"session.approve:dsh"`
+	ApproveWorkBuddy *bool `json:"session.approve:workbuddy,omitempty"`
 
 	// ToolStatus preserves explicit discovery results for installed providers
 	// that are temporarily unavailable. Missing entries use membership in Tools.

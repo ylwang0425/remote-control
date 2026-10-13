@@ -283,9 +283,35 @@ func (s *Server) handleAdminComputers(w http.ResponseWriter, r *http.Request) {
 		rosterCaps := map[string]any{
 			"tools": caps.Tools, "toolStatus": caps.ToolStatus,
 			"sessions.list": caps.SessionsList, "session.read": caps.SessionRead, "session.send": caps.SessionSend,
+			"session.stop": caps.SessionStop, "models.list": caps.ModelsList, "session.create": caps.SessionCreate,
+			"stop:codex": caps.StopCodex, "stop:dsh": caps.StopDSH,
+			"session.send:model:codex": caps.SendModelCodex, "session.send:model:dsh": caps.SendModelDSH,
+			"session.answer:codex": caps.AnswerCodex, "session.answer:dsh": caps.AnswerDSH,
+			"session.approve:codex": caps.ApproveCodex, "session.approve:dsh": caps.ApproveDSH,
+		}
+		if caps.SendCodex != nil {
+			rosterCaps["session.send:codex"] = *caps.SendCodex
 		}
 		if caps.SendWorkBuddy != nil {
 			rosterCaps["session.send:workbuddy"] = *caps.SendWorkBuddy
+		}
+		if caps.StopWorkBuddy != nil {
+			rosterCaps["stop:workbuddy"] = *caps.StopWorkBuddy
+		}
+		if caps.ModelsListWorkBuddy != nil {
+			rosterCaps["models.list:workbuddy"] = *caps.ModelsListWorkBuddy
+		}
+		if caps.SessionCreateWorkBuddy != nil {
+			rosterCaps["session.create:workbuddy"] = *caps.SessionCreateWorkBuddy
+		}
+		if caps.SendModelWorkBuddy != nil {
+			rosterCaps["session.send:model:workbuddy"] = *caps.SendModelWorkBuddy
+		}
+		if caps.AnswerWorkBuddy != nil {
+			rosterCaps["session.answer:workbuddy"] = *caps.AnswerWorkBuddy
+		}
+		if caps.ApproveWorkBuddy != nil {
+			rosterCaps["session.approve:workbuddy"] = *caps.ApproveWorkBuddy
 		}
 		result = append(result, computerView{
 			ClientID: computer.ClientID, OwnerName: computer.OwnerName, ClientName: computer.ClientName,

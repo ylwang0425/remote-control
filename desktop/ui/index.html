@@ -42,12 +42,12 @@
 </head>
 <body>
   <h1>AI Remote — 本机桥接状态</h1>
-  <p class="sub">这个页面只在本机 <code>127.0.0.1</code> 上打开，用来看中继链路的状态、生成一个手机配对码。它不能在这台电脑上执行任何东西。</p>
+  <p class="sub">这个页面只在本机 <code>127.0.0.1</code> 上打开，用来看中继链路状态、生成手机配对码和保存这台电脑自己的 WorkBuddy UI Automation opt-in。它没有通用命令或文件操作入口，也不会替你启动、关闭应用或改变应用权限。</p>
 
   <h2>怎么用（三步）</h2>
   <div class="box">
     <ol>
-      <li>保持这台电脑上的 <strong>Codex Desktop</strong>、<strong>DSH Desktop</strong> 和本桥接程序<strong>一直开着</strong>；电脑睡眠、程序退出都会让手机那边断掉。</li>
+      <li>保持这台电脑上的 <strong>Codex Desktop</strong>、<strong>DSH Desktop</strong>、本桥接程序，以及你要控制的 <strong>WorkBuddy</strong><strong>一直开着</strong>；电脑睡眠、程序退出都会让手机那边断掉。</li>
       <li>手机打开 <span class="code">https://101.43.98.18</span>，用下面生成的配对码<strong>配对一次</strong>即可，之后不用再配。</li>
       <li>配对后手机能看会话列表与消息，并按下面「手机能做什么」里列出的能力操作。</li>
     </ol>
@@ -91,6 +91,18 @@
     </table>
   </div>
 
+  <h2>WorkBuddy 本机 UI Automation（可选）</h2>
+  <div class="box">
+    <label class="field"><span><input id="workbuddyUiAutomationEnabled" type="checkbox" style="width:auto"> 在这台电脑启用 WorkBuddy UIA 适配器</span></label>
+    <label class="field" for="workbuddyExecutablePath">WorkBuddy.exe 绝对路径（可选）
+      <input id="workbuddyExecutablePath" type="text" maxlength="2048" autocomplete="off" placeholder="留空则保留已配置路径或使用适配器的安全发现">
+    </label>
+    <p class="note">此设置只保存到这台电脑的私密配置。桥接程序只重新打开 WorkBuddy 适配器，不会启动、关闭或改动 WorkBuddy。UIA 需要 Windows 默认（已解锁）桌面，并要求目标窗口位于前台。状态中的快照只是上次观测，不代表当前可操作。启用 opt-in 后，仍须按随包说明正常退出并用 WorkBuddy UIA 启动器重新打开应用；未实际测得的模型、创建、发送、停止、回答和审批能力继续保持关闭。</p>
+    <p id="workbuddyUiAutomationStatus" class="note" role="status" aria-live="polite">检查本机设置…</p>
+    <div class="actions"><button id="saveWorkbuddyUiAutomation">保存 WorkBuddy 本机设置</button></div>
+    <p id="workbuddyUiAutomationResult" class="note" role="status" aria-live="polite"></p>
+  </div>
+
   <h2>配一台手机</h2>
   <div class="box">
     <div id="pairIdle">
@@ -118,7 +130,7 @@
   <p class="note">DSH 那边这些能力是单独判定的，以本页「能力」一行的实际显示为准，并以中继原样透传的能力位为准。其它没测到的能力位一律按 false 上报，页面不会把「没测过」说成「可以」。</p>
 
   <h2>这个页面做不到什么</h2>
-  <p class="note">没有 shell、没有命令框、没有文件浏览器，也没有任何绕开上述固定操作去触碰会话的通道。这里的每一个写操作都需要只有本页面能读到的令牌（CSRF）。</p>
+  <p class="note">没有 shell、没有命令框、没有文件浏览器，也没有绕开已上报能力去触碰会话的通道。WorkBuddy UIA 只是这台电脑上的显式 opt-in 配置，不会改变其他电脑或账号的权限。这里的每一个写操作都需要只有本页面能读到的令牌（CSRF）。</p>
 
 <script>
   // CSRF 令牌由本页面下发，只有同源读取者才拿得到，这就是那个写接口的防线。
@@ -224,7 +236,39 @@
       return { text: '不可用 — ' + ((workbuddy && workbuddy.reason) || '没有接入原生会话控制通道'), className: 'warn' };
     }
     const count = Number.isFinite(workbuddy.sessions) ? ' — ' + String(workbuddy.sessions) + ' 条本地会话' : '';
-    return { text: '已接入（只读）' + count, className: 'ok' };
+    const access = workbuddy.readOnly === false ? '已接入（适配器报告部分能力）' : '已接入（当前只读）';
+    return { text: access + count, className: 'ok' };
+  }
+
+  function describeWorkbuddyUiAutomation(workbuddy) {
+    const uia = workbuddy && workbuddy.uiAutomation ? workbuddy.uiAutomation : {};
+    const result = document.getElementById('workbuddyUiAutomationStatus');
+    const enabled = uia.enabled === true;
+    let text = enabled
+      ? '本机 opt-in 已启用；要求默认（已解锁）桌面和 WorkBuddy 目标窗口在前台。'
+      : '本机 opt-in 已关闭（默认）。';
+    if (uia.executablePathConfigured === true) text += ' 已保存一个私密本机程序路径。';
+    const last = uia.lastObserved;
+    if (last && typeof last.observedAt === 'string') {
+      const desktop = { default: '默认桌面', secure: '安全桌面', other: '其他桌面', unavailable: '桌面状态不可用' }[last.desktopKind] || '未知桌面';
+      text += ' 上次观测（非当前状态）：' + last.observedAt + '，' + desktop +
+        '，目标匹配 ' + (last.targetMatched ? '是' : '否') +
+        '，前台 ' + (last.isForeground ? '是' : '否') + '。';
+    }
+    result.textContent = text;
+    result.className = 'note' + (enabled ? ' warn' : '');
+    const enabledField = document.getElementById('workbuddyUiAutomationEnabled');
+    if (enabledField.dataset.initialized !== 'true') {
+      enabledField.checked = enabled;
+      enabledField.dataset.initialized = 'true';
+    }
+    const pathField = document.getElementById('workbuddyExecutablePath');
+    if (pathField.dataset.initialized !== 'true') {
+      pathField.placeholder = uia.executablePathConfigured === true
+        ? '留空以保留已配置的私密路径'
+        : '可选：C:\\Program Files\\WorkBuddy\\WorkBuddy.exe';
+      pathField.dataset.initialized = 'true';
+    }
   }
 
   function showIdentityResult(text, className) {
@@ -250,6 +294,7 @@
       set('dsh', dsh.text, dsh.className);
       const workbuddy = describeWorkbuddy(state.workbuddy);
       set('workbuddy', workbuddy.text, workbuddy.className);
+      describeWorkbuddyUiAutomation(state.workbuddy);
       const nameField = document.getElementById('ownerName');
       if (nameField.dataset.initialized !== 'true') {
         nameField.value = identity.ownerName || '';
@@ -285,6 +330,31 @@
       document.getElementById('ownerName').value = result.identity.ownerName;
     } catch (error) {
       showIdentityResult(String(error.message || error), 'bad');
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  document.getElementById('saveWorkbuddyUiAutomation').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const pathField = document.getElementById('workbuddyExecutablePath');
+    const resultField = document.getElementById('workbuddyUiAutomationResult');
+    button.disabled = true;
+    try {
+      const settings = { enabled: document.getElementById('workbuddyUiAutomationEnabled').checked };
+      if (pathField.value.trim()) settings.executablePath = pathField.value.trim();
+      const result = await postLocal('/api/workbuddy-ui-automation', settings);
+      resultField.textContent = result.capabilitiesUpdated
+        ? '本机设置已保存，适配器已刷新，并已通过现有安全连接更新能力。WorkBuddy 应用本身没有被启动或关闭。'
+        : '本机设置已保存，适配器已刷新；桥接会在下次连接时发送最新能力。WorkBuddy 应用本身没有被启动或关闭。';
+      resultField.className = 'note ok';
+      document.getElementById('workbuddyUiAutomationEnabled').dataset.initialized = 'true';
+      pathField.value = '';
+      pathField.dataset.initialized = 'false';
+      await refresh();
+    } catch (error) {
+      resultField.textContent = String(error.message || error);
+      resultField.className = 'note bad';
     } finally {
       button.disabled = false;
     }

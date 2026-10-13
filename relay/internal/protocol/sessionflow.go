@@ -169,7 +169,7 @@ func validateAnswer(fields map[string]json.RawMessage) (Code, bool) {
 // the desktop's refusal to make, and it makes it explicitly.
 func validateApprove(fields map[string]json.RawMessage) (Code, bool) {
 	approvalID, ok := requiredString(fields, "approvalId", maxCallIDRunes)
-	if !ok || !IsUUID(approvalID) {
+	if !ok || !IsUUIDv4(approvalID) {
 		return CodeInvalidParams, false
 	}
 	decision, ok := requiredString(fields, "decision", maxEffortRunes)

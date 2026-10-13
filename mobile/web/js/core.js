@@ -1299,7 +1299,12 @@
     reason: 4000,      // permission reason
     toolName: 128,
     approvals: 8,      // pending permission approvals per session
-    id: 128
+    id: 128,
+    command: 4000,
+    contextPath: 1024,
+    networkHost: 253,
+    networkProtocol: 32,
+    fileSummary: 4000
   };
 
   /**
@@ -1357,6 +1362,10 @@
       multiSelect: raw.multiSelect === true,
       options: []
     };
+    if (raw.allowCustom !== undefined) {
+      if (typeof raw.allowCustom !== 'boolean') return null;
+      question.allowCustom = raw.allowCustom;
+    }
     if (typeof raw.header === 'string' && raw.header !== '') {
       question.header = clampText(raw.header, Q_LIMITS.header);
     }
@@ -1457,6 +1466,11 @@
       if (!batch) {
         return 'oversized';
       }
+      if (batch.questions.some(function (question) {
+        return question.allowCustom === false && question.options.length === 0;
+      })) {
+        return 'unsupported';
+      }
       batches.push(batch);
     }
     return batches.length > 0 ? 'ready' : 'none';
@@ -1479,7 +1493,55 @@
 
   var QUESTIONS_OVERSIZED_TEXT = '电脑上有待回答的问题，但内容超出手机能安全展示的范围。请在电脑上回答。';
 
-  function pendingApprovalsOf(input) {
+  var APPROVAL_ID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+  function exactApprovalText(value, max, multiline) {
+    var unsafeControls = multiline
+      ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u
+      : /[\u0000-\u001f\u007f]/u;
+    return typeof value === 'string' &&
+      value.trim() !== '' &&
+      Array.from(value).length <= max &&
+      !unsafeControls.test(value);
+  }
+
+  function approvalContextOf(raw, tool) {
+    if (raw === undefined) {
+      return tool === 'codex' || tool === 'workbuddy' ? null : undefined;
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.kind !== 'string') return null;
+    var allowed;
+    if (raw.kind === 'command') {
+      allowed = ['kind', 'command', 'cwd'];
+      if (Object.keys(raw).some(function (name) { return allowed.indexOf(name) === -1; }) ||
+          !exactApprovalText(raw.command, Q_LIMITS.command, true) || !exactApprovalText(raw.cwd, Q_LIMITS.contextPath)) return null;
+      return { kind: 'command', command: raw.command, cwd: raw.cwd };
+    }
+    if (raw.kind === 'network') {
+      allowed = ['kind', 'networkHost', 'protocol', 'networkPort'];
+      if (Object.keys(raw).some(function (name) { return allowed.indexOf(name) === -1; }) ||
+          !exactApprovalText(raw.networkHost, Q_LIMITS.networkHost) ||
+          /[\s\/@?#]/u.test(raw.networkHost) ||
+          !exactApprovalText(raw.protocol, Q_LIMITS.networkProtocol) ||
+          !/^[A-Za-z][A-Za-z0-9+.-]*$/u.test(raw.protocol)) return null;
+      var network = { kind: 'network', networkHost: raw.networkHost, protocol: raw.protocol };
+      if (own(raw, 'networkPort')) {
+        if (!Number.isInteger(raw.networkPort) || raw.networkPort < 1 || raw.networkPort > 65535) return null;
+        network.networkPort = raw.networkPort;
+      }
+      return network;
+    }
+    if (raw.kind === 'file-change') {
+      allowed = ['kind', 'summary', 'grantRoot'];
+      if (Object.keys(raw).some(function (name) { return allowed.indexOf(name) === -1; }) ||
+          !exactApprovalText(raw.summary, Q_LIMITS.fileSummary, true) ||
+          !exactApprovalText(raw.grantRoot, Q_LIMITS.contextPath)) return null;
+      return { kind: 'file-change', summary: raw.summary, grantRoot: raw.grantRoot };
+    }
+    return null;
+  }
+
+  function pendingApprovalsProjection(input) {
     var source = input || {};
     var capabilities = source.capabilities || {};
     var tool = source.tool;
@@ -1487,39 +1549,64 @@
     var supported = own(capabilities, key)
       ? capabilities[key] === true
       : capabilities['session.approve'] === true;
-    if (!supported) {
-      return [];
-    }
-    var raw = source.read && Array.isArray(source.read.pendingApprovals)
-      ? source.read.pendingApprovals : [];
-    if (raw.length === 0 || raw.length > Q_LIMITS.approvals) {
-      return [];
-    }
+    if (!source.read || !own(source.read, 'pendingApprovals')) return { state: 'none', approvals: [] };
+    var raw = source.read.pendingApprovals;
+    if (!Array.isArray(raw)) return { state: 'incomplete', approvals: [] };
+    if (raw.length === 0) return { state: 'none', approvals: [] };
+    if (raw.length > Q_LIMITS.approvals) return { state: 'oversized', approvals: [] };
     var out = [];
     for (var i = 0; i < raw.length; i++) {
       var entry = raw[i];
-      if (!entry || typeof entry !== 'object') {
-        continue;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+          typeof entry.id !== 'string' || !APPROVAL_ID_V4.test(entry.id) ||
+          !exactApprovalText(entry.toolName, Q_LIMITS.toolName)) {
+        return { state: 'incomplete', approvals: [] };
       }
-      var id = idText(entry.id, Q_LIMITS.id);
-      if (id === '') {
-        continue;
+      if (tool === 'codex' || tool === 'workbuddy') {
+        var keys = Object.keys(entry);
+        if (keys.some(function (name) { return ['id', 'toolName', 'callId', 'reason', 'context'].indexOf(name) === -1; })) {
+          return { state: 'incomplete', approvals: [] };
+        }
       }
-      var approval = { id: id, toolName: clampText(entry.toolName, Q_LIMITS.toolName) };
-      if (typeof entry.callId === 'string' && entry.callId !== '') {
-        approval.callId = idText(entry.callId, Q_LIMITS.id);
+      var approval = { id: entry.id, toolName: entry.toolName };
+      if (entry.callId !== undefined) {
+        if (!exactApprovalText(entry.callId, Q_LIMITS.id)) return { state: 'incomplete', approvals: [] };
+        approval.callId = entry.callId;
       }
-      if (typeof entry.reason === 'string' && entry.reason !== '') {
-        approval.reason = clampText(entry.reason, Q_LIMITS.reason);
+      if (entry.reason !== undefined) {
+        if (tool === 'codex' || tool === 'workbuddy' || entry.context !== undefined) {
+          if (!exactApprovalText(entry.reason, Q_LIMITS.reason, true)) return { state: 'incomplete', approvals: [] };
+        } else if (typeof entry.reason !== 'string' || Array.from(entry.reason).length > Q_LIMITS.reason) {
+          return { state: 'incomplete', approvals: [] };
+        }
+        approval.reason = tool === 'dsh' && entry.context === undefined
+          ? clampText(entry.reason, Q_LIMITS.reason) : entry.reason;
+      } else if (tool === 'codex' || tool === 'workbuddy' || entry.context !== undefined) {
+        return { state: 'incomplete', approvals: [] };
       }
+      var context = approvalContextOf(entry.context, tool);
+      if (context === null) return { state: 'incomplete', approvals: [] };
+      if (context !== undefined) approval.context = context;
       out.push(approval);
     }
-    return out;
+    // Keep a validated read-only projection visible when the native adapter
+    // explicitly lacks a decision path. The UI can show the actual request and
+    // direct the person to the computer, while the capability bit stays false
+    // and no decision control is exposed.
+    return { state: supported ? 'ready' : 'unsupported', approvals: out };
+  }
+
+  function pendingApprovalsOf(input) {
+    var projection = pendingApprovalsProjection(input);
+    return projection.state === 'ready' ? projection.approvals : [];
   }
 
   /** True when this read result genuinely leaves something for the user to do. */
   function readNeedsInput(input) {
-    return pendingQuestionsState(input) === 'ready' || pendingApprovalsOf(input).length > 0;
+    var approvals = pendingApprovalsProjection(input);
+    return pendingQuestionsState(input) === 'ready' ||
+      approvals.state === 'ready' || approvals.state === 'incomplete' || approvals.state === 'oversized' ||
+      (approvals.state === 'unsupported' && approvals.approvals.length > 0);
   }
 
   var APPROVAL_DECISIONS = { 'allow-once': '仅允许本次', reject: '拒绝' };
@@ -1658,11 +1745,14 @@
         }
       }
       var custom = entry && typeof entry.custom === 'string' ? entry.custom : '';
+      if (question.allowCustom === false && custom !== '') {
+        return null;
+      }
       if (labels.length === 0) {
         // A free-form question: there is nothing to tick, so only text can be
         // the answer. Anything else would fail the relay's "an answer needs an
         // option or custom text" rule after the user thought they had answered.
-        if (custom.trim() === '' || kept.length > 0) {
+        if (question.allowCustom === false || custom.trim() === '' || kept.length > 0) {
           return null;
         }
       } else if (question.multiSelect) {
@@ -1827,6 +1917,7 @@
     clampText: clampText,
     pendingQuestionsState: pendingQuestionsState,
     pendingQuestionsOf: pendingQuestionsOf,
+    pendingApprovalsProjection: pendingApprovalsProjection,
     pendingApprovalsOf: pendingApprovalsOf,
     readNeedsInput: readNeedsInput,
     approvalDecisionLabel: approvalDecisionLabel,

@@ -15,6 +15,7 @@ const crypto = require('node:crypto');
 
 const CLIENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const OWNER_NAME_MAX_CHARS = 64;
+const NATIVE_RUN_ID = CLIENT_ID;
 
 const DEFAULTS = Object.freeze({
   relayUrl: 'wss://101.43.98.18/bridge',
@@ -23,9 +24,12 @@ const DEFAULTS = Object.freeze({
   ownerName: null,
   uiPort: 18989,
   bridgeToken: null,
-  codex: { pipePath: null, contextThreadId: null },
+  codex: { pipePath: null, contextThreadId: null, nativeControl: { enabled: false, registryDir: null, runId: null } },
   dsh: { port: null },
-  workbuddy: { configDir: null },
+  workbuddy: {
+    configDir: null,
+    uiAutomation: { enabled: false, executablePath: null, configurationValid: true },
+  },
   tools: ['codex', 'dsh'],
   autoStartBridge: true,
 });
@@ -49,6 +53,22 @@ function newClientId() {
 
 function validClientId(value) {
   return typeof value === 'string' && CLIENT_ID.test(value);
+}
+
+/**
+ * Validate the one local executable override accepted by WorkBuddy UIA. This
+ * config is never accepted from the phone or relay; the local settings page
+ * calls the same validator before it is persisted.
+ */
+function normalizeWorkBuddyExecutablePath(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2048 || /[\p{Cc}"]/u.test(value)) {
+    throw new TypeError('WorkBuddy executable path must be an absolute WorkBuddy.exe path');
+  }
+  const normalized = path.win32.normalize(value.trim());
+  if (!path.win32.isAbsolute(normalized) || path.win32.basename(normalized).toLowerCase() !== 'workbuddy.exe') {
+    throw new TypeError('WorkBuddy executable path must be an absolute WorkBuddy.exe path');
+  }
+  return normalized;
 }
 
 /** Where the config file lives, unless the environment names another one. */
@@ -83,7 +103,29 @@ function loadConfig(options = {}) {
   const file = options.path ?? configPath({ env });
   const fromFile = readConfigFile(file);
   const pick = (key, fallback) => (fromFile[key] === undefined ? fallback : fromFile[key]);
+  const nativeControlEnabled = env.AI_REMOTE_CODEX_NATIVE_CONTROL === '0'
+    ? false
+    : env.AI_REMOTE_CODEX_NATIVE_CONTROL === '1' || fromFile.codex?.nativeControl?.enabled === true;
+  const nativeControlRegistryDir = env.CODEX_NATIVE_CONTROL_DIR;
+  const nativeControlRunId = env.CODEX_NATIVE_RUN_ID;
+  if (nativeControlEnabled && (
+    typeof nativeControlRegistryDir !== 'string' || !path.isAbsolute(nativeControlRegistryDir) ||
+    typeof nativeControlRunId !== 'string' || !NATIVE_RUN_ID.test(nativeControlRunId)
+  )) {
+    throw new Error('Codex native control opt-in needs this launch\'s absolute registry directory and UUID v4 run ID');
+  }
   const token = env.AI_REMOTE_BRIDGE_TOKEN ?? pick('bridgeToken', DEFAULTS.bridgeToken);
+  const workbuddyUiConfig = fromFile.workbuddy?.uiAutomation;
+  const workbuddyExeConfigured = workbuddyUiConfig?.executablePath !== undefined && workbuddyUiConfig?.executablePath !== null;
+  let workbuddyExecutablePath = null;
+  let workbuddyUiConfigurationValid = true;
+  if (workbuddyExeConfigured) {
+    try {
+      workbuddyExecutablePath = normalizeWorkBuddyExecutablePath(workbuddyUiConfig.executablePath);
+    } catch {
+      workbuddyUiConfigurationValid = false;
+    }
+  }
   let ownerName = null;
   try {
     if (typeof fromFile.ownerName === 'string') ownerName = normalizeOwnerName(fromFile.ownerName);
@@ -102,12 +144,22 @@ function loadConfig(options = {}) {
     codex: {
       pipePath: env.AI_REMOTE_CODEX_PIPE ?? fromFile.codex?.pipePath ?? DEFAULTS.codex.pipePath,
       contextThreadId: env.CODEX_THREAD_ID ?? fromFile.codex?.contextThreadId ?? DEFAULTS.codex.contextThreadId,
+      nativeControl: {
+        enabled: nativeControlEnabled,
+        registryDir: nativeControlEnabled ? nativeControlRegistryDir : null,
+        runId: nativeControlEnabled ? nativeControlRunId : null,
+      },
     },
     dsh: {
       port: asNumber(env.AI_REMOTE_DSH_PORT ?? fromFile.dsh?.port ?? null, null),
     },
     workbuddy: {
       configDir: (env.WORKBUDDY_CONFIG_DIR ?? fromFile.workbuddy?.configDir ?? path.join(os.homedir(), '.workbuddy')),
+      uiAutomation: {
+        enabled: workbuddyUiConfig?.enabled === true && workbuddyUiConfigurationValid,
+        executablePath: workbuddyExecutablePath,
+        configurationValid: workbuddyUiConfigurationValid,
+      },
     },
     tools: Array.isArray(fromFile.tools) && fromFile.tools.length > 0 ? fromFile.tools : DEFAULTS.tools,
     autoStartBridge:
@@ -138,6 +190,17 @@ function saveConfig(file, updates) {
     }
   }
   const next = { ...current, ...updates };
+  // Local WorkBuddy UIA settings are nested. Merge that one subtree so saving
+  // the opt-in cannot erase configDir or unrelated future WorkBuddy options.
+  if (updates.workbuddy !== null && typeof updates.workbuddy === 'object' && !Array.isArray(updates.workbuddy)) {
+    next.workbuddy = { ...(current.workbuddy && typeof current.workbuddy === 'object' && !Array.isArray(current.workbuddy) ? current.workbuddy : {}), ...updates.workbuddy };
+    if (updates.workbuddy.uiAutomation !== null && typeof updates.workbuddy.uiAutomation === 'object' && !Array.isArray(updates.workbuddy.uiAutomation)) {
+      next.workbuddy.uiAutomation = {
+        ...(current.workbuddy?.uiAutomation && typeof current.workbuddy.uiAutomation === 'object' && !Array.isArray(current.workbuddy.uiAutomation) ? current.workbuddy.uiAutomation : {}),
+        ...updates.workbuddy.uiAutomation,
+      };
+    }
+  }
   const directory = path.dirname(file);
   fs.mkdirSync(directory, { recursive: true });
   const temp = `${file}.${crypto.randomUUID()}.tmp`;
@@ -174,9 +237,17 @@ function redactedConfig(config) {
     codex: {
       ...config.codex,
       contextThreadId: config.codex?.contextThreadId == null ? null : '<set>',
+      nativeControl: {
+        enabled: config.codex?.nativeControl?.enabled === true,
+      },
     },
     workbuddy: {
       configured: typeof config.workbuddy?.configDir === 'string',
+      uiAutomation: {
+        enabled: config.workbuddy?.uiAutomation?.enabled === true,
+        executablePathConfigured: typeof config.workbuddy?.uiAutomation?.executablePath === 'string',
+        configurationValid: config.workbuddy?.uiAutomation?.configurationValid !== false,
+      },
     },
   };
 }
@@ -192,5 +263,6 @@ module.exports = {
   normalizeOwnerName,
   newClientId,
   validClientId,
+  normalizeWorkBuddyExecutablePath,
   saveConfig,
 };

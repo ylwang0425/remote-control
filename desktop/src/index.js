@@ -18,7 +18,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { loadConfig, readTokenFile, redactedConfig, configPath, normalizeOwnerName, newClientId, saveConfig } = require('./config');
+const {
+  loadConfig, readTokenFile, redactedConfig, configPath, normalizeOwnerName,
+  normalizeWorkBuddyExecutablePath, newClientId, saveConfig, validClientId,
+} = require('./config');
 const { EnrollmentError, normalizeRelayAddress, enrollDesktop } = require('./enrollment');
 const {
   buildCapabilities,
@@ -36,6 +39,7 @@ const { BridgeClient } = require('./bridge');
 const { LocalUiServer } = require('./ui/server');
 const { discoverCodexPipes } = require('./adapters/codex');
 const { CreateLog, fingerprintOf } = require('./creates');
+const { readRunStopRequestConfig, createRunStopRequestWatcher } = require('./run-stop-request');
 
 /**
  * Per-source deadlines for `sessions.list`, measured on this machine: a Codex
@@ -47,7 +51,40 @@ const { CreateLog, fingerprintOf } = require('./creates');
 const CODEX_LIST_TIMEOUT_MS = 8000;
 const DSH_LIST_TIMEOUT_MS = 5000;
 const WORKBUDDY_UNAVAILABLE_REASON = '未找到可读取的 WorkBuddy 本地会话存储。';
-const WORKBUDDY_READ_ONLY_REASON = '可查看本机会话和消息；续聊、模型切换与授权操作暂未接入。';
+const WORKBUDDY_READ_ONLY_REASON = 'WorkBuddy 本机会话可读；模型、创建、发送、停止、回答和审批仅在对应原生能力实测后启用。';
+
+function safeWorkBuddyLastSnapshot(value) {
+  if (value === null || value === undefined || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (typeof value.observedAt !== 'string' || value.observedAt.length > 40 || Number.isNaN(Date.parse(value.observedAt))) return null;
+  if (!['default', 'secure', 'other', 'unavailable'].includes(value.desktopKind) ||
+      typeof value.targetMatched !== 'boolean' || typeof value.isForeground !== 'boolean') return null;
+  return {
+    observedAt: value.observedAt,
+    desktopKind: value.desktopKind,
+    targetMatched: value.targetMatched,
+    isForeground: value.isForeground,
+  };
+}
+
+/** Local-only status projection. Native helper/debug objects never pass through. */
+function describeWorkBuddyUiAutomation(adapter, settings) {
+  const enabled = settings?.enabled === true;
+  let observed = null;
+  try {
+    const description = adapter?.describe?.();
+    observed = safeWorkBuddyLastSnapshot(description?.uiAutomation?.lastSnapshot);
+  } catch {
+    // Status rendering must not fail the bridge or expose adapter diagnostics.
+  }
+  return {
+    enabled,
+    executablePathConfigured: typeof settings?.executablePath === 'string',
+    needsUnlockedDesktop: enabled,
+    requiresDefaultInputDesktop: enabled,
+    requiresForegroundTarget: enabled,
+    lastObserved: observed,
+  };
+}
 
 const VERSION = require('../package.json').version;
 
@@ -77,7 +114,8 @@ Exit codes:
 Environment:
   AI_REMOTE_CONFIG, AI_REMOTE_RELAY_URL, AI_REMOTE_BRIDGE_TOKEN,
   AI_REMOTE_UI_PORT, AI_REMOTE_CLIENT_NAME, AI_REMOTE_CODEX_PIPE,
-  AI_REMOTE_DSH_PORT, AI_REMOTE_NO_BRIDGE
+  AI_REMOTE_DSH_PORT, AI_REMOTE_NO_BRIDGE,
+  AI_REMOTE_CODEX_NATIVE_CONTROL, CODEX_NATIVE_CONTROL_DIR, CODEX_NATIVE_RUN_ID
 
 The bridge token is never printed, never written to a log and never put in a URL.
 `;
@@ -194,6 +232,11 @@ function selfCheck(config) {
  */
 function createDispatcher(config, log, factories = {}) {
   const state = { codex: null, dsh: null, workbuddy: null, lastError: { codex: null, dsh: null, workbuddy: null } };
+  let workbuddyAdapterConfigKey = null;
+  let workbuddyOpenPromise = null;
+  let workbuddyLifecycleTail = Promise.resolve();
+  let acceptingRequests = true;
+  let closePromise = null;
   const createLog = new CreateLog({ path: config.createLogPath });
   /**
    * Numbers that were really measured, `null` wherever nothing has been measured
@@ -210,10 +253,21 @@ function createDispatcher(config, log, factories = {}) {
     if (state.codex !== null) return state.codex;
     const { CodexAdapter } = require('./adapters/codex');
     try {
-      state.codex = await (factories.codex ?? CodexAdapter.open)({
+      const options = {
         pipePath: config.codex.pipePath,
         contextThreadId: config.codex.contextThreadId,
-      });
+      };
+      if (config.codex?.nativeControl?.enabled === true) {
+        const nativeControl = config.codex.nativeControl;
+        if (typeof nativeControl.registryDir !== 'string' || !path.isAbsolute(nativeControl.registryDir) || !validClientId(nativeControl.runId)) {
+          throw new BridgeError('not_capable', 'Codex native control is enabled without a valid private per-launch registry');
+        }
+        // This directory/run ID is supplied by the opt-in launcher to both the
+        // bridge and the same Codex Desktop child. It contains private
+        // authenticated loopback descriptors, so never log or return it.
+        options.nativeControl = { registryDir: nativeControl.registryDir, runId: nativeControl.runId };
+      }
+      state.codex = await (factories.codex ?? CodexAdapter.open)(options);
       state.lastError.codex = null;
       metrics.codex.tools = state.codex.availableTools().length;
       log(`codex: pipe ${metrics.codex.tools} tools (${state.codex.availableTools().join(', ')})`);
@@ -235,17 +289,76 @@ function createDispatcher(config, log, factories = {}) {
     return state.dsh;
   }
 
+  function workbuddyOptionsSnapshot() {
+    const configuredUiAutomation = config.workbuddy?.uiAutomation ?? {};
+    const options = {
+      configDir: config.workbuddy?.configDir,
+      uiAutomation: {
+        enabled: configuredUiAutomation.enabled === true,
+        ...(typeof configuredUiAutomation.executablePath === 'string'
+          ? { executablePath: configuredUiAutomation.executablePath }
+          : {}),
+      },
+    };
+    // This in-memory key detects a settings change without returning local
+    // paths from status or persisting an additional version field.
+    return { options, key: JSON.stringify([options.configDir ?? null, options.uiAutomation.enabled, options.uiAutomation.executablePath ?? null]) };
+  }
+
+  async function closeWorkBuddyAdapter(adapter) {
+    await adapter?.close?.();
+  }
+
   async function workbuddy() {
-    if (state.workbuddy !== null) return state.workbuddy;
-    const { WorkBuddyAdapter } = require('./adapters/workbuddy');
-    try {
-      state.workbuddy = await (factories.workbuddy ?? WorkBuddyAdapter.open)({ configDir: config.workbuddy?.configDir });
-      state.lastError.workbuddy = null;
-      return state.workbuddy;
-    } catch (error) {
-      state.lastError.workbuddy = safeMessage(error);
-      throw error;
+    for (;;) {
+      const target = workbuddyOptionsSnapshot();
+      if (state.workbuddy !== null && workbuddyAdapterConfigKey === target.key) return state.workbuddy;
+
+      if (state.workbuddy !== null) {
+        const previous = state.workbuddy;
+        state.workbuddy = null;
+        workbuddyAdapterConfigKey = null;
+        await closeWorkBuddyAdapter(previous);
+      }
+
+      if (workbuddyOpenPromise !== null) {
+        await workbuddyOpenPromise;
+        continue;
+      }
+
+      const { WorkBuddyAdapter } = require('./adapters/workbuddy');
+      const opening = (async () => {
+        try {
+          const adapter = await (factories.workbuddy ?? WorkBuddyAdapter.open)(target.options);
+          // A local settings request can arrive while open() is pending. Never
+          // publish or use an instance created for a superseded configuration.
+          if (workbuddyOptionsSnapshot().key !== target.key) {
+            await closeWorkBuddyAdapter(adapter);
+            return null;
+          }
+          state.workbuddy = adapter;
+          workbuddyAdapterConfigKey = target.key;
+          state.lastError.workbuddy = null;
+          return adapter;
+        } catch (error) {
+          state.lastError.workbuddy = safeMessage(error);
+          throw error;
+        }
+      })();
+      workbuddyOpenPromise = opening;
+      try {
+        const opened = await opening;
+        if (opened !== null) return opened;
+      } finally {
+        if (workbuddyOpenPromise === opening) workbuddyOpenPromise = null;
+      }
     }
+  }
+
+  function withWorkBuddyLifecycle(operation) {
+    const running = workbuddyLifecycleTail.then(operation, operation);
+    workbuddyLifecycleTail = running.then(() => undefined, () => undefined);
+    return running;
   }
 
   async function pair(open) {
@@ -261,7 +374,11 @@ function createDispatcher(config, log, factories = {}) {
    * missing on a stand-in is "not measured", which is false - never true by
    * default, the same rule protocol-v1 §9.5 sets for every capability bit.
    */
-  const adapterFlag = (adapter, method) => adapter !== null && typeof adapter[method] === 'function' && adapter[method]() === true;
+  const adapterFlag = (adapter, method) => {
+    if (adapter === null || typeof adapter[method] !== 'function') return false;
+    try { return adapter[method]() === true; } catch { return false; }
+  };
+  const adapterAbility = (adapter, flag, operation) => adapterFlag(adapter, flag) && typeof adapter?.[operation] === 'function';
 
   /**
    * The capability options for the adapters that really answered.
@@ -270,25 +387,45 @@ function createDispatcher(config, log, factories = {}) {
    * the next message, or cannot hand an answer back to a native question, says
    * false instead of letting the phone draw a control whose call must fail.
    */
-  function capabilityOptions(codexAdapter, dshAdapter) {
+  function capabilityOptions(codexAdapter, dshAdapter, workbuddyAdapter) {
+    const stopWorkbuddy = adapterAbility(workbuddyAdapter, 'canStop', 'stopSession');
+    const modelsListWorkbuddy = adapterAbility(workbuddyAdapter, 'canModelsList', 'listModels');
+    const sessionCreateWorkbuddy = modelsListWorkbuddy && adapterAbility(workbuddyAdapter, 'canCreate', 'createSession');
+    const sendWorkbuddy = adapterAbility(workbuddyAdapter, 'canSend', 'sendMessage');
+    const sendModelWorkbuddy = sendWorkbuddy && adapterFlag(workbuddyAdapter, 'canSendWithModel');
+    const answerWorkbuddy = adapterAbility(workbuddyAdapter, 'canAnswer', 'answerQuestion');
+    const approveWorkbuddy = adapterAbility(workbuddyAdapter, 'canApprove', 'approveRequest');
     return {
-      stopCodex: codexAdapter === null ? false : codexAdapter.canStop(),
-      stopDsh: dshAdapter === null ? false : dshAdapter.canStop(),
-      modelsList: codexAdapter !== null || dshAdapter !== null,
-      sessionCreate: codexAdapter !== null || dshAdapter !== null,
-      sendModelCodex: adapterFlag(codexAdapter, 'canSendWithModel'),
-      sendModelDsh: adapterFlag(dshAdapter, 'canSendWithModel'),
-      answerCodex: adapterFlag(codexAdapter, 'canAnswer'),
-      answerDsh: adapterFlag(dshAdapter, 'canAnswer'),
-      // Requirement F: per tool, because only one of the two channels really
-      // carries a native permission request. Codex's app-tools pipe has no such
-      // surface, so its bit is false and the phone draws no button for it.
-      approveCodex: adapterFlag(codexAdapter, 'canApprove'),
-      approveDsh: adapterFlag(dshAdapter, 'canApprove'),
+      stopCodex: adapterAbility(codexAdapter, 'canStop', 'stopSession'),
+      stopDsh: adapterAbility(dshAdapter, 'canStop', 'stopSession'),
+      stopWorkbuddy,
+      modelsList: codexAdapter !== null || dshAdapter !== null || modelsListWorkbuddy,
+      sessionCreate: codexAdapter !== null || dshAdapter !== null || sessionCreateWorkbuddy,
+      modelsListWorkbuddy,
+      sessionCreateWorkbuddy,
+      sendCodex: adapterAbility(codexAdapter, 'canSend', 'sendMessage'),
+      sendModelCodex: adapterAbility(codexAdapter, 'canSendWithModel', 'sendMessage'),
+      sendModelDsh: adapterAbility(dshAdapter, 'canSendWithModel', 'sendMessage'),
+      sendWorkbuddy,
+      sendModelWorkbuddy,
+      answerCodex: adapterAbility(codexAdapter, 'canAnswer', 'answerQuestion'),
+      answerDsh: adapterAbility(dshAdapter, 'canAnswer', 'answerQuestion'),
+      answerWorkbuddy,
+      // Permission controls are advertised per adapter only when its native
+      // request source and explicit decision method have both been measured.
+      approveCodex: adapterAbility(codexAdapter, 'canApprove', 'approveRequest'),
+      approveDsh: adapterAbility(dshAdapter, 'canApprove', 'approveRequest'),
+      approveWorkbuddy,
     };
   }
 
   function capabilityToolStatus(codexAdapter, dshAdapter, workbuddyAdapter) {
+    const workbuddyCapabilities = capabilityOptions(null, null, workbuddyAdapter);
+    const workbuddyReadOnly = !(
+      workbuddyCapabilities.sendWorkbuddy || workbuddyCapabilities.stopWorkbuddy ||
+      workbuddyCapabilities.answerWorkbuddy || workbuddyCapabilities.approveWorkbuddy ||
+      workbuddyCapabilities.sessionCreateWorkbuddy
+    );
     return {
       codex: codexAdapter === null
         ? { available: false, reason: state.lastError.codex ?? 'no Codex app-tools pipe answered yet' }
@@ -298,7 +435,7 @@ function createDispatcher(config, log, factories = {}) {
         : { available: true },
       workbuddy: workbuddyAdapter == null
         ? { available: false, reason: state.lastError.workbuddy ?? WORKBUDDY_UNAVAILABLE_REASON }
-        : { available: true, reason: WORKBUDDY_READ_ONLY_REASON },
+        : { available: true, ...(workbuddyReadOnly ? { reason: WORKBUDDY_READ_ONLY_REASON } : {}) },
     };
   }
 
@@ -311,7 +448,23 @@ function createDispatcher(config, log, factories = {}) {
     const toolStatus = capabilityToolStatus(codexAdapter, dshAdapter, workbuddyAdapter);
     // No default-on: with no session source the hello carries an empty `tools`
     // and false bits, which is the contract's "connected but nothing to show".
-    return buildCapabilities(tools, { ...capabilityOptions(codexAdapter, dshAdapter), toolStatus });
+    return buildCapabilities(tools, { ...capabilityOptions(codexAdapter, dshAdapter, workbuddyAdapter), toolStatus });
+  }
+
+  /**
+   * Capability checks for an exact-tool request must be derived from that one
+   * adapter. Opening unrelated tools here can start native clients as a side
+   * effect of a WorkBuddy request and makes a rejected operation depend on
+   * other local tools being available.
+   */
+  function capabilitiesForTool(tool, adapter) {
+    const codexAdapter = tool === 'codex' ? adapter : null;
+    const dshAdapter = tool === 'dsh' ? adapter : null;
+    const workbuddyAdapter = tool === 'workbuddy' ? adapter : null;
+    return buildCapabilities([tool], {
+      ...capabilityOptions(codexAdapter, dshAdapter, workbuddyAdapter),
+      toolStatus: capabilityToolStatus(codexAdapter, dshAdapter, workbuddyAdapter),
+    });
   }
 
   function route(params, capabilitiesNow) {
@@ -360,33 +513,55 @@ function createDispatcher(config, log, factories = {}) {
     }
   }
 
-  async function dispatch({ method, params }) {
-    // The local WorkBuddy archive exposes no native execution channel. Refuse
-    // every write before catalog/create routing could select another adapter.
-    if (params.tool === 'workbuddy' && method !== 'sessions.list' && method !== 'session.read') {
-      throw new BridgeError('not_capable', WORKBUDDY_READ_ONLY_REASON);
-    }
+  async function dispatchUnlocked(request) {
+    const { method, params } = request;
+    const workbuddyHooks = request?.internal?.workbuddyHooks;
     if (method === 'models.list') {
-      const adapter = await pair(params.tool === 'codex' ? codex : dsh);
+      const routeInfo = route(params);
+      const adapter = await pair(routeInfo.open);
       if (adapter === null) {
+        if (params.tool === 'workbuddy') {
+          throw new BridgeError('tool_unavailable', 'the WorkBuddy session source is not connected');
+        }
         // "Connected but nothing to offer" is not an error (§9.5 precedent).
         return buildModelsListResult({ tool: params.tool, models: [] });
       }
+      if (params.tool === 'workbuddy' && !adapterAbility(adapter, 'canModelsList', 'listModels')) {
+        throw new BridgeError('not_capable', 'this WorkBuddy session source cannot list native models');
+      }
       try {
-        const listed = await adapter.listModels();
+        if (params.tool === 'workbuddy') workbuddyHooks?.checkActive?.();
+        const listed = params.tool === 'workbuddy'
+          ? await adapter.listModels(workbuddyHooks)
+          : await adapter.listModels();
         return buildModelsListResult({ tool: params.tool, models: listed.models, projects: listed.projects });
       } catch (error) {
         log(`models.list failed: ${safeMessage(error)}`);
+        if (params.tool === 'workbuddy') throw error;
         return buildModelsListResult({ tool: params.tool, models: [] });
       }
     }
 
     if (method === 'session.create') {
-      const adapter = await pair(params.tool === 'codex' ? codex : dsh);
+      const routeInfo = route(params);
+      const adapter = await pair(routeInfo.open);
       if (adapter === null) {
         throw new BridgeError('tool_unavailable', `the ${params.tool} session source is not connected`);
       }
-      const listed = await adapter.listModels().catch(() => ({ models: [], projects: [] }));
+      if (params.tool === 'workbuddy' && !(
+        adapterAbility(adapter, 'canModelsList', 'listModels') &&
+        adapterAbility(adapter, 'canCreate', 'createSession')
+      )) {
+        throw new BridgeError('not_capable', 'this WorkBuddy session source cannot list models and create native sessions');
+      }
+      if (params.tool === 'workbuddy') workbuddyHooks?.checkActive?.();
+      const listed = params.tool === 'workbuddy'
+        ? await adapter.listModels(workbuddyHooks).catch(() => ({ models: [], projects: [] }))
+        : await adapter.listModels().catch(() => ({ models: [], projects: [] }));
+      // The create path intentionally treats an unavailable model catalog as
+      // empty, but a caller whose deadline elapsed while reading it must not
+      // proceed into the create reservation or native UI action.
+      if (params.tool === 'workbuddy') workbuddyHooks?.checkActive?.();
       // An empty catalog is not "anything goes": with nothing to check against,
       // the honest answer is that no model can be chosen, and no native session
       // is created at all.
@@ -409,18 +584,21 @@ function createDispatcher(config, log, factories = {}) {
         }
       }
 
-      const runCreate = (onCreated) =>
-        adapter.createSession(
-          {
-            model: params.model,
-            provider: params.provider,
-            reasoningEffort: params.reasoningEffort,
-            cwd: params.cwd,
-            projectId: params.projectId,
-            text: params.text,
-          },
-          { onCreated },
-        );
+      const runCreate = (onCreated) => {
+        const input = {
+          model: params.model,
+          provider: params.provider,
+          reasoningEffort: params.reasoningEffort,
+          cwd: params.cwd,
+          projectId: params.projectId,
+          text: params.text,
+        };
+        if (params.tool === 'workbuddy') {
+          workbuddyHooks?.checkActive?.();
+          return adapter.createSession(input, { onCreated }, workbuddyHooks);
+        }
+        return adapter.createSession(input, { onCreated });
+      };
 
       // The log is what makes a retry cheap and a double tap harmless: it
       // reserves the key on disk before the native call, coalesces concurrent
@@ -461,7 +639,7 @@ function createDispatcher(config, log, factories = {}) {
       if (workbuddyAdapter !== null) tools.push('workbuddy');
       const sessions = [];
       const capabilitiesNow = buildCapabilities(tools, {
-        ...capabilityOptions(codexAdapter, dshAdapter),
+        ...capabilityOptions(codexAdapter, dshAdapter, workbuddyAdapter),
         toolStatus: capabilityToolStatus(codexAdapter, dshAdapter, workbuddyAdapter),
       });
       for (const [tool, adapter] of [
@@ -483,22 +661,31 @@ function createDispatcher(config, log, factories = {}) {
       return buildSessionsListResult({ sessions, capabilities: capabilitiesNow });
     }
 
-    const capabilitiesNow = await capabilities();
-    const routeInfo = route(params, capabilitiesNow);
+    const routeInfo = route(params);
     const adapter = await pair(() => routeInfo.open());
     if (adapter === null) {
-      throw new BridgeError('bridge_error', `the ${params.tool} session source is not connected`);
+      throw new BridgeError('tool_unavailable', `the ${params.tool} session source is not connected`);
     }
+    const capabilitiesNow = capabilitiesForTool(params.tool, adapter);
 
     if (method === 'session.read') {
-      const session = await adapter.readSession(params.sessionId);
+      let session;
+      if (params.tool === 'workbuddy') {
+        workbuddyHooks?.checkActive?.();
+        session = typeof adapter.readSessionLive === 'function'
+          ? await adapter.readSessionLive(params.sessionId, workbuddyHooks)
+          : await adapter.readSession(params.sessionId);
+        workbuddyHooks?.checkActive?.();
+      } else {
+        session = await adapter.readSession(params.sessionId);
+      }
       return buildSessionReadResult({
         id: session.id,
         tool: session.tool,
         title: session.title,
         status: session.status,
         messages: session.messages,
-        canStop: session.status === 'working' && capabilitiesNow[`stop:${session.tool}`] === true,
+        canStop: session.status === 'working' && capabilitiesNow[`stop:${session.tool}`] === true && session.canStop !== false,
         activeTurnId: session.activeTurnId,
         // Both travel only when the adapter really read them from native state.
         currentModel: session.currentModel,
@@ -510,6 +697,13 @@ function createDispatcher(config, log, factories = {}) {
       });
     }
     if (method === 'session.send') {
+      // A present per-tool bit is authoritative. This prevents a generic send
+      // capability advertised by another adapter from making a read-only tool
+      // look writable on either the phone or this dispatcher.
+      const sendCapability = `session.send:${params.tool}`;
+      if (Object.prototype.hasOwnProperty.call(capabilitiesNow, sendCapability) && capabilitiesNow[sendCapability] !== true) {
+        throw new BridgeError('not_capable', `this ${params.tool} session cannot receive messages`);
+      }
       // CRD 0008 §B: a model for the NEXT message. Omitting it is the old
       // request exactly. The capability bit and the call agree: a tool whose
       // schema documents no model catalog refuses here, rather than sending a
@@ -517,11 +711,17 @@ function createDispatcher(config, log, factories = {}) {
       if (params.model !== undefined && capabilitiesNow[`session.send:model:${params.tool}`] !== true) {
         throw new BridgeError('not_capable', `this ${params.tool} session cannot choose a model for the next message`);
       }
-      await adapter.sendMessage(params.sessionId, params.text, {
+      const sendOptions = {
         model: params.model,
         provider: params.provider,
         reasoningEffort: params.reasoningEffort,
-      });
+      };
+      if (params.tool === 'workbuddy') {
+        workbuddyHooks?.checkActive?.();
+        await adapter.sendMessage(params.sessionId, params.text, sendOptions, workbuddyHooks);
+      } else {
+        await adapter.sendMessage(params.sessionId, params.text, sendOptions);
+      }
       return buildSessionSendResult(params.sessionId);
     }
     if (method === 'session.answer') {
@@ -532,8 +732,18 @@ function createDispatcher(config, log, factories = {}) {
       if (capabilitiesNow[`session.answer:${params.tool}`] !== true || typeof adapter.answerQuestion !== 'function') {
         throw new BridgeError('not_capable', `this ${params.tool} session cannot answer a question`);
       }
-      await adapter.answerQuestion(params.sessionId, params.callId, params.answers);
-      return buildSessionAnswerResult(params.sessionId, params.callId);
+      if (params.tool === 'workbuddy') workbuddyHooks?.checkActive?.();
+      const answered = params.tool === 'workbuddy'
+        ? await adapter.answerQuestion(params.sessionId, params.callId, params.answers, workbuddyHooks)
+        : await adapter.answerQuestion(params.sessionId, params.callId, params.answers);
+      // The existing DSH adapter returns only after its native acceptance /
+      // exact-answer check, so retain that established confirmation semantics.
+      // New ACP adapters must report confirmed only when they prove this exact
+      // answer from native state; transport acknowledgement defaults to submitted.
+      const answerState = answered?.state === undefined
+        ? (params.tool === 'dsh' ? 'confirmed' : 'submitted')
+        : answered.state;
+      return buildSessionAnswerResult(params.sessionId, params.callId, answerState);
     }
     if (method === 'session.approve') {
       // Requirement F: one explicit human decision for one live native request.
@@ -544,7 +754,10 @@ function createDispatcher(config, log, factories = {}) {
       if (capabilitiesNow[`session.approve:${params.tool}`] !== true || typeof adapter.approveRequest !== 'function') {
         throw new BridgeError('not_capable', `this ${params.tool} session cannot decide a permission approval`);
       }
-      const decided = await adapter.approveRequest(params.sessionId, params.approvalId, params.decision);
+      if (params.tool === 'workbuddy') workbuddyHooks?.checkActive?.();
+      const decided = params.tool === 'workbuddy'
+        ? await adapter.approveRequest(params.sessionId, params.approvalId, params.decision, workbuddyHooks)
+        : await adapter.approveRequest(params.sessionId, params.approvalId, params.decision);
       return buildSessionApproveResult({
         sessionId: params.sessionId,
         approvalId: params.approvalId,
@@ -554,13 +767,40 @@ function createDispatcher(config, log, factories = {}) {
       });
     }
     if (method === 'session.stop') {
-      if (capabilitiesNow[`stop:${params.tool}`] !== true || adapter.canStop() !== true) {
+      if (capabilitiesNow[`stop:${params.tool}`] !== true || !adapterAbility(adapter, 'canStop', 'stopSession')) {
         throw new BridgeError('not_capable', `this ${params.tool} session cannot be stopped`);
       }
-      await adapter.stopSession(params.sessionId);
+      if (params.tool === 'workbuddy') {
+        workbuddyHooks?.checkActive?.();
+        await adapter.stopSession(params.sessionId, workbuddyHooks);
+      } else {
+        await adapter.stopSession(params.sessionId);
+      }
       return buildSessionStopResult(params.sessionId);
     }
     throw new BridgeError('unknown_method', 'method is not allowed');
+  }
+
+  function dispatch(request) {
+    if (!acceptingRequests) {
+      return Promise.reject(new BridgeError('bridge_error', 'this computer is stopping and no longer accepts requests'));
+    }
+    const method = request?.method;
+    const params = request?.params;
+    // `sessions.list` reads WorkBuddy alongside the other sources, and every
+    // exact WorkBuddy request may use its foreground UI writer. Serialize both
+    // with local refresh so an accepted native action is never interrupted,
+    // replayed, or raced against adapter replacement.
+    if (method === 'sessions.list' || params?.tool === 'workbuddy') {
+      return withWorkBuddyLifecycle(() => {
+        // A timed-out WorkBuddy request may have spent its whole budget behind
+        // a refresh or an earlier native action. Check it as soon as its turn
+        // reaches the writer queue, before opening or touching native UI state.
+        if (params?.tool === 'workbuddy') request?.internal?.workbuddyHooks?.checkActive?.();
+        return dispatchUnlocked(request);
+      });
+    }
+    return dispatchUnlocked(request);
   }
 
   /**
@@ -568,25 +808,41 @@ function createDispatcher(config, log, factories = {}) {
    * a one-shot script must, because an open Codex named pipe keeps the Node event
    * loop alive for ever.
    */
+  function stopAccepting() {
+    acceptingRequests = false;
+  }
+
   function close() {
-    try {
-      state.codex?.close();
-    } catch {
-      // already gone
+    stopAccepting();
+    if (closePromise !== null) return closePromise;
+    closePromise = (async () => {
+      await withWorkBuddyLifecycle(async () => {
+        const previous = state.workbuddy;
+        state.workbuddy = null;
+        workbuddyAdapterConfigKey = null;
+        await closeWorkBuddyAdapter(previous);
+      });
+      for (const key of ['codex', 'dsh']) {
+        const previous = state[key];
+        state[key] = null;
+        try { await previous?.close?.(); } catch { /* the old adapter is already gone */ }
+      }
+    })();
+    return closePromise;
+  }
+
+  /** Re-open only WorkBuddy after a local settings change; never touch its process. */
+  function refreshWorkBuddy() {
+    if (closePromise !== null) {
+      return Promise.reject(new BridgeError('bridge_error', 'this computer is stopping'));
     }
-    try {
-      state.dsh?.close();
-    } catch {
-      // already gone
-    }
-    try {
-      state.workbuddy?.close();
-    } catch {
-      // already gone
-    }
-    state.codex = null;
-    state.dsh = null;
-    state.workbuddy = null;
+    return withWorkBuddyLifecycle(async () => {
+      metrics.workbuddy.sessions = null;
+      lastGood.delete('workbuddy');
+      // workbuddy() reuses an unchanged instance, but awaits its close before
+      // replacement when the saved local configuration has changed.
+      return capabilities();
+    });
   }
 
   /**
@@ -597,6 +853,8 @@ function createDispatcher(config, log, factories = {}) {
   return {
     dispatch,
     close,
+    stopAccepting,
+    refreshWorkBuddy,
     describe: () => ({
       codex: {
         available: state.codex !== null,
@@ -614,8 +872,13 @@ function createDispatcher(config, log, factories = {}) {
       workbuddy: {
         available: state.workbuddy !== null,
         sessions: metrics.workbuddy.sessions,
-        readOnly: true,
-        reason: state.workbuddy === null ? state.lastError.workbuddy ?? WORKBUDDY_UNAVAILABLE_REASON : WORKBUDDY_READ_ONLY_REASON,
+        readOnly: state.workbuddy === null
+          ? null
+          : capabilityToolStatus(state.codex, state.dsh, state.workbuddy).workbuddy.reason === WORKBUDDY_READ_ONLY_REASON,
+        reason: state.workbuddy === null
+          ? state.lastError.workbuddy ?? WORKBUDDY_UNAVAILABLE_REASON
+          : capabilityToolStatus(state.codex, state.dsh, state.workbuddy).workbuddy.reason ?? null,
+        uiAutomation: describeWorkBuddyUiAutomation(state.workbuddy, config.workbuddy?.uiAutomation),
       },
     }),
   };
@@ -675,7 +938,10 @@ async function run(config, args, log) {
       const toolStatus = {
         codex: described.codex.available ? { available: true } : { available: false, reason: described.codex.reason },
         dsh: described.dsh.available ? { available: true } : { available: false, reason: described.dsh.reason },
-        workbuddy: { available: described.workbuddy.available, reason: described.workbuddy.reason },
+        workbuddy: {
+          available: described.workbuddy.available,
+          ...(typeof described.workbuddy.reason === 'string' ? { reason: described.workbuddy.reason } : {}),
+        },
       };
       // If the combined session list itself failed, membership is unknown. Do
       // not claim any configured tool as an opened native session adapter.
@@ -767,6 +1033,48 @@ async function run(config, args, log) {
       }
       return { identity: { clientId, ownerName }, helloUpdated: helloSent };
     },
+    onWorkBuddyUiAutomationUpdate: async ({ enabled, executablePath }) => {
+      let normalizedExecutablePath = config.workbuddy?.uiAutomation?.executablePath ?? null;
+      if (executablePath !== undefined) {
+        try {
+          normalizedExecutablePath = normalizeWorkBuddyExecutablePath(executablePath);
+        } catch (error) {
+          throw new EnrollmentError('invalid_params', error.message, 400);
+        }
+      }
+      const uiAutomation = {
+        enabled,
+        executablePath: normalizedExecutablePath,
+        configurationValid: true,
+      };
+      try {
+        saveConfig(config.configFile, { workbuddy: { uiAutomation } });
+      } catch {
+        throw new EnrollmentError('config_write_failed', 'Could not save the local WorkBuddy settings.', 500);
+      }
+      config.workbuddy = { ...config.workbuddy, uiAutomation };
+
+      // The explicit local click replaces only this adapter. Its close method
+      // releases local reader/helper resources and must not start or stop the
+      // WorkBuddy process. The same authenticated bridge then advertises the
+      // newly measured flags without changing client identity or credentials.
+      const capabilities = await dispatcher.refreshWorkBuddy();
+      const described = updateStatusFromAdapters();
+      status.bridge.capabilities = capabilities;
+      const capabilitiesUpdated = bridge !== null && typeof bridge.updateCapabilities === 'function'
+        ? bridge.updateCapabilities(capabilities)
+        : false;
+      return {
+        uiAutomation: {
+          enabled,
+          executablePathConfigured: typeof normalizedExecutablePath === 'string',
+          configurationValid: true,
+        },
+        workbuddyAvailable: described.workbuddy.available,
+        readOnly: described.workbuddy.readOnly,
+        capabilitiesUpdated,
+      };
+    },
     onEnroll: async ({ code, ownerName: rawOwnerName, relayUrl: rawRelayUrl }) => {
       if (config.bridgeTokenOverridden || config.relayUrlOverridden || args.relay !== undefined) {
         throw new EnrollmentError(
@@ -846,16 +1154,28 @@ async function run(config, args, log) {
     if (!bridgeRequested) {
       log('relay link disabled (--no-bridge): the local UI is up, nothing is connected');
     }
-    return { ui, get bridge() { return bridge; }, clientName };
+    return {
+      ui, get bridge() { return bridge; }, clientName,
+      stopAcceptingRequests: () => dispatcher.stopAccepting(),
+      closeAdapters: () => dispatcher.close(),
+    };
   }
   if (token === null) {
     log('no bridge token configured: the local UI is up, the relay link stays down');
     log('set bridgeToken in the config file, or AI_REMOTE_BRIDGE_TOKEN, or pass --token-file <path>');
-    return { ui, get bridge() { return bridge; }, clientName };
+    return {
+      ui, get bridge() { return bridge; }, clientName,
+      stopAcceptingRequests: () => dispatcher.stopAccepting(),
+      closeAdapters: () => dispatcher.close(),
+    };
   }
 
   await startBridge(token);
-  return { ui, get bridge() { return bridge; }, clientName };
+  return {
+    ui, get bridge() { return bridge; }, clientName,
+    stopAcceptingRequests: () => dispatcher.stopAccepting(),
+    closeAdapters: () => dispatcher.close(),
+  };
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -886,13 +1206,31 @@ async function main(argv = process.argv.slice(2)) {
     return selfCheck(config);
   }
 
+  // The opt-in launcher supplies a private per-run stop credential only to the
+  // bridge process. Validate it before opening listeners so the launcher never
+  // starts a hidden bridge that it cannot later stop after Codex exits.
+  const stopRequestConfig = readRunStopRequestConfig(config.codex?.nativeControl, process.env);
   const running = await run(config, args, log);
-  const shutdown = async () => {
-    log('stopping');
-    await running.bridge?.stop();
-    await running.ui.stop();
-    process.exit(0);
+  let shutdownPromise = null;
+  let stopWatcher = null;
+  const shutdown = () => {
+    if (shutdownPromise !== null) return shutdownPromise;
+    stopWatcher?.close();
+    running.stopAcceptingRequests?.();
+    shutdownPromise = (async () => {
+      log('stopping');
+      try {
+        await running.bridge?.stop();
+        await running.ui.stop();
+        await running.closeAdapters?.();
+        process.exit(0);
+      } catch (error) {
+        log(`graceful shutdown failed: ${safeMessage(error)}`);
+      }
+    })();
+    return shutdownPromise;
   };
+  stopWatcher = createRunStopRequestWatcher(stopRequestConfig, shutdown);
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
   log('running; press Ctrl+C to stop');

@@ -58,20 +58,43 @@ func TestHelloValidatesStableIdentityAndExplicitToolStatus(t *testing.T) {
 	}
 }
 
-func TestHelloPreservesExplicitWorkBuddyReadOnlySendingCapability(t *testing.T) {
-	frame, err := ParseFrame([]byte(`{"type":"hello","version":1,"clientName":"DESKTOP","capabilities":{"tools":["workbuddy"],"session.read":true,"session.send":true,"session.send:workbuddy":false}}`))
+func TestHelloPreservesExplicitPerToolCapabilities(t *testing.T) {
+	frame, err := ParseFrame([]byte(`{"type":"hello","version":1,"clientName":"DESKTOP","capabilities":{"tools":["codex","workbuddy"],"session.read":true,"session.send":true,"session.send:codex":false,"session.send:workbuddy":false,"stop:workbuddy":false,"models.list:workbuddy":false,"session.create:workbuddy":false,"session.send:model:workbuddy":false,"session.answer:workbuddy":false,"session.approve:workbuddy":false}}`))
 	if err != nil || frame.ValidateHello() != nil {
-		t.Fatalf("valid read-only WorkBuddy hello was rejected: %v", err)
+		t.Fatalf("valid hello with per-tool send overrides was rejected: %v", err)
+	}
+	if frame.Capabilities.SendCodex == nil || *frame.Capabilities.SendCodex {
+		t.Fatal("explicit Codex false was lost, enabling the legacy generic send capability")
 	}
 	if frame.Capabilities.SendWorkBuddy == nil || *frame.Capabilities.SendWorkBuddy {
-		t.Fatal("explicit false was lost, enabling the legacy generic send capability")
+		t.Fatal("explicit WorkBuddy false was lost, enabling the legacy generic send capability")
+	}
+	for name, flag := range map[string]*bool{
+		"stop:workbuddy":               frame.Capabilities.StopWorkBuddy,
+		"models.list:workbuddy":        frame.Capabilities.ModelsListWorkBuddy,
+		"session.create:workbuddy":     frame.Capabilities.SessionCreateWorkBuddy,
+		"session.send:model:workbuddy": frame.Capabilities.SendModelWorkBuddy,
+		"session.answer:workbuddy":     frame.Capabilities.AnswerWorkBuddy,
+		"session.approve:workbuddy":    frame.Capabilities.ApproveWorkBuddy,
+	} {
+		if flag == nil || *flag {
+			t.Fatalf("explicit false %s capability was lost", name)
+		}
 	}
 	encoded, err := json.Marshal(frame.Capabilities)
-	if err != nil || !strings.Contains(string(encoded), `"session.send:workbuddy":false`) {
-		t.Fatalf("read-only capability was not preserved: %s, %v", encoded, err)
+	for _, name := range []string{
+		"session.send:codex", "session.send:workbuddy", "stop:workbuddy", "models.list:workbuddy",
+		"session.create:workbuddy", "session.send:model:workbuddy", "session.answer:workbuddy", "session.approve:workbuddy",
+	} {
+		if err != nil || !strings.Contains(string(encoded), `"`+name+`":false`) {
+			t.Fatalf("explicit false per-tool capability %s was not preserved: %s, %v", name, encoded, err)
+		}
 	}
 	legacy, err := ParseFrame([]byte(`{"type":"hello","version":1,"clientName":"DESKTOP","capabilities":{"tools":["codex"]}}`))
-	if err != nil || legacy.Capabilities.SendWorkBuddy != nil {
+	if err != nil || legacy.Capabilities.SendCodex != nil || legacy.Capabilities.SendWorkBuddy != nil ||
+		legacy.Capabilities.StopWorkBuddy != nil || legacy.Capabilities.ModelsListWorkBuddy != nil ||
+		legacy.Capabilities.SessionCreateWorkBuddy != nil || legacy.Capabilities.SendModelWorkBuddy != nil ||
+		legacy.Capabilities.AnswerWorkBuddy != nil || legacy.Capabilities.ApproveWorkBuddy != nil {
 		t.Fatalf("legacy absence should stay absent: %v", err)
 	}
 }

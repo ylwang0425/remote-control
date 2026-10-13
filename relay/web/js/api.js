@@ -26,12 +26,14 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  // The server clamps its own RPC timeouts to at most 60s and defaults to 30s
-  // (protocol-v1 7.3). The client budget sits just above the server's own
-  // ceiling so a hung socket can never leave a request in flight forever --
-  // the poller refuses to stack, so a never-settling request would silently
-  // stop all polling.
+  // Ordinary RPCs keep the server's existing method budgets and this 35s client
+  // guard. A narrowly scoped per-call override may use the server's 60s ceiling
+  // with a longer client guard; other calls keep this default so one slow native
+  // tool cannot stall the poller for unrelated sessions.
   var CLIENT_TIMEOUT_MS = 35000;
+  var MAX_RPC_TIMEOUT_MS = 60000;
+  var MIN_RPC_TIMEOUT_MS = 1000;
+  var MAX_CLIENT_TIMEOUT_MS = 120000;
 
   var PATHS = {
     health: '/health',
@@ -110,7 +112,8 @@
     }
 
     /** Run one request with a client-side abort budget. */
-    function send(path, init) {
+    function send(path, init, requestTimeoutMs) {
+      var effectiveTimeoutMs = typeof requestTimeoutMs === 'number' ? requestTimeoutMs : timeoutMs;
       var controller = typeof AbortController === 'function' ? new AbortController() : null;
       var timer = null;
       var aborted = false;
@@ -142,7 +145,7 @@
         timer = setTimeoutImpl(function () {
           aborted = true;
           controller.abort();
-        }, timeoutMs);
+        }, effectiveTimeoutMs);
       }
       return promise.then(function (out) {
         if (timer !== null) {
@@ -152,7 +155,7 @@
       });
     }
 
-    function postJson(path, body) {
+    function postJson(path, body, requestTimeoutMs) {
       return send(path, {
         method: 'POST',
         headers: JSON_HEADERS,
@@ -160,7 +163,45 @@
         // the intent explicit and keeps working behind a rewrite (protocol-v1 5.2).
         credentials: 'include',
         body: JSON.stringify(body === undefined ? {} : body)
-      });
+      }, requestTimeoutMs);
+    }
+
+    /** Validate per-call budgets; timeoutMs stays at the HTTP envelope level. */
+    function normalizeRpcOptions(options) {
+      if (options === undefined) return { ok: true, value: {} };
+      if (!options || typeof options !== 'object' || Array.isArray(options)) {
+        return { ok: false, message: 'RPC options must be an object containing only timeoutMs and clientTimeoutMs' };
+      }
+      var keys = Object.keys(options);
+      if (keys.some(function (key) { return key !== 'timeoutMs' && key !== 'clientTimeoutMs'; })) {
+        return { ok: false, message: 'RPC options may contain only timeoutMs and clientTimeoutMs' };
+      }
+      var value = {};
+      if (Object.prototype.hasOwnProperty.call(options, 'timeoutMs')) {
+        if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < MIN_RPC_TIMEOUT_MS || options.timeoutMs > MAX_RPC_TIMEOUT_MS) {
+          return { ok: false, message: 'timeoutMs must be an integer between 1000 and 60000' };
+        }
+        value.timeoutMs = options.timeoutMs;
+      }
+      if (Object.prototype.hasOwnProperty.call(options, 'clientTimeoutMs')) {
+        if (!Number.isInteger(options.clientTimeoutMs) || options.clientTimeoutMs < MIN_RPC_TIMEOUT_MS || options.clientTimeoutMs > MAX_CLIENT_TIMEOUT_MS) {
+          return { ok: false, message: 'clientTimeoutMs must be an integer between 1000 and 120000' };
+        }
+        value.clientTimeoutMs = options.clientTimeoutMs;
+      }
+      if (value.timeoutMs !== undefined) {
+        if (value.clientTimeoutMs !== undefined && value.clientTimeoutMs <= value.timeoutMs) {
+          return { ok: false, message: 'clientTimeoutMs must be greater than timeoutMs' };
+        }
+        if (value.clientTimeoutMs === undefined && value.timeoutMs >= timeoutMs) {
+          return { ok: false, message: 'clientTimeoutMs must exceed timeoutMs when the request timeout reaches the client default' };
+        }
+      }
+      return { ok: true, value: value };
+    }
+
+    function invalidRpcOptions(message) {
+      return Promise.resolve({ ok: false, code: null, message: message, status: null });
     }
 
     return {
@@ -174,9 +215,14 @@
       pair: function (code, deviceName) {
         return postJson(PATHS.pair, { code: code, deviceName: deviceName });
       },
-      // protocol-v1 7.3: exactly {method, params}.
-      rpc: function (body) {
-        return postJson(PATHS.rpc, { method: body.method, params: body.params || {} });
+      // protocol-v1 7.3: {method, params} plus an optional top-level timeoutMs.
+      // clientTimeoutMs is local-only and never crosses the wire.
+      rpc: function (body, rpcOptions) {
+        var normalized = normalizeRpcOptions(rpcOptions);
+        if (!normalized.ok) return invalidRpcOptions(normalized.message);
+        var requestBody = { method: body.method, params: body.params || {} };
+        if (normalized.value.timeoutMs !== undefined) requestBody.timeoutMs = normalized.value.timeoutMs;
+        return postJson(PATHS.rpc, requestBody, normalized.value.clientTimeoutMs);
       },
       adminLogin: function (username, password) {
         return postJson(PATHS.adminLogin, { username: username, password: password });
@@ -187,12 +233,16 @@
       adminComputers: function () {
         return postJson(PATHS.adminComputers, {});
       },
-      adminRpc: function (clientId, body) {
-        return postJson(PATHS.adminRpc, {
+      adminRpc: function (clientId, body, rpcOptions) {
+        var normalized = normalizeRpcOptions(rpcOptions);
+        if (!normalized.ok) return invalidRpcOptions(normalized.message);
+        var requestBody = {
           clientId: clientId,
           method: body.method,
           params: body.params || {}
-        });
+        };
+        if (normalized.value.timeoutMs !== undefined) requestBody.timeoutMs = normalized.value.timeoutMs;
+        return postJson(PATHS.adminRpc, requestBody, normalized.value.clientTimeoutMs);
       },
       adminEnrollmentCodes: function () {
         return postJson(PATHS.adminEnrollmentCodes, {});

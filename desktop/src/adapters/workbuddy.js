@@ -6,34 +6,106 @@
  * The native app keeps searchable session metadata in workbuddy.db and the
  * canonical transcript in projects/<native cwd key>/<session id>.jsonl. The
  * bridge opens the database explicitly read-only and never uses WorkBuddy's
- * account/runtime owner-bucket fallback. This adapter has no write, model,
- * question, approval, or stop operation.
+ * account/runtime owner-bucket fallback. Standard UI Automation is used for
+ * the verified current-model read and native create/send operations; stop,
+ * question, and approval actions remain unsupported.
  */
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { TextDecoder } = require('node:util');
 
 const { BridgeError } = require('../errors');
 const { isSessionId, MAX_MESSAGES, toRfc3339 } = require('../protocol');
+const { createWindowsUiaInspector } = require('../workbuddy-native/windows-uia');
+const { WorkBuddyNativeWriter } = require('../workbuddy-native/writer');
+const { WorkBuddyPendingService } = require('../workbuddy-native/pending-service');
 
 const MAX_LIST = 200;
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
 const MAX_LINE_BYTES = 512 * 1024;
 const MAX_HISTORY_RECORDS = 5000;
 const MAX_TEXT_CHARS = 65536;
+const MAX_NATIVE_IDENTITY_CANDIDATES = 64;
+const MAX_NATIVE_TASK_TITLES = 200;
+const MAX_NATIVE_SESSION_IDS = 20000;
+const NATIVE_CREATE_CONFIRM_MS = 8000;
+const EMPTY_DRAFT_FINGERPRINT = 'e3b0c44298fc1c14';
+const GLOBAL_NON_CHAT_TABS = new Map([
+  ['技能', 'skills'], ['专家·技能·连接器', 'skills'], ['skills', 'skills'], ['experts · skills · connectors', 'skills'],
+  ['项目', 'projects'], ['projects', 'projects'], ['project', 'projects'],
+]);
 const WORKBUDDY_DB_UNAVAILABLE = '无法只读打开 WorkBuddy 本地历史数据库；请确认此 Windows 用户已安装并运行过 WorkBuddy。';
 const HISTORY_UNAVAILABLE = '此 WorkBuddy 会话的本地历史记录暂不可用。';
 
 const REQUIRED_SESSION_COLUMNS = ['id', 'cwd', 'title', 'custom_title', 'created_at', 'updated_at', 'last_activity_at', 'deleted_at', 'transport'];
 const SAFE_MESSAGE_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const SAFE_SESSION_FILE_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
+const SAFE_MODEL_LABEL = /^[^\u0000-\u001f\u007f]{1,180}$/u;
+
+function normalizeModelName(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  const match = /^(?:select\s+model\s*:\s*|选择模型：?\s*)/iu.exec(text);
+  return (match ? text.slice(match[0].length) : text).trim();
+}
+
+function nativeDraftFingerprint(value) {
+  const normalized = String(value).replace(/^\uFEFF/u, '').trim();
+  return crypto.createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, 16);
+}
+
+function uniqueModelOptions(controls) {
+  const labels = [];
+  const seen = new Set();
+  for (const control of controls) {
+    const label = typeof control?.accessibleName === 'string' ? control.accessibleName.trim() : '';
+    if (!SAFE_MODEL_LABEL.test(label) || redactSensitiveText(label) !== label || seen.has(label)) return [];
+    seen.add(label);
+    labels.push(label);
+  }
+  return labels;
+}
 
 function sessionTitle(row) {
   const value = typeof row.custom_title === 'string' && row.custom_title.trim()
     ? row.custom_title : typeof row.title === 'string' && row.title.trim() ? row.title : row.id;
   return redactSensitiveText(value).replace(/[\r\n\p{Cc}]/gu, ' ').trim().slice(0, 200) || row.id;
+}
+
+function nativeIdentityTitle(row) {
+  if (!row || typeof row !== 'object') return null;
+  const custom = typeof row.custom_title === 'string' ? row.custom_title.trim() : '';
+  const ordinary = typeof row.title === 'string' ? row.title.trim() : '';
+  const title = custom || ordinary;
+  if (!title || title.length > 180 || /[\r\n\p{Cc}]/u.test(title) || redactSensitiveText(title) !== title) return null;
+  return title;
+}
+
+function nativeHistoryAnchors(session) {
+  if (!session || session.historyTruncated === true || !Array.isArray(session.messages)) return null;
+  const messages = session.messages.filter((message) => message && ['user', 'assistant'].includes(message.role) &&
+    typeof message.text === 'string' && message.text.trim() &&
+    // WorkBuddy replaces these native cancellation records with its own stop
+    // widget. Their archive text is not a visible chat identity anchor.
+    !(message.role === 'assistant' && ['[User Cancelled]', 'Interrupted by user'].includes(message.text.trim())));
+  // A complete, truly empty native session is a known non-match when the
+  // WorkBuddy UI is already showing another same-title conversation. A missing
+  // file/corrupt tail is different: readSession throws or marks it truncated.
+  if (messages.length === 0) return [];
+  if (!messages.some((message) => message.role === 'user')) return null;
+  const anchors = [];
+  for (const message of messages.slice(-2)) {
+    const raw = message.text.replace(/[\r\n\p{Z}\p{Cc}]+/gu, ' ').trim();
+    if (!raw || redactSensitiveText(raw) !== raw) return null;
+    const points = [...raw];
+    const anchor = points.slice(-100).join('');
+    if (anchor.length < 2 || anchor.length > 120 || anchors.includes(anchor)) return null;
+    anchors.push(anchor);
+  }
+  return anchors.length ? anchors : null;
 }
 
 function nativeConfigDir(options = {}) {
@@ -295,16 +367,50 @@ function historyPath(configDir, row) {
 }
 
 class WorkBuddyAdapter {
-  constructor({ db, configDir, columns }) {
+  constructor({ db, configDir, columns, uiAutomation = {} }) {
     this.db = db;
     this.configDir = configDir;
     this.columns = new Set(columns);
+    this.uiAutomationEnabled = uiAutomation.enabled === true;
+    this.workbuddyExecutablePath = uiAutomation.executablePath ?? '';
+    this.nativeWriter = new WorkBuddyNativeWriter();
+    this.lifecycleOperations = new Set();
+    this.uiAutomationInspector = this.uiAutomationEnabled
+      ? createWindowsUiaInspector({ timeoutMs: 15000 })
+      : null;
+    this.lastNativeObservation = null;
+    this.pendingService = this.uiAutomationEnabled ? new WorkBuddyPendingService({
+      executablePath: this.workbuddyExecutablePath,
+      load: (sessionId) => this.readSession(sessionId, { includeSource: true }),
+      readContext: (sessionId, hooks, analysis) => this.readNativePendingContext(sessionId, hooks, analysis),
+      execute: (sessionId, plan, context, hooks) => this.uiAutomationInspector.executeNativePendingAction({
+        expectedExePath: this.workbuddyExecutablePath, expectedProcessId: context.target.processId,
+        expectedHandle: context.target.handle, maxControls: 160, identityTitle: context.identity.title,
+        anchorCandidates: context.identity.anchorCandidates, expectedCandidateIndex: context.identity.expectedCandidateIndex,
+        nativePlan: plan,
+      }, hooks),
+    }) : null;
+    this.closePromise = null;
     this.listStatement = db.prepare(`SELECT id, cwd, title, custom_title, created_at, updated_at, last_activity_at, deleted_at, transport FROM sessions WHERE transport = 'local' AND deleted_at IS NULL ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC LIMIT ?`);
     this.readStatement = db.prepare(`SELECT id, cwd, title, custom_title, created_at, updated_at, last_activity_at, deleted_at, transport FROM sessions WHERE id = ? AND transport = 'local' AND deleted_at IS NULL LIMIT 1`);
+    this.identityTitleCountStatement = db.prepare(`SELECT COUNT(*) AS count FROM sessions WHERE transport = 'local' AND deleted_at IS NULL AND COALESCE(NULLIF(TRIM(custom_title), ''), NULLIF(TRIM(title), ''), id) = ?`);
+    this.identityCandidatesStatement = db.prepare(`SELECT id, cwd, title, custom_title, created_at, updated_at, last_activity_at, deleted_at, transport FROM sessions WHERE transport = 'local' AND deleted_at IS NULL AND COALESCE(NULLIF(TRIM(custom_title), ''), NULLIF(TRIM(title), ''), id) = ? ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, id LIMIT ?`);
+    this.nativeTitleCountStatement = db.prepare(`SELECT COUNT(*) AS count FROM sessions WHERE transport = 'local' AND deleted_at IS NULL`);
+    this.nativeTitleRowsStatement = db.prepare(`SELECT id, title, custom_title, cwd, created_at, updated_at, last_activity_at, deleted_at, transport FROM sessions WHERE transport = 'local' AND deleted_at IS NULL ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, id LIMIT ?`);
+    this.nativeSessionIdsStatement = db.prepare(`SELECT id FROM sessions WHERE transport = 'local' AND deleted_at IS NULL LIMIT ?`);
   }
 
   static open(options = {}) {
     const configDir = typeof options.configDir === 'string' && options.configDir.trim() ? options.configDir : nativeConfigDir();
+    const uiAutomation = options.uiAutomation ?? {};
+    if (uiAutomation === null || typeof uiAutomation !== 'object' || Array.isArray(uiAutomation) ||
+        (uiAutomation.enabled !== undefined && typeof uiAutomation.enabled !== 'boolean')) {
+      throw new Error('WorkBuddy UI Automation configuration is invalid');
+    }
+    if (uiAutomation.enabled === true && (process.platform !== 'win32' || typeof uiAutomation.executablePath !== 'string' ||
+        !path.win32.isAbsolute(uiAutomation.executablePath) || path.win32.basename(uiAutomation.executablePath).toLowerCase() !== 'workbuddy.exe')) {
+      throw new Error('WorkBuddy native control requires an enabled Windows configuration with an exact WorkBuddy.exe path');
+    }
     const databasePath = path.join(configDir, 'workbuddy.db');
     try {
       const stat = fs.lstatSync(databasePath);
@@ -314,7 +420,7 @@ class WorkBuddyAdapter {
       try {
         const columns = db.prepare('PRAGMA table_info("sessions")').all().map((row) => row.name);
         if (!REQUIRED_SESSION_COLUMNS.every((column) => columns.includes(column))) throw new Error('unsupported WorkBuddy history schema');
-        return new WorkBuddyAdapter({ db, configDir, columns });
+        return new WorkBuddyAdapter({ db, configDir, columns, uiAutomation });
       } catch (error) {
         db.close();
         throw error;
@@ -324,12 +430,582 @@ class WorkBuddyAdapter {
     }
   }
 
-  availableTools() { return ['local-history-read']; }
-  canStop() { return false; }
-  canSendWithModel() { return false; }
-  canAnswer() { return false; }
-  canApprove() { return false; }
-  close() { this.db.close(); }
+  availableTools() { return this.uiAutomationEnabled ? ['local-history-read', 'native-ui-automation'] : ['local-history-read']; }
+  canModelsList() { return this.uiAutomationEnabled; }
+  canCreate() { return this.uiAutomationEnabled; }
+  canSend() { return this.uiAutomationEnabled; }
+  canStop() { return this.uiAutomationEnabled && this.pendingService != null && typeof this.uiAutomationInspector?.executeNativePendingAction === 'function'; }
+  canSendWithModel() { return this.uiAutomationEnabled && typeof this.uiAutomationInspector?.selectNativeModel === 'function'; }
+  canAnswer() { return this.canStop(); }
+  canApprove() { return this.canStop(); }
+  describe() {
+    return {
+      uiAutomation: {
+        enabled: this.uiAutomationEnabled,
+        ready: false,
+        needsUnlockedDesktop: true,
+        target: this.lastNativeObservation,
+        capabilities: {
+          modelsList: this.canModelsList(), create: this.canCreate(), send: this.canSend(),
+          stop: this.canStop(), sendWithModel: this.canSendWithModel(), answer: this.canAnswer(), approve: this.canApprove(),
+        },
+      },
+    };
+  }
+
+  close() {
+    if (this.closePromise !== null) return this.closePromise;
+    this.pendingService?.retire();
+    const drained = this.nativeWriter.close();
+    if (this.nativeWriter.inFlight === 0 && this.lifecycleOperations.size === 0) {
+      // Preserve the adapter's synchronous close behavior when no native or
+      // create lifecycle operation can still touch the read-only DB. Test and
+      // fixture cleanup can then remove the database immediately after close.
+      this.db.close();
+      this.closePromise = drained;
+    } else {
+      const lifecycle = Promise.all([...this.lifecycleOperations]);
+      this.closePromise = Promise.all([drained, lifecycle]).then(() => this.db.close());
+    }
+    return this.closePromise;
+  }
+
+  async discoverNativeWindow(hooks) {
+    if (!this.uiAutomationEnabled || this.uiAutomationInspector === null) {
+      throw new BridgeError('not_capable', 'WorkBuddy native UI Automation is not enabled');
+    }
+    hooks?.checkActive?.();
+    const discovery = await this.uiAutomationInspector.discoverMainWindows({ expectedExePath: this.workbuddyExecutablePath }, hooks);
+    if (discovery.inputDesktopKind !== 'default') {
+      throw new BridgeError('not_capable', 'WorkBuddy native UI Automation needs the unlocked default Windows desktop');
+    }
+    const eligible = discovery.windows.filter((window) => window.visible && window.enabled && window.mainWindow);
+    const foreground = eligible.filter((window) => window.isForeground);
+    const candidates = foreground.length === 1
+      ? foreground
+      : eligible;
+    if (candidates.length !== 1) {
+      throw new BridgeError('not_capable', 'WorkBuddy must have one unambiguous visible main window for native UI Automation');
+    }
+    const target = candidates[0];
+    this.lastNativeObservation = {
+      processId: target.processId, handle: target.handle, visible: target.visible, enabled: target.enabled,
+      minimized: target.minimized, isForeground: target.isForeground, observedAt: new Date().toISOString(),
+    };
+    return target;
+  }
+
+  async freshNativeSnapshot(target, { activate = false, knownConversationTitles } = {}, hooks) {
+    if (!this.uiAutomationEnabled || this.uiAutomationInspector === null || !target) {
+      throw new BridgeError('not_capable', 'WorkBuddy native UI Automation target is unavailable');
+    }
+    const options = {
+      expectedExePath: this.workbuddyExecutablePath,
+      expectedProcessId: target.processId,
+      expectedHandle: target.handle,
+      maxControls: 160,
+    };
+    activate = activate || target.minimized === true;
+    hooks?.checkActive?.();
+    const snapshot = activate
+      ? await this.uiAutomationInspector.activateSemanticSnapshot({ ...options,
+        ...(knownConversationTitles !== undefined ? { knownConversationTitles } : {}) }, hooks)
+      : await this.uiAutomationInspector.semanticSnapshot({ ...options,
+        ...(knownConversationTitles !== undefined ? { knownConversationTitles } : {}) }, hooks);
+    this.lastNativeObservation = {
+      processId: snapshot.target.processId, handle: snapshot.target.handle, visible: snapshot.target.visible,
+      enabled: snapshot.target.enabled, minimized: snapshot.target.minimized, isForeground: snapshot.target.isForeground,
+      inputDesktopKind: snapshot.inputDesktopKind, observedAt: new Date().toISOString(),
+    };
+    return snapshot;
+  }
+
+  findUniqueNativeControl(snapshot, safeActionLabel) {
+    const controls = snapshot.controls.filter((control) => control.safeActionLabel === safeActionLabel &&
+      !control.offscreen && !control.passwordProtected && control.runtimeIdHash !== '' && control.regionHash !== '');
+    if (controls.length !== 1) {
+      throw new BridgeError('not_capable', 'WorkBuddy did not expose one fresh matching native control');
+    }
+    return controls[0];
+  }
+
+  nativeConversationIdentityCandidates(sessionId) {
+    if (typeof sessionId !== 'string' || !SAFE_SESSION_FILE_ID.test(sessionId)) {
+      throw new BridgeError('invalid_params', 'invalid WorkBuddy session id');
+    }
+    const targetRow = this.readStatement.get(sessionId);
+    if (!targetRow) throw new BridgeError('session_not_found', 'WorkBuddy local session not found');
+    const title = nativeIdentityTitle(targetRow);
+    if (!title) throw new BridgeError('not_capable', 'WorkBuddy cannot safely identify a session without a complete native title');
+    const count = Number(this.identityTitleCountStatement.get(title)?.count);
+    if (!Number.isInteger(count) || count < 1 || count > MAX_NATIVE_IDENTITY_CANDIDATES) {
+      throw new BridgeError('not_capable', 'WorkBuddy has too many same-title conversations to bind safely');
+    }
+    const rows = this.identityCandidatesStatement.all(title, MAX_NATIVE_IDENTITY_CANDIDATES + 1);
+    if (!Array.isArray(rows) || rows.length !== count || rows.length > MAX_NATIVE_IDENTITY_CANDIDATES) {
+      throw new BridgeError('not_capable', 'WorkBuddy same-title conversation candidates changed during identity lookup');
+    }
+    const anchorCandidates = [];
+    let expectedCandidateIndex = -1;
+    for (const row of rows) {
+      if (!row || typeof row.id !== 'string' || !SAFE_SESSION_FILE_ID.test(row.id) || row.transport !== 'local' || row.deleted_at !== null ||
+          nativeIdentityTitle(row) !== title) {
+        throw new BridgeError('not_capable', 'WorkBuddy same-title conversation metadata is incomplete');
+      }
+      const session = this.readSession(row.id);
+      const anchors = nativeHistoryAnchors(session);
+      if (!anchors) throw new BridgeError('not_capable', 'WorkBuddy same-title conversation history is incomplete; native binding was refused');
+      if (row.id === sessionId) expectedCandidateIndex = anchorCandidates.length;
+      anchorCandidates.push(anchors);
+    }
+    if (expectedCandidateIndex < 0) throw new BridgeError('not_capable', 'WorkBuddy target session disappeared during identity lookup');
+    return { title, anchorCandidates, expectedCandidateIndex };
+  }
+
+  async verifyNativeConversationIdentity(sessionId, target) {
+    if (!this.uiAutomationEnabled || this.uiAutomationInspector === null || !target) {
+      throw new BridgeError('not_capable', 'WorkBuddy native UI Automation target is unavailable');
+    }
+    const expected = this.nativeConversationIdentityCandidates(sessionId);
+    const observed = await this.uiAutomationInspector.inspectConversationIdentity({
+      expectedExePath: this.workbuddyExecutablePath,
+      expectedProcessId: target.processId,
+      expectedHandle: target.handle,
+      identityTitle: expected.title,
+      anchorCandidates: expected.anchorCandidates,
+    });
+    const proof = observed.identityProof;
+    if (!proof || proof.conversationHeaderMatches !== 1 ||
+        proof.candidateCount !== expected.anchorCandidates.length || proof.matchedCandidateIndex !== expected.expectedCandidateIndex) {
+      throw new BridgeError('not_capable', 'WorkBuddy current native conversation could not be uniquely matched to this local session');
+    }
+    return expected;
+  }
+
+  async newTaskFrame(target, knownConversationTitles, hooks, { requireVerifiedIntent = false } = {}) {
+    const snapshot = await this.freshNativeSnapshot(target, { knownConversationTitles }, hooks);
+    this.assertNativeTargetSnapshot(snapshot, target);
+    const tabs = snapshot.controls.filter((control) => control.safeActionLabel === 'new-task-tab' &&
+      control.controlType === 'ControlType.TabItem' && !control.offscreen && !control.passwordProtected &&
+      control.runtimeIdHash !== '' && control.regionHash !== '');
+    if (tabs.length !== 1) throw new BridgeError('not_capable', 'WorkBuddy does not expose one fresh New Task tab');
+    let frame = null;
+    if (snapshot.uiaCom.composerBindingSucceeded) {
+      frame = this.assertNativeSnapshot(snapshot, target);
+      if (frame.composer.draftState !== 'empty' || frame.composer.draftFingerprint !== EMPTY_DRAFT_FINGERPRINT || frame.send.enabled) {
+        throw new BridgeError('not_capable', 'WorkBuddy new chat was refused because the native composer is not empty');
+      }
+    } else if (!this.isVerifiedGlobalNonChatPage(snapshot)) {
+      throw new BridgeError('not_capable', 'WorkBuddy cannot verify an empty composer or a Skills/Projects page before New Task navigation');
+    }
+    if (requireVerifiedIntent && snapshot.newTaskPageProof?.verified !== true) {
+      throw new BridgeError('not_capable', 'WorkBuddy could not positively verify the blank New Task page and its native composer region');
+    }
+    return { snapshot, frame, tab: tabs[0], knownConversationTitles };
+  }
+
+  isVerifiedGlobalNonChatPage(snapshot) {
+    const status = snapshot?.uiaCom;
+    if (!status || status.composerBindingSucceeded !== false || status.composerModelCandidates !== 0 || status.composerSendCandidates !== 0 ||
+        snapshot.newTaskPageProof?.snapshotComplete !== true || snapshot.newTaskPageProof.selectedConversationTabMatches !== 0 ||
+        snapshot.newTaskPageProof.conversationHeaderMatches !== 0 || !Array.isArray(snapshot.controls)) return false;
+    if (snapshot.controls.some((control) => ['composer', 'model-selector', 'send-label'].includes(control.safeActionLabel))) return false;
+    const selectedCategories = snapshot.controls.filter((control) => control.controlType === 'ControlType.TabItem' && control.selected)
+      .map((control) => typeof control.accessibleName === 'string' ? control.accessibleName.trim().toLowerCase() : '')
+      .map((name) => GLOBAL_NON_CHAT_TABS.get(name)).filter(Boolean);
+    return selectedCategories.length > 0 && new Set(selectedCategories).size === 1;
+  }
+
+  async selectNewTaskPage(target, knownConversationTitles, hooks) {
+    if (typeof this.uiAutomationInspector.navigateNewTask === 'function') {
+      const snapshot = await this.uiAutomationInspector.navigateNewTask({
+        expectedExePath: this.workbuddyExecutablePath, expectedProcessId: target.processId,
+        expectedHandle: target.handle, maxControls: 160, knownConversationTitles,
+      }, hooks);
+      this.assertNativeTargetSnapshot(snapshot, target);
+      const frame = this.assertNativeSnapshot(snapshot, target);
+      if (snapshot.newTaskPageProof?.verified !== true || frame.composer.draftState !== 'empty' ||
+          frame.composer.draftFingerprint !== EMPTY_DRAFT_FINGERPRINT || frame.send.enabled) {
+        throw new BridgeError('not_capable', 'WorkBuddy did not verify an empty native New Task page; no message was written');
+      }
+      return { snapshot, frame, tab: this.findUniqueNativeControl(snapshot, 'new-task-tab'), knownConversationTitles };
+    }
+    let state = await this.newTaskFrame(target, knownConversationTitles, hooks);
+    if (state.tab.selected) {
+      if (state.snapshot.newTaskPageProof?.verified !== true) {
+        throw new BridgeError('not_capable', 'WorkBuddy could not positively verify the blank New Task page and its native composer region');
+      }
+    } else {
+      const selected = await this.executeNativeControl(target, state.tab, 'select', { knownConversationTitles }, hooks);
+      if (!selected.actionResult.submitted) {
+        const uncertain = selected.actionResult.attempted;
+        throw new BridgeError(uncertain ? 'bridge_error' : 'not_capable', uncertain
+          ? 'WorkBuddy New Task selection outcome is unknown; refresh the native window before another action'
+          : 'WorkBuddy could not select the exact New Task tab');
+      }
+      state = await this.newTaskFrame(target, knownConversationTitles, hooks, { requireVerifiedIntent: true });
+    }
+    if (state.tab.selected !== true) throw new BridgeError('not_capable', 'WorkBuddy New Task tab is not selected');
+    return state;
+  }
+
+  async submitNativeText(target, composer, text, { identity = null, newTaskTitles = null } = {}, hooks) {
+    const expectedDraftFingerprint = EMPTY_DRAFT_FINGERPRINT;
+    const setValueExtra = {
+      expectedDraftFingerprint,
+      payload: text,
+      ...(identity ? { identityTitle: identity.title, anchorCandidates: identity.anchorCandidates,
+        expectedCandidateIndex: identity.expectedCandidateIndex } :
+        { requireNewTaskIntent: true, knownConversationTitles: newTaskTitles }),
+    };
+    const filled = typeof this.uiAutomationInspector.typeNativeComposer === 'function'
+      ? await this.uiAutomationInspector.typeNativeComposer({ expectedExePath: this.workbuddyExecutablePath,
+        expectedProcessId: target.processId, expectedHandle: target.handle, maxControls: 160, ...setValueExtra }, hooks)
+      : await this.executeNativeControl(target, composer, 'set-value', setValueExtra, hooks);
+    if (!filled.actionResult.submitted) {
+      const uncertain = filled.actionResult.attempted;
+      throw new BridgeError(uncertain ? 'bridge_error' : 'not_capable', uncertain
+        ? 'WorkBuddy composer write outcome is unknown; refresh the native chat before another action'
+        : 'WorkBuddy editor, model menu, or focus was unavailable; no message was typed');
+    }
+
+    hooks?.checkActive?.();
+    const after = await this.freshNativeSnapshot(target, {}, hooks);
+    const frame = this.assertNativeSnapshot(after, target);
+    if (frame.composer.draftState !== 'non-empty' || frame.composer.draftFingerprint !== nativeDraftFingerprint(text) ||
+        !frame.send.enabled) {
+      throw new BridgeError('bridge_error', 'WorkBuddy native composer did not confirm the exact submitted draft; refresh before another action');
+    }
+    const sendExtra = {
+      expectedDraftFingerprint: frame.composer.draftFingerprint,
+      ...(identity ? { identityTitle: identity.title, anchorCandidates: identity.anchorCandidates,
+        expectedCandidateIndex: identity.expectedCandidateIndex } :
+        { requireNewTaskIntent: true, knownConversationTitles: newTaskTitles }),
+    };
+    const submitted = await this.executeNativeControl(target, frame.send, 'invoke', sendExtra, hooks);
+    return { receipt: submitted, draftFingerprint: frame.composer.draftFingerprint };
+  }
+
+  async waitForCreatedNativeSession(previousIds, text, hooks) {
+    const deadline = Date.now() + NATIVE_CREATE_CONFIRM_MS;
+    for (;;) {
+      hooks?.checkActive?.();
+      const ids = this.readNativeSessionIds();
+      const matching = [];
+      for (const id of ids) {
+        hooks?.checkActive?.();
+        if (previousIds.has(id)) continue;
+        let session;
+        try { session = this.readSession(id); }
+        catch (error) {
+          if (error?.code === 'session_gone' || error?.code === 'session_not_found') continue;
+          throw error;
+        }
+        const userMessages = session.messages.filter((message) => message.role === 'user');
+        if (!session.historyTruncated && userMessages.length === 1 && userMessages[0].text === text) {
+          const row = this.readStatement.get(id);
+          if (row && row.transport === 'local' && row.deleted_at === null) matching.push({ id, row });
+        }
+      }
+      if (matching.length === 1) {
+        hooks?.checkActive?.();
+        const { id, row } = matching[0];
+        return { sessionId: id, title: sessionTitle(row) };
+      }
+      if (matching.length > 1) {
+        hooks?.checkActive?.();
+        throw new BridgeError('session_create_failed', 'WorkBuddy persisted more than one matching new chat; inspect the session list before retrying');
+      }
+      const remaining = Math.min(deadline - Date.now(), hooks?.remainingBudgetMs?.() ?? NATIVE_CREATE_CONFIRM_MS);
+      if (remaining <= 0) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(150, remaining)));
+    }
+    hooks?.checkActive?.();
+    throw new BridgeError('session_create_failed', 'WorkBuddy native send may have created a chat, but no exact new UUID and first message could be verified; inspect the session list before retrying');
+  }
+
+  async createSession(input, hooks = {}, workbuddyHooks) {
+    if (!this.canCreate()) throw new BridgeError('not_capable', 'WorkBuddy native session creation is not enabled');
+    if (!input || typeof input !== 'object' || typeof input.text !== 'string' || input.text.trim().length === 0 ||
+        [...input.text].length > MAX_TEXT_CHARS || typeof input.model !== 'string' || !SAFE_MODEL_LABEL.test(input.model)) {
+      throw new BridgeError('invalid_params', 'a WorkBuddy new chat needs a model and a non-empty first message');
+    }
+    if ((typeof input.projectId === 'string' && input.projectId.length > 0) ||
+        (typeof input.cwd === 'string' && input.cwd.length > 0)) {
+      throw new BridgeError('not_capable', 'WorkBuddy has no verified project picker in the current native UI; choose its desktop workspace first');
+    }
+    if ((typeof input.reasoningEffort === 'string' && input.reasoningEffort.length > 0) ||
+        (typeof input.provider === 'string' && input.provider.length > 0)) {
+      throw new BridgeError('not_capable', 'WorkBuddy does not expose a verified provider or reasoning-effort selector');
+    }
+    if (this.nativeWriter.retired) throw new BridgeError('not_capable', 'WorkBuddy native control is closed');
+    let resolveLifecycle;
+    const lifecycleOperation = new Promise((resolve) => { resolveLifecycle = resolve; });
+    this.lifecycleOperations.add(lifecycleOperation);
+    try {
+    workbuddyHooks?.checkActive?.();
+    const preSend = await this.nativeWriter.run(async (nativeHooks) => {
+      const knownConversationTitles = this.readNativeTaskTitles();
+      const previousIds = this.readNativeSessionIds();
+      const target = await this.discoverNativeWindow(nativeHooks);
+      const page = await this.selectNewTaskPage(target, knownConversationTitles, nativeHooks);
+      if (page.frame.currentModel !== input.model) {
+        await this.selectNativeModel(target, input.model, { knownConversationTitles }, nativeHooks);
+      }
+      const result = await this.submitNativeText(target, page.frame.composer, input.text,
+        { newTaskTitles: knownConversationTitles }, nativeHooks);
+      if (!result.receipt.actionResult.submitted) {
+        if (result.receipt.actionResult.attempted) {
+          return { previousIds, sendMayHaveOccurred: true };
+        }
+        throw new BridgeError('not_capable', 'WorkBuddy did not accept the exact native Send pattern');
+      }
+      return { previousIds, sendMayHaveOccurred: true };
+    }, workbuddyHooks);
+
+    const created = await this.waitForCreatedNativeSession(preSend.previousIds, input.text, workbuddyHooks);
+    workbuddyHooks?.checkActive?.();
+    if (typeof hooks.onCreated === 'function') hooks.onCreated({ sessionId: created.sessionId });
+    workbuddyHooks?.checkActive?.();
+    return created;
+    } finally {
+      resolveLifecycle();
+      this.lifecycleOperations.delete(lifecycleOperation);
+    }
+  }
+
+  async sendMessage(sessionId, text, options = {}, hooks) {
+    if (!this.canSend()) throw new BridgeError('not_capable', 'WorkBuddy native sending is not enabled');
+    if (typeof sessionId !== 'string' || !SAFE_SESSION_FILE_ID.test(sessionId) || typeof text !== 'string' ||
+        text.trim().length === 0 || [...text].length > MAX_TEXT_CHARS) {
+      throw new BridgeError('invalid_params', 'a WorkBuddy native message needs a session id and non-empty text');
+    }
+    if (options.model !== undefined && (typeof options.model !== 'string' || !SAFE_MODEL_LABEL.test(options.model))) {
+      throw new BridgeError('invalid_params', 'invalid WorkBuddy model');
+    }
+    if (typeof options.provider === 'string' && options.provider.length > 0 ||
+        typeof options.reasoningEffort === 'string' && options.reasoningEffort.length > 0) {
+      throw new BridgeError('not_capable', 'WorkBuddy does not expose a verified provider or reasoning-effort selector');
+    }
+    return this.nativeWriter.run(async (nativeHooks) => {
+      const identity = this.nativeConversationIdentityCandidates(sessionId);
+      const target = await this.discoverNativeWindow(nativeHooks);
+      const route = await this.uiAutomationInspector.navigateConversation({
+        expectedExePath: this.workbuddyExecutablePath,
+        expectedProcessId: target.processId,
+        expectedHandle: target.handle,
+        sessionId,
+        identityTitle: identity.title,
+        anchorCandidates: identity.anchorCandidates,
+        expectedCandidateIndex: identity.expectedCandidateIndex,
+      }, nativeHooks);
+      if (route.outcome !== 'confirmed') {
+        throw new BridgeError(route.outcome === 'submitted' ? 'bridge_error' : 'not_capable',
+          route.outcome === 'submitted'
+            ? 'WorkBuddy destination page could not be confirmed after native navigation; refresh before another action'
+            : 'WorkBuddy could not prove the requested native conversation before navigation');
+      }
+      const snapshot = await this.freshNativeSnapshot(target, {}, nativeHooks);
+      let frame = this.assertNativeSnapshot(snapshot, target);
+      if (frame.composer.draftState !== 'empty' || frame.composer.draftFingerprint !== EMPTY_DRAFT_FINGERPRINT || frame.send.enabled) {
+        throw new BridgeError('not_capable', 'WorkBuddy send was refused because the verified conversation has a user draft');
+      }
+      if (options.model && options.model !== frame.currentModel) {
+        await this.selectNativeModel(target, options.model, { identity }, nativeHooks);
+        frame = this.assertNativeSnapshot(await this.freshNativeSnapshot(target, {}, nativeHooks), target);
+      }
+      const submitted = await this.submitNativeText(target, frame.composer, text, { identity }, nativeHooks);
+      if (!submitted.receipt.actionResult.submitted) {
+        throw new BridgeError(submitted.receipt.actionResult.attempted ? 'bridge_error' : 'not_capable',
+          submitted.receipt.actionResult.attempted
+            ? 'WorkBuddy Send may have been invoked but has no confirmed UIA receipt; refresh the native chat before another action'
+            : 'WorkBuddy did not accept the exact native Send pattern');
+      }
+      return { accepted: true, sessionId };
+    }, hooks);
+  }
+
+  async selectNativeModel(target, model, { identity, knownConversationTitles }, hooks) {
+    if (typeof this.uiAutomationInspector.selectNativeModel !== 'function') throw new BridgeError('model_not_available', 'WorkBuddy native model switching is unavailable');
+    const receipt = await this.uiAutomationInspector.selectNativeModel({ expectedExePath: this.workbuddyExecutablePath,
+      expectedProcessId: target.processId, expectedHandle: target.handle, maxControls: 160, model,
+      ...(identity ? { identityTitle: identity.title, anchorCandidates: identity.anchorCandidates,
+        expectedCandidateIndex: identity.expectedCandidateIndex } : { knownConversationTitles }),
+    }, hooks);
+    if (!receipt.verified) {
+      const attempted = receipt.attempted || receipt.patternReceipts.some(r => r.attempted);
+      throw new BridgeError(attempted ? 'bridge_error' : 'model_not_available', 'WorkBuddy native model selection could not be confirmed; refresh before another action');
+    }
+  }
+
+  async readNativePendingContext(sessionId, hooks, analysis) {
+    const identity = this.nativeConversationIdentityCandidates(sessionId);
+    const target = await this.discoverNativeWindow(hooks);
+    if (target.minimized === true) this.assertNativeTargetSnapshot(
+      await this.freshNativeSnapshot(target, { activate: true }, hooks), target);
+    const pendingOptions = { expectedExePath: this.workbuddyExecutablePath,
+      expectedProcessId: target.processId, expectedHandle: target.handle, maxControls: 160,
+      identityTitle: identity.title, anchorCandidates: identity.anchorCandidates, expectedCandidateIndex: identity.expectedCandidateIndex,
+      ...(analysis?.complete === true ? { questionMetadata: analysis.questionCandidates.filter(c=>c.complete===true).map(c=>c.questions) } : {}) };
+    let observed = await this.uiAutomationInspector.readNativePending(pendingOptions, hooks);
+    if (!observed.pendingForms.conversationIdentityVerified && typeof this.uiAutomationInspector.navigateConversation === 'function') {
+      const route = await this.uiAutomationInspector.navigateConversation({ ...pendingOptions, sessionId }, hooks);
+      if (route.outcome !== 'confirmed') throw new BridgeError(route.outcome === 'submitted' ? 'bridge_error' : 'not_capable',
+        'WorkBuddy could not verify the requested native conversation; no answer or permission was submitted');
+      observed = await this.uiAutomationInspector.readNativePending(pendingOptions, hooks);
+    }
+    return { ...observed, target, identity };
+  }
+
+  async readSessionLive(sessionId, hooks) {
+    if (!this.uiAutomationEnabled || this.pendingService === null) return this.readSession(sessionId);
+    return this.nativeWriter.run(async nativeHooks => {
+      try { return await this.pendingService.read(sessionId, nativeHooks); }
+      catch (error) {
+        nativeHooks?.checkActive?.();
+        if (['not_capable','bridge_error','stale_request'].includes(error?.code)) return this.readSession(sessionId);
+        throw error;
+      }
+    }, hooks);
+  }
+
+  answerQuestion(sessionId, callId, answers, hooks) {
+    if (!this.canAnswer()) throw new BridgeError('not_capable', 'WorkBuddy native questions are disabled');
+    return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, callId, { answers }, nativeHooks), hooks);
+  }
+
+  approveRequest(sessionId, approvalId, decision, hooks) {
+    if (!this.canApprove()) throw new BridgeError('not_capable', 'WorkBuddy native permissions are disabled');
+    return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, approvalId, { decision }, nativeHooks), hooks);
+  }
+
+  stopSession(sessionId, hooks) {
+    if (!this.canStop()) throw new BridgeError('not_capable', 'WorkBuddy native Stop is disabled');
+    return this.nativeWriter.run(nativeHooks => this.pendingService.stop(sessionId, nativeHooks), hooks);
+  }
+
+  async executeNativeControl(target, control, action, extra = {}, hooks) {
+    hooks?.checkActive?.();
+    const receipt = await this.uiAutomationInspector.executeSemanticAction({
+      expectedExePath: this.workbuddyExecutablePath,
+      expectedProcessId: target.processId,
+      expectedHandle: target.handle,
+      action,
+      safeActionLabel: control.safeActionLabel,
+      runtimeIdHash: control.runtimeIdHash,
+      regionHash: control.regionHash,
+      ...extra,
+    }, hooks);
+    return receipt;
+  }
+
+  assertNativeSnapshot(snapshot, target) {
+    this.assertNativeTargetSnapshot(snapshot, target);
+    if (!snapshot.uiaCom.composerBindingSucceeded) {
+      throw new BridgeError('not_capable', 'WorkBuddy exact native page and composer context could not be verified');
+    }
+    const model = this.findUniqueNativeControl(snapshot, 'model-selector');
+    const composer = this.findUniqueNativeControl(snapshot, 'composer');
+    const send = this.findUniqueNativeControl(snapshot, 'send-label');
+    if (model.regionHash !== composer.regionHash || model.regionHash !== send.regionHash ||
+        model.controlType !== 'ControlType.ComboBox' || !model.enabled ||
+        !composer.enabled || composer.draftState === 'unavailable' || !send.patterns.includes('invoke')) {
+      throw new BridgeError('not_capable', 'WorkBuddy did not expose one live, bound native model and composer frame');
+    }
+    const currentModel = normalizeModelName(model.accessibleName);
+    if (!SAFE_MODEL_LABEL.test(currentModel) || redactSensitiveText(currentModel) !== currentModel) {
+      throw new BridgeError('not_capable', 'WorkBuddy native current model could not be read safely');
+    }
+    return { model, composer, send, currentModel };
+  }
+
+  assertNativeTargetSnapshot(snapshot, target) {
+    if (!snapshot || snapshot.operation !== 'semantic-snapshot' || snapshot.inputDesktopKind !== 'default' ||
+        snapshot.target.processId !== target.processId || snapshot.target.handle !== target.handle ||
+        snapshot.target.mainWindow !== true || snapshot.target.visible !== true || snapshot.target.enabled !== true ||
+        snapshot.target.minimized !== false || !snapshot.processContext.sameWindowsSession ||
+        !snapshot.processContext.sameBitness || !snapshot.processContext.sameIntegrityLevel ||
+        snapshot.uiaCom.traversalTruncated || snapshot.uiaCom.errorType !== null || snapshot.uiaCom.errorStage !== '') {
+      throw new BridgeError('not_capable', 'WorkBuddy exact native target and complete UI Automation tree could not be verified');
+    }
+    return snapshot;
+  }
+
+  readNativeTaskTitles() {
+    const before = Number(this.nativeTitleCountStatement.get()?.count);
+    if (!Number.isInteger(before) || before < 0 || before > MAX_NATIVE_TASK_TITLES) {
+      throw new BridgeError('not_capable', 'WorkBuddy has too many local conversations to prove a new-task page');
+    }
+    const rows = this.nativeTitleRowsStatement.all(MAX_NATIVE_TASK_TITLES + 1);
+    const after = Number(this.nativeTitleCountStatement.get()?.count);
+    if (!Array.isArray(rows) || before !== after || rows.length !== before) {
+      throw new BridgeError('not_capable', 'WorkBuddy local conversation titles changed during new-task verification');
+    }
+    const titles = new Set();
+    for (const row of rows) {
+      if (!row || row.transport !== 'local' || row.deleted_at !== null) {
+        throw new BridgeError('not_capable', 'WorkBuddy local conversation metadata is incomplete');
+      }
+      const title = nativeIdentityTitle(row);
+      if (!title) throw new BridgeError('not_capable', 'WorkBuddy has a local conversation without a safe complete title');
+      titles.add(title);
+    }
+    return [...titles];
+  }
+
+  readNativeSessionIds() {
+    const rows = this.nativeSessionIdsStatement.all(MAX_NATIVE_SESSION_IDS + 1);
+    if (!Array.isArray(rows) || rows.length > MAX_NATIVE_SESSION_IDS ||
+        rows.some((row) => !row || typeof row.id !== 'string' || !SAFE_SESSION_FILE_ID.test(row.id))) {
+      throw new BridgeError('not_capable', 'WorkBuddy local session index is too large or incomplete to confirm a newly created chat');
+    }
+    return new Set(rows.map((row) => row.id));
+  }
+
+  async listModels(hooks) {
+    if (!this.canModelsList()) throw new BridgeError('not_capable', 'WorkBuddy native model listing is not enabled');
+    return this.nativeWriter.run(async (nativeHooks) => {
+      const knownConversationTitles = this.readNativeTaskTitles();
+      const target = await this.discoverNativeWindow(nativeHooks);
+      const initial = await this.freshNativeSnapshot(target, { knownConversationTitles }, nativeHooks);
+      this.assertNativeTargetSnapshot(initial, target);
+      if (initial.uiaCom.composerBindingSucceeded !== true) {
+        await this.selectNewTaskPage(target, knownConversationTitles, nativeHooks);
+      }
+      nativeHooks?.checkActive?.();
+      const catalog = await this.uiAutomationInspector.readNativeModelCatalog({
+        expectedExePath: this.workbuddyExecutablePath,
+        expectedProcessId: target.processId,
+        expectedHandle: target.handle,
+      }, nativeHooks);
+      nativeHooks?.checkActive?.();
+      const catalogCurrentModel = typeof catalog?.catalog?.currentModel === 'string'
+        ? normalizeModelName(catalog.catalog.currentModel) : '';
+      if (!SAFE_MODEL_LABEL.test(catalogCurrentModel) || redactSensitiveText(catalogCurrentModel) !== catalogCurrentModel ||
+          catalog.targetContextVerified !== true || catalog.catalog.targetContextVerified !== true ||
+          catalog.catalog.composerVerified !== true || !/^[a-f0-9]{16}$/.test(catalog.catalog.initialDraftFingerprint) ||
+          catalog.catalog.finalDraftFingerprint !== catalog.catalog.initialDraftFingerprint) {
+        throw new BridgeError(catalog.outcome === 'submitted' ? 'bridge_error' : 'not_capable',
+          catalog.outcome === 'submitted'
+            ? 'WorkBuddy model catalog read may have changed the native selector; refresh before another action'
+            : 'WorkBuddy could not verify the native model selector and unchanged composer');
+      }
+      const nativeModels = catalog.outcome === 'confirmed' && Array.isArray(catalog.catalog.models)
+        ? catalog.catalog.models : [catalogCurrentModel];
+      const labels = uniqueModelOptions(nativeModels.map((label) => ({ accessibleName: label })));
+      if (labels.length === 0 || !labels.includes(catalogCurrentModel)) {
+        throw new BridgeError('not_capable', 'WorkBuddy native model options could not be read safely');
+      }
+      return {
+        models: labels.map((label) => ({ id: label, label, isDefault: label === catalogCurrentModel })),
+        projects: [],
+        currentModel: catalogCurrentModel,
+        catalogSource: catalog.outcome === 'confirmed'
+          ? 'WorkBuddy native model options (UIA listbox; project catalog unavailable)'
+          : 'WorkBuddy current model only (native UIA catalog unavailable; project catalog unavailable)',
+      };
+    }, hooks);
+  }
 
   listSessions() {
     const rows = this.listStatement.all(MAX_LIST);
@@ -353,7 +1029,7 @@ class WorkBuddyAdapter {
     return result;
   }
 
-  readSession(sessionId) {
+  readSession(sessionId, options = {}) {
     if (typeof sessionId !== 'string' || !SAFE_SESSION_FILE_ID.test(sessionId)) throw new BridgeError('invalid_params', 'invalid WorkBuddy session id');
     const row = this.readStatement.get(sessionId);
     if (!row) throw new BridgeError('session_not_found', 'WorkBuddy local session not found');
@@ -398,7 +1074,7 @@ class WorkBuddyAdapter {
     const title = typeof row.custom_title === 'string' && row.custom_title.trim() !== ''
       ? row.custom_title
       : typeof row.title === 'string' && row.title.trim() !== '' ? row.title : row.id;
-    return {
+    const session = {
       id: row.id,
       tool: 'workbuddy',
       title: sessionTitle(row),
@@ -407,6 +1083,7 @@ class WorkBuddyAdapter {
       canStop: false,
       historyTruncated,
     };
+    return options.includeSource === true ? { session, records: replay.records, cwd: row.cwd, historyTruncated } : session;
   }
 }
 
@@ -414,6 +1091,11 @@ module.exports = {
   WorkBuddyAdapter,
   nativeConfigDir,
   nativeWorkspaceKey,
+  normalizeModelName,
+  uniqueModelOptions,
+  nativeIdentityTitle,
+  nativeHistoryAnchors,
+  MAX_NATIVE_IDENTITY_CANDIDATES,
   historyPath,
   redactSensitiveText,
   WORKBUDDY_DB_UNAVAILABLE,

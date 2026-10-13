@@ -26,6 +26,38 @@ const DEFAULT_NODE_CANDIDATES = ['D:\\env\\node.exe', path.join(process.env.Prog
 
 const LAUNCHER_NAME = 'Start-AI-Remote.cmd';
 const README_NAME = 'README.txt';
+const FULL_CONTROL_LAUNCHER_NAME = 'Start-FullControl.cmd';
+const FULL_CONTROL_SCRIPT_NAME = 'Start-FullControl.ps1';
+const SOURCE_RUNTIME_FILES = Object.freeze([
+  'src/adapters/codex.js',
+  'src/adapters/dsh.js',
+  'src/adapters/workbuddy.js',
+  'src/backoff.js',
+  'src/bridge.js',
+  'src/codex-context.js',
+  'src/codex-native-control.js',
+  'src/codex-native-proxy-core.js',
+  'src/codex-native-proxy.js',
+  'src/config.js',
+  'src/creates.js',
+  'src/dsh-events.js',
+  'src/enrollment.js',
+  'src/errors.js',
+  'src/framing.js',
+  'src/index.js',
+  'src/pending.js',
+  'src/protocol.js',
+  'src/run-stop-request.js',
+  'src/ui/server.js',
+  'src/workbuddy-native/pending-items.js',
+  'src/workbuddy-native/uia-pending-controller.js',
+  'src/workbuddy-native/pending-service.js',
+  'src/workbuddy-native/history-state.js',
+  'src/workbuddy-native/windows-uia.js',
+  'src/workbuddy-native/writer.js',
+  'src/ws.js',
+]);
+const FORBIDDEN_PACKAGE_ENTRY = /(?:^|\/)(?:test|tests|private|\.private|\.native-src|\.native-asar|native-asar)(?:\/|$)|(?:^|\/)[^/]*\.test\.[^/]+$|\.asar(?:$|\/)/i;
 
 const LAUNCHER = `@echo off
 rem Double-click this file to start the bridge. It lives beside node.exe, so it
@@ -57,15 +89,15 @@ const README = `AI Remote —— Windows 电脑端桥接程序
 
   - 列出并阅读会话（最近 200 条消息；过长历史会截断，并在结果里标注 historyTruncated）；
   - 在**原来那条会话里**继续说话（不新建、不重放历史）；
-  - 停止正在执行的一轮（DSH 可以；Codex 见下方限制）；
+  - 停止正在执行的一轮（DSH 默认可用；Codex 需要下方明确选择的预览启动）；
   - **新建会话**：先选工具与真实模型（models.list 给的是本机真实目录），再创建；
   - **给下一条消息选模型**：Codex 用发送工具 schema 里写明的模型；DSH 先
     "session/selectModel" 再发送。选模型失败就**不发这条消息**，不会用错模型发出去；
   - **回答会话里等待中的问题**：只呈现后端真实给出的问题和选项；DSH 里 "continued" 的
     提问走原生 "userQuestions/answer"，还开在应用里（"open"）的提问走后端真实转发过来的
-    提问事件流；两条路都只在原生状态确认之后才算成功（状态会一起发给手机）。Codex 没有
-    回答通道，程序如实上报“不支持”；
-  - **决定等待中的权限审批**：只有后端真实通过事件流发出来的审批请求才会显示，一次点击
+    提问事件流；两条路都只在原生状态确认之后才算成功（状态会一起发给手机）。Codex 的原生回答
+    仅在下方 FullControl 预览启动下提供；
+  - **决定等待中的权限审批**：只有后端真实通过事件流或明确启用的 Codex 原生请求通道发出来的审批请求才会显示，一次点击
     只提交一次"仅此一次允许"或"拒绝"；程序不会自动批准、不会改成“以后都允许”、不会改
     任何策略。手机和电脑同时回答时，以原生先到的那次为准（详见下文）；
   - 手机端把回复按 Markdown 渲染，并把工具调用折叠成活动块（这部分在手机端完成）。
@@ -73,6 +105,22 @@ const README = `AI Remote —— Windows 电脑端桥接程序
 怎么启动
 --------
 双击 Start-AI-Remote.cmd。会弹出一个命令行窗口，程序一直运行到你在窗口里按 Ctrl+C。
+
+Codex Desktop 原生控制（明确选择的预览功能）
+------------------
+要让手机停止 Codex 正在执行的一轮、回答 Codex 原生问题或处理真实权限请求，先在 Codex 菜单中正常退出它，
+然后双击 Start-FullControl.cmd。它只在确认 Codex 和本地桥接都没有运行时才启动，并为这一轮新建一个
+仅当前 Windows 用户、SYSTEM 与 Administrators 可访问的临时控制目录；桥接与新启动的 Codex Desktop
+使用同一个目录。目录和运行标识仅在进程环境中传递，不写入普通配置、日志或命令行参数。此启动方式
+使用 Codex Desktop 自身版本化的 codex.exe 作为原生 stdio 代理的后端，不会另开 Codex 聊天或重放历史。
+Codex 26.1007 的安装路径、app-server 接口及本机源代码已经检查，代理通过了本地协议夹具测试；真实
+Codex Desktop 原生激活与端到端操作尚未验收，其他版本也未经验证。这是尚待真实桌面端验收的预览入口，
+WorkBuddy 的实测范围见下方说明。正常关闭 Codex Desktop 后，启动器会用该运行私有的一次性
+请求让它自己启动的桥接优雅退出，并等待有限时间；若桥接没有响应，只会停止这一个桥接进程，
+不会停止 Codex Desktop 或其他桥接。私密控制目录只会在这两个已启动进程都退出、且本次运行创建的
+Codex 原生子进程描述符全部消失后删除；若在限定时间内无法确认，不会停止原生子进程，并会保留目录。
+也可用
+"-CodexDesktopPath" 和 "-CodexCliPath" 参数明确选择安装路径；任何参数都不会绕过现有进程检查。
 
 然后在**这台电脑**的浏览器里打开 http://127.0.0.1:18989 。这个页面显示连接状态，
 输入姓名并保存电脑身份；新的电脑输入管理员生成的十分钟一次性登记码后，可生成手机配对码。
@@ -100,14 +148,32 @@ const README = `AI Remote —— Windows 电脑端桥接程序
 请把该文件设成只有你自己能读。token 只会发往服务器，出现在连接握手的请求头里；
 它不会出现在网址、日志或任何报告里。也可以用环境变量 AI_REMOTE_BRIDGE_TOKEN 代替。
 
-WorkBuddy 本地会话（只读）
-------------------
-手机工作台可读取此 Windows 用户在 WorkBuddy 中本地保存的会话和消息，支持 Markdown
-与折叠工具记录。程序只读打开 .workbuddy/workbuddy.db 和项目 JSONL，不会修改原数据。
-自定义数据目录可在私密配置中设置 workbuddy.configDir，或使用 WORKBUDDY_CONFIG_DIR。
-续聊、新建、模型与授权等执行操作暂未接入，界面会标注只读。需要这些操作时，可按官方
-说明在官方手机 App 登录与电脑相同的账号。只有本地保存的历史才会出现在此读取入口中。
-官方说明：https://www.codebuddy.cn/docs/workbuddyapp/features/Multidevice
+WorkBuddy 本地会话与 UI Automation opt-in
+-------------------------------------
+默认仍只读 WorkBuddy 本地会话和消息，不会修改 workbuddy.db 或项目 JSONL。自定义数据目录可在
+私密配置中设置 workbuddy.configDir，或使用 WORKBUDDY_CONFIG_DIR。
+
+WorkBuddy 5.7.7 已通过原生新建、续聊、下条消息选模型、单题与两题回答、停止任务的公网验收，
+自定义文本回答也已读回原生工具结果。
+结果已读回它自己的本地消息。模型目录来自实际选择器的 19 个选项；选项在屏幕外时使用标准
+ScrollIntoView。发送使用 Windows 原生键盘输入，保护已有草稿，并在模型菜单收起、原会话身份
+和精确草稿均确认后点击原生发送。窗口最小化时可恢复；电脑必须保持登录、未锁屏。
+
+允许一次／拒绝只匹配完整原生命令卡及其工作目录，不点击“跳过”或长期允许。本机良性命令
+由 WorkBuddy 自动放行，真实审批点击尚未实测；审批路径已通过协议与 C# 夹具检查。
+本机版本的新建页未暴露可验证的工作目录选择控件，因此新聊天沿用桌面选定的目录；手机可以
+按已有会话的真实目录筛选。未经支持的 projectId/cwd 会在写入消息前被拒绝。
+
+你可以在本机状态页面显式启用 \`workbuddy.uiAutomation.enabled\`，并可选填写绝对
+\`WorkBuddy.exe\` 路径。状态页面只保存这台电脑的设置、重新打开本机适配器并更新能力；它不会
+启动或关闭 WorkBuddy，也不会改变其他电脑、账号或应用的权限。启用后如需访问 UIA，请先从
+WorkBuddy 自身菜单或托盘正常退出，再运行 \`plugins\\workbuddy-native\\Start-WorkBuddy-UIA.cmd\`；
+若目标安装仍在运行，启动器会拒绝操作。用 \`Start-WorkBuddy-Standard.cmd\` 可按普通方式启动。
+该启动器只给单次进程传入 Chromium 可访问性参数，不修改应用文件或设置，也不开放调试端口。
+
+UI Automation 要求 Windows 默认（已解锁）桌面和 WorkBuddy 目标窗口处于前台。状态页中的控件
+快照只表示上次观测；每个原生操作都必须在执行前新鲜核验目标进程、窗口、输入桌面和焦点。
+会话和消息始终使用 WorkBuddy 原生 ID。提交状态仅表示控件动作已提交；AI 结果由后续原生消息确认。
 
 它能在这台电脑上做什么
 ----------------------
@@ -116,14 +182,14 @@ WorkBuddy 本地会话（只读）
   可以列会话、读会话、往**已有**会话里发消息，也可以用该应用自己的 "create_thread"
   新建一条**真实桌面聊天**（只允许本机 local 项目；不会去开 worktree、不会发到云）。
   模型候选来自该应用实时 schema 里写明的本机可用模型（本机实测 7 个）。
-  **限制：不能停止 Codex 的一轮** —— 该管道没有停止工具，所以程序如实上报“不支持”，
-  不会假装成功（"capabilities" 里 "stop:codex" 为 false）。
+  默认启动仍只使用该命名管道；它没有停止、提问回答或审批工具，所以默认启动不会假装支持这些操作。
+  若使用上方明确选择的 FullControl 启动预览，才额外连接到 Codex Desktop 自己启动的 stdio child；
+  该通道按会话实际报告的能力逐项启用，并在每次操作时重新核对原生请求。
   给下一条消息选模型：只有当**发送工具自己的 schema** 写明模型目录时才提供，发送时带
   model 与 thinking 两个字段；schema 没写就如实上报“不支持”（"session.send:model:codex"
-  为 false），普通的发送完全不受影响。回答提问：这条管道没有回答工具，所以
-   "session.answer:codex" 为 false，程序不会用“发一条消息”的方式假装回答。
-  权限审批同理："session.approve:codex" 为 false —— 这条管道根本没有审批通道，手机端
-  不会出现任何审批按钮。
+  为 false），普通的发送完全不受影响。默认启动的命名管道没有回答与审批工具；FullControl 预览只为
+  当前确实存在、且完整上下文能安全呈现的 Codex 原生问题或审批显示按钮，答案和决定先标为“已提交”，
+  直到原生证据确认。
   从桌面双击启动时，程序只读查询当前用户的 Codex 本机索引，寻找已有的本机用户会话作为
   调用上下文，不会新建聊天、恢复运行或读取消息正文；显式配置仍优先。便携包内的 Node
   支持此发现。索引不兼容或尚未打开本机聊天时，状态页会提示具体设置办法。
@@ -301,6 +367,20 @@ function collectFiles(dir, prefix, filter = () => true) {
   return out;
 }
 
+function collectRuntimeFiles() {
+  return SOURCE_RUNTIME_FILES.map((name) => {
+    const filePath = path.join(ROOT, ...name.split('/'));
+    let stat;
+    try {
+      stat = fs.lstatSync(filePath);
+    } catch {
+      throw new Error(`required runtime module ${name} is missing`);
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`required runtime module ${name} is not a regular file`);
+    return { name, data: fs.readFileSync(filePath), path: filePath, size: stat.size };
+  });
+}
+
 function findNode(override) {
   if (override !== undefined) {
     if (!fs.existsSync(override)) throw new Error(`--node ${override} does not exist`);
@@ -326,15 +406,38 @@ function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const nodePath = findNode(args.node);
   const out = args.out ?? path.join(ROOT, 'dist', 'AI-Remote-Windows.zip');
+  const codexNativeProxyPath = path.join(ROOT, 'dist', 'AI-Remote-Windows', 'codex-native', 'codex-native-proxy.exe');
+  if (!fs.existsSync(codexNativeProxyPath)) {
+    throw new Error('Codex native proxy shim is missing; build the reviewed codex-native-proxy.exe before packaging.');
+  }
 
   const files = [
-    ...collectFiles(path.join(ROOT, 'src'), 'src/', (file) => file.endsWith('.js')),
+    ...collectRuntimeFiles(),
     ...collectFiles(path.join(ROOT, 'ui'), 'ui/'),
+    { name: 'src/workbuddy-native/windows-uia.ps1', data: fs.readFileSync(path.join(ROOT, 'src', 'workbuddy-native', 'windows-uia.ps1')) },
+    { name: 'src/workbuddy-native/windows-uia-com.cs', data: fs.readFileSync(path.join(ROOT, 'src', 'workbuddy-native', 'windows-uia-com.cs')) },
+    { name: 'src/workbuddy-native/windows-uia-pending.cs', data: fs.readFileSync(path.join(ROOT, 'src', 'workbuddy-native', 'windows-uia-pending.cs')) },
+    { name: 'src/workbuddy-native/model-popup.cs', data: fs.readFileSync(path.join(ROOT, 'src', 'workbuddy-native', 'model-popup.cs')) },
+    { name: 'src/workbuddy-native/pending-actions.cs', data: fs.readFileSync(path.join(ROOT, 'src', 'workbuddy-native', 'pending-actions.cs')) },
+    { name: 'src/workbuddy-native/native-input.cs', data: fs.readFileSync(path.join(ROOT, 'src', 'workbuddy-native', 'native-input.cs')) },
+    { name: 'plugins/workbuddy-native/README.md', data: fs.readFileSync(path.join(ROOT, 'plugins', 'workbuddy-native', 'README.md')) },
+    { name: 'plugins/workbuddy-native/Start-WorkBuddy.ps1', data: fs.readFileSync(path.join(ROOT, 'plugins', 'workbuddy-native', 'Start-WorkBuddy.ps1')) },
+    { name: 'plugins/workbuddy-native/Start-WorkBuddy-UIA.cmd', data: fs.readFileSync(path.join(ROOT, 'plugins', 'workbuddy-native', 'Start-WorkBuddy-UIA.cmd')) },
+    { name: 'plugins/workbuddy-native/Start-WorkBuddy-Standard.cmd', data: fs.readFileSync(path.join(ROOT, 'plugins', 'workbuddy-native', 'Start-WorkBuddy-Standard.cmd')) },
+    { name: 'scripts/codex-fullcontrol-ready.js', data: fs.readFileSync(path.join(ROOT, 'scripts', 'codex-fullcontrol-ready.js')) },
     { name: 'package.json', data: fs.readFileSync(path.join(ROOT, 'package.json')) },
     { name: LAUNCHER_NAME, data: Buffer.from(LAUNCHER, 'utf8') },
     { name: README_NAME, data: Buffer.from(README, 'utf8') },
+    { name: FULL_CONTROL_LAUNCHER_NAME, data: fs.readFileSync(path.join(ROOT, 'scripts', FULL_CONTROL_LAUNCHER_NAME)) },
+    { name: FULL_CONTROL_SCRIPT_NAME, data: fs.readFileSync(path.join(ROOT, 'scripts', FULL_CONTROL_SCRIPT_NAME)) },
+    { name: 'codex-native/codex-native-proxy.exe', data: fs.readFileSync(codexNativeProxyPath) },
     { name: 'node.exe', data: fs.readFileSync(nodePath) },
   ];
+
+  const forbiddenFiles = files.filter((file) => FORBIDDEN_PACKAGE_ENTRY.test(file.name));
+  if (forbiddenFiles.length > 0) {
+    throw new Error(`private or test files cannot be packaged: ${forbiddenFiles.map((file) => file.name).join(', ')}`);
+  }
 
   const entries = files.map((file) => ({
     name: file.name,
@@ -362,4 +465,4 @@ try {
   process.exit(1);
 }
 
-export { main, writeZip, collectFiles, findNode, LAUNCHER, README };
+export { main, writeZip, collectFiles, collectRuntimeFiles, SOURCE_RUNTIME_FILES, findNode, LAUNCHER, README };

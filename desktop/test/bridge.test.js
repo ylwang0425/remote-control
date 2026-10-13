@@ -10,8 +10,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const os = require('node:os');
+const path = require('node:path');
 
 const { BridgeClient } = require('../src/bridge');
+const { createDispatcher } = require('../src/index');
 const { WebSocketClient } = require('../src/ws');
 const { startWsServer } = require('./helpers/ws-server');
 const { buildCapabilities, fitSessionReadResult } = require('../src/protocol');
@@ -211,6 +215,38 @@ test('saving a computer name refreshes identity on the authenticated bridge with
   assert.equal(relay.connections.length, connectionsBefore, 'a label edit does not replace or restart the authenticated connection');
 });
 
+test('a local capability refresh sends a repeated hello without changing this client identity or connection', async (t) => {
+  const clientId = '98c9e96b-5d91-4a04-8d89-e2bdd29e30a5';
+  const { relay, bridge } = await connectedBridge(t, {
+    bridge: { clientId, ownerName: 'Local user' },
+  });
+  const originalCapabilities = bridge.capabilities;
+  const connectionCount = relay.connections.length;
+  const updated = buildCapabilities(['codex', 'dsh', 'workbuddy'], {
+    modelsList: true,
+    sessionCreate: true,
+    sendWorkbuddy: false,
+    modelsListWorkbuddy: false,
+    sessionCreateWorkbuddy: false,
+    stopWorkbuddy: false,
+  });
+
+  assert.equal(bridge.updateCapabilities(updated), true);
+  assert.equal(bridge.capabilities, updated);
+  assert.notEqual(bridge.capabilities, originalCapabilities);
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline && relay.received.filter((frame) => frame.type === 'hello').length < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const hellos = relay.received.filter((frame) => frame.type === 'hello');
+  assert.equal(hellos.length, 2);
+  assert.equal(hellos[1].clientId, clientId);
+  assert.equal(hellos[1].ownerName, 'Local user');
+  assert.equal(hellos[1].clientName, CLIENT_NAME);
+  assert.equal(hellos[1].capabilities['session.send:workbuddy'], false);
+  assert.equal(relay.connections.length, connectionCount, 'capability refresh does not reconnect or change transport identity');
+});
+
 test('enrollment replaces only the bridge credentials and reconnects with the new identity', async (t) => {
   const nextToken = 'enrolled-token-0123456789';
   const clientId = '98c9e96b-5d91-4a04-8d89-e2bdd29e30a5';
@@ -339,6 +375,142 @@ test('contract 2: stop on a session without the capability answers not_capable, 
   assert.equal(response.error.code, 'not_capable');
   assert.ok(!/[A-Za-z]:\\|\//.test(response.error.message), `no path in ${response.error.message}`);
   assert.ok(!response.error.message.includes('at '), 'no stack in the message');
+});
+
+test('a timed-out WorkBuddy partial submission is never replayed when the relay repeats its id', async (t) => {
+  const relay = await new FakeRelay().start();
+  t.after(() => relay.close());
+  let dispatchCalls = 0;
+  let nativeSubmissions = 0;
+  let hooks;
+  let finishDispatch;
+  const dispatchGate = new Promise((resolve) => { finishDispatch = resolve; });
+  let dispatchEntered;
+  const entered = new Promise((resolve) => { dispatchEntered = resolve; });
+  const bridge = new BridgeClient({
+    url: relay.url,
+    token: TOKEN,
+    clientName: CLIENT_NAME,
+    capabilities: makeCapabilities(),
+    dispatch: async (request) => {
+      dispatchCalls += 1;
+      assert.deepEqual(request.params, { tool: 'workbuddy', sessionId: 'wb-1', text: 'one submission' });
+      assert.equal(Object.prototype.hasOwnProperty.call(request.params, 'internal'), false);
+      hooks = request.internal?.workbuddyHooks;
+      assert.equal(typeof hooks?.checkActive, 'function');
+      assert.equal(typeof hooks?.remainingBudgetMs, 'function');
+      nativeSubmissions += 1; // the native action was already submitted once
+      dispatchEntered();
+      await dispatchGate;
+      hooks.checkActive(); // a post-submit check must fail closed after expiry
+      nativeSubmissions += 1;
+      return { accepted: true };
+    },
+    backoff: { next: () => 5, reset: () => {}, reject: () => 5 },
+  });
+  t.after(() => bridge.stop());
+  await bridge.start();
+  await bridge.waitUntilConnected(2000);
+
+  const request = {
+    type: 'request',
+    id: '7a8b9c0d-1e2f-4a5b-8c6d-7e8f9a0b1c2d',
+    method: 'session.send',
+    params: { tool: 'workbuddy', sessionId: 'wb-1', text: 'one submission' },
+    timeoutMs: 100,
+  };
+  relay.sendRequest(request);
+  await entered;
+  assert.ok(hooks.remainingBudgetMs() > 0 && hooks.remainingBudgetMs() <= 60000);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  finishDispatch();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(hooks.remainingBudgetMs(), 0);
+  assert.equal(bridge.pending.size, 0);
+  assert.equal(nativeSubmissions, 1, 'expiry does not resubmit or continue the partial action');
+  assert.equal(await relay.responseFor(request.id, 50), null, 'the expired reply is dropped');
+
+  relay.sendRequest(request);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(dispatchCalls, 1, 'the same expired WorkBuddy id is retired against duplicate replay');
+  assert.equal(nativeSubmissions, 1);
+});
+
+test('a real deadline expiring in the serialized WorkBuddy queue prevents any adapter submission', async (t) => {
+  const relay = await new FakeRelay().start();
+  let sendEntered;
+  const entered = new Promise((resolve) => { sendEntered = resolve; });
+  let finishSend;
+  const finish = new Promise((resolve) => { finishSend = resolve; });
+  const sendCalls = [];
+  const adapter = {
+    canStop: () => false,
+    canSend: () => true,
+    canSendWithModel: () => false,
+    canAnswer: () => false,
+    canApprove: () => false,
+    canModelsList: () => false,
+    canCreate: () => false,
+    listSessions: async () => [],
+    listModels: async () => ({ models: [], projects: [] }),
+    sendMessage: async (sessionId, text) => {
+      sendCalls.push({ sessionId, text });
+      if (text === 'hold the writer') {
+        sendEntered();
+        await finish;
+      }
+      return { accepted: true, sessionId };
+    },
+    close: async () => {},
+  };
+  const dispatcher = createDispatcher({
+    createLogPath: path.join(os.tmpdir(), `ai-remote-bridge-${crypto.randomUUID()}`, 'creates.json'),
+    codex: { pipePath: null, contextThreadId: null },
+    dsh: { port: null },
+    workbuddy: { configDir: 'C:\\Users\\Local\\.workbuddy', uiAutomation: { enabled: false } },
+  }, () => {}, {
+    codex: async () => { throw new Error('unused'); },
+    dsh: async () => { throw new Error('unused'); },
+    workbuddy: async () => adapter,
+  });
+  const bridge = new BridgeClient({
+    url: relay.url,
+    token: TOKEN,
+    clientName: CLIENT_NAME,
+    capabilities: makeCapabilities(),
+    dispatch: dispatcher.dispatch,
+    backoff: { next: () => 5, reset: () => {}, reject: () => 5 },
+  });
+  t.after(async () => {
+    finishSend();
+    await bridge.stop();
+    await dispatcher.close();
+    await relay.close();
+  });
+  await bridge.start();
+  await bridge.waitUntilConnected(2000);
+
+  const blocking = {
+    type: 'request', id: '12121212-1234-4234-8234-123456789abc', method: 'session.send',
+    params: { tool: 'workbuddy', sessionId: 'wb-1', text: 'hold the writer' }, timeoutMs: 5000,
+  };
+  const queued = {
+    type: 'request', id: '22121212-1234-4234-8234-123456789abc', method: 'session.send',
+    params: { tool: 'workbuddy', sessionId: 'wb-1', text: 'must expire in queue' }, timeoutMs: 150,
+  };
+  relay.sendRequest(blocking);
+  await entered;
+  relay.sendRequest(queued);
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  finishSend();
+
+  assert.equal((await relay.responseFor(blocking.id))?.ok, true);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(sendCalls.length, 1, 'the expired queued request never reaches the WorkBuddy adapter');
+  assert.equal(await relay.responseFor(queued.id, 50), null, 'the bridge drops the response after the local deadline');
+  relay.sendRequest(queued);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(sendCalls.length, 1, 'a duplicate of the expired request cannot replay native input');
 });
 
 test('an unknown frame type is ignored and the link stays up (protocol-v1 §12.4)', async (t) => {

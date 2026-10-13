@@ -324,6 +324,10 @@ test('the Android manifest is closed by default', () => {
   assert.match(declared, /windowSoftInputMode\s*=\s*"adjustResize"/, 'the keyboard must not cover the composer');
   assert.match(declared, /minSdkVersion\s*=\s*"26"/);
   assert.match(declared, /targetSdkVersion\s*=\s*"35"/);
+  assert.match(declared, /android:versionCode\s*=\s*"2"/,
+    'the release APK must use the approved version code');
+  assert.match(declared, /android:versionName\s*=\s*"1\.1\.0"/,
+    'the release APK must use the approved version name');
 
   // Only the network permission: no file-content permissions at all.
   const permissions = (declared.match(/<uses-permission[^>]*android:name\s*=\s*"([^"]+)"/g) || [])

@@ -120,13 +120,20 @@ const PENDING_STATES = Object.freeze(['open', 'continued']);
  * truncation target: a list the phone cannot show in full is never shown in part.
  */
 const MAX_PENDING_APPROVALS = 8;
-/** One approval's native identity: the gateway event id, which really is a v4 UUID. */
-const APPROVAL_ID_LIMIT = 128;/** The tool a pending approval names - an identifier, so one short line. */
+/** Phone-facing UUIDv4 handle for one live native approval request. */
+const APPROVAL_ID_LIMIT = 128;
+/** The tool a pending approval names - an identifier, so one short line. */
 const MAX_APPROVAL_TOOL_NAME = 128;
 /** The tool call a pending approval belongs to, when the native request names one. */
 const MAX_APPROVAL_CALL_ID = 128;
 /** The native reason sentence; bounded, because it is really displayed. */
 const MAX_APPROVAL_REASON = 4000;
+const MAX_APPROVAL_COMMAND = 4000;
+const MAX_APPROVAL_CONTEXT_PATH = 1024;
+const MAX_APPROVAL_NETWORK_HOST = 253;
+const MAX_APPROVAL_NETWORK_PROTOCOL = 32;
+const MAX_APPROVAL_NETWORK_PORT = 65535;
+const MAX_APPROVAL_FILE_SUMMARY = 4000;
 
 /**
  * The only two decisions this bridge may submit for a generic approval.
@@ -202,7 +209,7 @@ function buildPendingQuestion(value) {
   const bad = (message) => protocolError('bridge_error', message);
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw bad('a pending question must be an object');
   for (const key of Object.keys(value)) {
-    if (!['id', 'question', 'header', 'detail', 'options', 'multiSelect'].includes(key)) {
+    if (!['id', 'question', 'header', 'detail', 'options', 'multiSelect', 'allowCustom'].includes(key)) {
       throw bad('a pending question carries a field the contract does not allow');
     }
   }
@@ -231,6 +238,10 @@ function buildPendingQuestion(value) {
   if (value.multiSelect !== undefined) {
     if (typeof value.multiSelect !== 'boolean') throw bad('multiSelect must be a boolean');
     if (value.multiSelect === true) question.multiSelect = true;
+  }
+  if (value.allowCustom !== undefined) {
+    if (typeof value.allowCustom !== 'boolean') throw bad('allowCustom must be a boolean');
+    question.allowCustom = value.allowCustom;
   }
   return question;
 }
@@ -261,14 +272,12 @@ function buildPendingQuestions(value) {
 }
 
 /**
- * A native approval identity: the Gateway's own `eventId`.
+ * Phone-facing approval handle. It is always a UUID v4 minted by this bridge.
  *
- * The installed gateway mints it with `randomUUID()` (`startRemoteEvent` in
- * `dsh-api-gateway/lib/index.js`), so it is a v4 UUID and nothing else. The check
- * is exact rather than "a bounded token" on purpose: the relay validates the same
- * field as a UUID, and this bridge must never be able to emit a projection its own
- * relay would reject. A value that is not one is refused here, where the reason is
- * still visible, instead of surfacing later as a broken answer on the phone.
+ * Native ACP request IDs may be strings or integers and are never sent over this
+ * wire field. The adapter privately maps this handle to the exact typed native
+ * request and its conversation/turn/item while that request is pending. DSH's
+ * native event ID is already a UUID v4, so it continues to fit this contract.
  */
 function isApprovalId(value) {
   return isUuidV4(value);
@@ -277,20 +286,75 @@ function isApprovalId(value) {
 /**
  * One pending permission approval (additive wire v1, requirement F).
  *
- * The shape is the native gateway's own: `id` is the real `eventId` of the
- * `approval/request` waterfall, `toolName` is what native said it will run,
- * `callId` and `reason` travel only when native carried them. Nothing here
- * invents a pending approval, and nothing here decides one.
+ * The phone-facing shape names one real native approval with an opaque UUIDv4
+ * handle. ACP adapters keep their typed request IDs and exact native context in
+ * a private live map. The display projection is a closed union so the phone
+ * cannot silently omit an authorization-relevant field.
  */
-function buildPendingApproval(value) {
+function approvalContextText(value, name, limit, multiline = false) {
+  const unsafeControls = multiline
+    ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u
+    : /[\u0000-\u001f\u007f]/u;
+  if (typeof value !== 'string' || value.trim() === '' || [...value].length > limit || unsafeControls.test(value)) {
+    throw protocolError('bridge_error', `a pending approval needs a complete bounded ${name}`);
+  }
+  return value;
+}
+
+function buildApprovalContext(value) {
+  const bad = (message) => protocolError('bridge_error', message);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw bad('a pending approval context must be an object');
+  }
+  if (typeof value.kind !== 'string') throw bad('a pending approval context needs a kind');
+  const fieldsByKind = {
+    command: ['kind', 'command', 'cwd'],
+    network: ['kind', 'networkHost', 'protocol', 'networkPort'],
+    'file-change': ['kind', 'summary', 'grantRoot'],
+  };
+  const allowed = fieldsByKind[value.kind];
+  if (allowed === undefined) throw bad('a pending approval context has an unsupported kind');
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) throw bad('a pending approval context carries an unapproved field');
+  }
+
+  if (value.kind === 'command') {
+    return {
+      kind: 'command',
+      command: approvalContextText(value.command, 'command', MAX_APPROVAL_COMMAND, true),
+      cwd: approvalContextText(value.cwd, 'working directory', MAX_APPROVAL_CONTEXT_PATH),
+    };
+  }
+  if (value.kind === 'network') {
+    const networkHost = approvalContextText(value.networkHost, 'network host', MAX_APPROVAL_NETWORK_HOST);
+    if (/[\s\/@?#]/u.test(networkHost)) throw bad('a pending approval network host must not contain a URL, path or user info');
+    const protocol = approvalContextText(value.protocol, 'network protocol', MAX_APPROVAL_NETWORK_PROTOCOL);
+    if (!/^[A-Za-z][A-Za-z0-9+.-]*$/u.test(protocol)) throw bad('a pending approval network protocol is invalid');
+    const context = { kind: 'network', networkHost, protocol };
+    if (value.networkPort !== undefined) {
+      if (!Number.isInteger(value.networkPort) || value.networkPort < 1 || value.networkPort > MAX_APPROVAL_NETWORK_PORT) {
+        throw bad('a pending approval network port must be an integer from 1 to 65535');
+      }
+      context.networkPort = value.networkPort;
+    }
+    return context;
+  }
+  return {
+    kind: 'file-change',
+    summary: approvalContextText(value.summary, 'file-change summary', MAX_APPROVAL_FILE_SUMMARY, true),
+    grantRoot: approvalContextText(value.grantRoot, 'file grant root', MAX_APPROVAL_CONTEXT_PATH),
+  };
+}
+
+function buildPendingApproval(value, tool) {
   const bad = (message) => protocolError('bridge_error', message);
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw bad('a pending approval must be an object');
   for (const key of Object.keys(value)) {
-    if (!['id', 'toolName', 'callId', 'reason'].includes(key)) {
+    if (!['id', 'toolName', 'callId', 'reason', 'context'].includes(key)) {
       throw bad('a pending approval carries a field the contract does not allow');
     }
   }
-  if (!isApprovalId(value.id)) throw bad('a pending approval needs the native request id (a UUID)');
+  if (!isApprovalId(value.id)) throw bad('a pending approval needs a UUID v4 phone handle');
   if (typeof value.toolName !== 'string' || value.toolName.trim().length === 0 || value.toolName.length > MAX_APPROVAL_TOOL_NAME || /[\r\n\t\u0000]/.test(value.toolName)) {
     throw bad('a pending approval needs the bounded tool name it is waiting for');
   }
@@ -306,11 +370,26 @@ function buildPendingApproval(value) {
     if (reason.includes('\u0000')) throw bad('an approval reason carries a NUL character');
     if (reason.length > 0) entry.reason = reason;
   }
+  if (Object.prototype.hasOwnProperty.call(value, 'context')) {
+    entry.context = buildApprovalContext(value.context);
+  }
+  if (tool === 'codex' || tool === 'workbuddy') {
+    if (entry.reason === undefined || entry.reason.trim() === '' || entry.context === undefined) {
+      throw bad('a native approval cannot be shown without its reason and complete action context');
+    }
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(entry.reason)) {
+      throw bad('a native approval reason contains a control character');
+    }
+  } else if (entry.context !== undefined && entry.reason === undefined) {
+    throw bad('a contextual approval needs its reason');
+  } else if (entry.context !== undefined && /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(entry.reason)) {
+    throw bad('a contextual approval reason contains a control character');
+  }
   return entry;
 }
 
 /** Validate and normalise the whole pending-approval list of one `session.read`. */
-function buildPendingApprovals(value) {
+function buildPendingApprovals(value, tool) {
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value)) throw protocolError('bridge_error', 'pendingApprovals must be an array');
   // Nothing waiting means the field is absent, exactly like pendingQuestions: a
@@ -321,7 +400,7 @@ function buildPendingApprovals(value) {
   }
   const seen = new Set();
   return value.map((approval) => {
-    const entry = buildPendingApproval(approval);
+    const entry = buildPendingApproval(approval, tool);
     if (seen.has(entry.id)) throw protocolError('bridge_error', 'a pending approval list names the same request twice');
     seen.add(entry.id);
     return entry;
@@ -488,9 +567,9 @@ function buildCapabilities(tools, options = {}) {
     'session.send:model:codex': flag('sendModelCodex', 'codex'),
     'session.send:model:dsh': flag('sendModelDsh', 'dsh'),
     'session.send:model:workbuddy': flag('sendModelWorkbuddy', 'workbuddy'),
-    // WorkBuddy's local history projection is read-only. Keep this explicit
-    // false so the phone can disable the per-tool composer even though other
-    // session sources on the same bridge accept messages.
+    // Per-tool send overrides are explicit so a read-only source or a source
+    // whose native send tool is missing cannot inherit the generic send bit.
+    'session.send:codex': flag('sendCodex', 'codex'),
     'session.send:workbuddy': flag('sendWorkbuddy', 'workbuddy'),
     // CRD 0008: whether this desktop can hand a real answer back to a native
     // question. False is honest for a tool with no answer path at all.
@@ -793,12 +872,12 @@ function buildSessionReadResult({ id, tool, title, status, messages, canStop, ac
   if (typeof canStop !== 'boolean') {
     throw protocolError('bridge_error', 'canStop must be a boolean');
   }
-  if (status === 'working' && (typeof activeTurnId !== 'string' || activeTurnId.length === 0)) {
+  if (status === 'working' && (tool !== 'workbuddy' || activeTurnId !== undefined) && (typeof activeTurnId !== 'string' || activeTurnId.length === 0)) {
     throw protocolError('bridge_error', 'a working session must report an activeTurnId');
   }
   const result = { id, tool, title, status, messages: selectMessages(messages), canStop };
   if (historyTruncated === true || messages.length > MAX_MESSAGES) result.historyTruncated = true;
-  if (status === 'working') {
+  if (status === 'working' && activeTurnId !== undefined) {
     result.activeTurnId = activeTurnId;
   }
   // CRD 0008 §C: the model the host itself reports for this session. Codex has
@@ -816,7 +895,7 @@ function buildSessionReadResult({ id, tool, title, status, messages, canStop, ac
   // Requirement F: real pending permission approvals, bounded, from the native
   // event stream only. A list that does not fit is refused here rather than
   // trimmed - a half-shown approval is not an approval.
-  const approvals = buildPendingApprovals(pendingApprovals);
+  const approvals = buildPendingApprovals(pendingApprovals, tool);
   if (approvals !== undefined) {
     result.pendingApprovals = approvals;
   }
@@ -839,14 +918,17 @@ function buildSessionStopResult(sessionId) {
  * answer belongs to - so the phone can never mistake one answered question for
  * another.
  */
-function buildSessionAnswerResult(sessionId, callId) {
+function buildSessionAnswerResult(sessionId, callId, state = 'submitted') {
   if (!isSessionId(sessionId)) {
     throw protocolError('bridge_error', 'the session id is not a valid session id');
   }
   if (!isCallId(callId)) {
     throw protocolError('bridge_error', 'the call id is not a valid tool call id');
   }
-  return { accepted: true, sessionId, callId };
+  if (!APPROVAL_STATES.includes(state)) {
+    throw protocolError('bridge_error', 'an answer result must say whether it was submitted or confirmed');
+  }
+  return { accepted: true, sessionId, callId, state };
 }
 
 /**

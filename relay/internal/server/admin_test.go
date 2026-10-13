@@ -347,11 +347,21 @@ func TestEnrollmentAdminRPCTargetingWorkBuddyAndMetadataOnlyAudit(t *testing.T) 
 	}
 }
 
-func TestAdminRosterPreservesWorkBuddyReadOnlyCapability(t *testing.T) {
+func TestAdminRosterPreservesPerToolCapabilities(t *testing.T) {
 	e := newAdminEnv(t)
-	readOnly := false
+	codexReadOnly := false
+	workBuddyReadOnly := false
+	workBuddyStop := false
+	workBuddyModels := false
+	workBuddyCreate := false
+	workBuddyModelSend := false
+	workBuddyAnswer := false
+	workBuddyApprove := false
 	_ = e.helloBridge(protocol.Capabilities{
-		Tools: []string{"codex", "workbuddy"}, SessionsList: true, SessionRead: true, SessionSend: true, SendWorkBuddy: &readOnly,
+		Tools: []string{"codex", "workbuddy"}, SessionsList: true, SessionRead: true, SessionSend: true,
+		SendCodex: &codexReadOnly, SendWorkBuddy: &workBuddyReadOnly,
+		StopWorkBuddy: &workBuddyStop, ModelsListWorkBuddy: &workBuddyModels, SessionCreateWorkBuddy: &workBuddyCreate,
+		SendModelWorkBuddy: &workBuddyModelSend, AnswerWorkBuddy: &workBuddyAnswer, ApproveWorkBuddy: &workBuddyApprove,
 		ToolStatus: map[string]protocol.ToolStatus{"workbuddy": {Available: true, Reason: "local history only"}},
 	})
 	resp, token := adminLogin(e, testAdminUsername, testAdminPassword)
@@ -379,11 +389,28 @@ func TestAdminRosterPreservesWorkBuddyReadOnlyCapability(t *testing.T) {
 		t.Fatalf("unexpected administrator roster status/size: %d/%d", response.StatusCode, len(body.Result.Computers))
 	}
 	computer := body.Result.Computers[0]
-	if string(computer.Capabilities["session.send:workbuddy"]) != "false" {
-		t.Fatal("roster lost the explicit false sending capability")
+	if string(computer.Capabilities["session.send:codex"]) != "false" || string(computer.Capabilities["session.send:workbuddy"]) != "false" {
+		t.Fatal("roster lost an explicit false per-tool sending capability")
 	}
 	if string(computer.Capabilities["session.read"]) != "true" || string(computer.Capabilities["session.send"]) != "true" {
 		t.Fatal("roster omitted the shared method capabilities needed to interpret the per-tool override")
+	}
+	for _, name := range []string{
+		"stop:workbuddy", "models.list:workbuddy", "session.create:workbuddy", "session.send:model:workbuddy",
+		"session.answer:workbuddy", "session.approve:workbuddy",
+	} {
+		if string(computer.Capabilities[name]) != "false" {
+			t.Fatalf("roster did not preserve explicit false %s: %s", name, computer.Capabilities[name])
+		}
+	}
+	for _, name := range []string{
+		"session.stop", "models.list", "session.create", "stop:codex", "stop:dsh",
+		"session.send:model:codex", "session.send:model:dsh", "session.answer:codex", "session.answer:dsh",
+		"session.approve:codex", "session.approve:dsh",
+	} {
+		if _, exists := computer.Capabilities[name]; !exists {
+			t.Fatalf("roster omitted declared/shared capability %s", name)
+		}
 	}
 	for _, tool := range computer.Tools {
 		if tool.ID == "workbuddy" && tool.Available {

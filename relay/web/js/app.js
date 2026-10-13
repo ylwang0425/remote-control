@@ -37,9 +37,17 @@
   var DEFAULT_DEVICE_NAME = '手机';
   var STOP_UNSUPPORTED_TEXT = '电脑端未启用这个会话的停止功能';
   var QUESTION_UNSUPPORTED_TEXT = '这个会话不支持在手机上回答，请在电脑上回答。';
-  var APPROVAL_SENT_TEXT = '已提交，等待电脑确认…';
-  var ANSWER_SENT_TEXT = '已提交，等待电脑处理…';
+  var APPROVAL_SENT_TEXT = '已提交，等待原生状态确认…';
+  var APPROVAL_CONFIRMED_TEXT = '电脑已确认这次决定。';
+  var ANSWER_SENT_TEXT = '已提交，等待原生状态确认…';
+  var ANSWER_CONFIRMED_TEXT = '电脑已确认这次回答。';
+  var APPROVAL_INCOMPLETE_TEXT = '权限请求信息不完整或超出安全显示范围，未提供手机审批，请在电脑查看。';
+  var APPROVAL_OVERSIZED_TEXT = '权限请求数量超出安全显示范围，未提供手机审批，请在电脑查看。';
   var APP_VERSION_TEXT = 'AI 工作台 · 手机端界面';
+  var WORKBUDDY_LONG_RPC_METHODS = [
+    'models.list', 'session.create', 'session.send', 'session.stop', 'session.answer', 'session.approve'
+  ];
+  var WORKBUDDY_RPC_OPTIONS = { timeoutMs: 60000, clientTimeoutMs: 65000 };
 
   function createApp(env) {
     var document = env.document;
@@ -161,6 +169,7 @@
       projectRow: byId('project-row'),
       projectSelect: byId('project-select'),
       newText: byId('new-text'),
+      newTextLabel: byId('new-text-label'),
       newTextHint: byId('new-text-hint'),
       cwdRow: byId('cwd-row'),
       cwdInput: byId('cwd-input'),
@@ -307,17 +316,28 @@
       return !!context && context.generation === scopeGeneration && context.scope === currentScopeKey();
     }
 
+    function rpcOptionsFor(body) {
+      var params = body && body.params;
+      if (!params || params.tool !== 'workbuddy' || WORKBUDDY_LONG_RPC_METHODS.indexOf(body.method) === -1) {
+        return null;
+      }
+      return { timeoutMs: WORKBUDDY_RPC_OPTIONS.timeoutMs, clientTimeoutMs: WORKBUDDY_RPC_OPTIONS.clientTimeoutMs };
+    }
+
     /** One transport boundary. Admin calls always name the captured target. */
     function rpc(body, context) {
       var ctx = context || captureRpcContext();
+      var rpcOptions = rpcOptionsFor(body);
       var pending;
       if (ctx.admin) {
         if (!ctx.clientId || typeof apiClient.adminRpc !== 'function') {
           return Promise.resolve({ ok: false, code: 'admin_target_required', message: '请先选择一台在线电脑。', status: 400 });
         }
-        pending = apiClient.adminRpc(ctx.clientId, body);
+        pending = rpcOptions
+          ? apiClient.adminRpc(ctx.clientId, body, rpcOptions)
+          : apiClient.adminRpc(ctx.clientId, body);
       } else {
-        pending = apiClient.rpc(body);
+        pending = rpcOptions ? apiClient.rpc(body, rpcOptions) : apiClient.rpc(body);
       }
       return Promise.resolve(pending).then(function (result) {
         if (!rpcContextIsCurrent(ctx)) {
@@ -533,6 +553,10 @@
 
     function capabilityFor(prefix, tool) {
       return capabilityForCapabilities(state.capabilities, prefix, tool);
+    }
+
+    function canChooseMessageModel(tool) {
+      return capabilityFor('session.send', tool) && capabilityFor('session.send:model', tool);
     }
 
     function toolIsReadOnly(tool) {
@@ -1806,7 +1830,7 @@
       if (el.composer) el.composer.hidden = !canSend;
       if (el.workBuddyReadonlyNote) {
         var workBuddyReadOnly = current.tool === 'workbuddy' && toolIsReadOnly(current.tool);
-        el.workBuddyReadonlyNote.hidden = canSend;
+        el.workBuddyReadonlyNote.hidden = current.tool !== 'workbuddy' || canSend;
         if (el.workBuddyReadonlyText) {
           el.workBuddyReadonlyText.textContent = workBuddyReadOnly
             ? '可查看本机会话；续聊和授权操作暂未接入。'
@@ -2094,19 +2118,19 @@
     function approvalSignature(current, approval) {
       var receipt = state.approvalReceipts[approvalReceiptKey(current.id, approval.id)] || null;
       return [
-        current.id, approval.id, approval.toolName, approval.callId, approval.reason,
+        current.id, approval.id, approval.toolName, approval.callId, approval.reason, JSON.stringify(approval.context || null),
         receipt ? (receipt.state + '\u0000' + (receipt.message || '')) : 'none'
       ].join('\u0001');
     }
 
     function renderPendingApprovals(current) {
       if (!el.approvalsPanel) return;
-      var approvals = core.pendingApprovalsOf({
+      var projection = core.pendingApprovalsProjection({
         capabilities: state.capabilities,
         tool: current.tool,
         read: current.raw
       });
-      if (approvals.length === 0) {
+      if (projection.state === 'none' || (projection.state === 'unsupported' && projection.approvals.length === 0)) {
         el.approvalsPanel.hidden = true;
         // Remove the controls rather than leaving another session's request
         // hidden but still live in the DOM.
@@ -2114,6 +2138,18 @@
         return;
       }
       el.approvalsPanel.hidden = false;
+      if (projection.state !== 'ready' && projection.state !== 'unsupported') {
+        ui.clear(el.approvalsList);
+        var notice = document.createElement('li');
+        notice.setAttribute('class', 'pending-card');
+        notice.appendChild(ui.make(
+          document, 'p', 'pending-reason',
+          projection.state === 'oversized' ? APPROVAL_OVERSIZED_TEXT : APPROVAL_INCOMPLETE_TEXT
+        ));
+        el.approvalsList.appendChild(notice);
+        return;
+      }
+      var approvals = projection.approvals;
       var entries = approvals.map(function (approval) {
         return {
           key: approval.id,
@@ -2143,6 +2179,15 @@
 
       var reason = ui.make(document, 'p', 'pending-reason', '');
       item.appendChild(reason);
+      var context = ui.make(document, 'div', 'pending-context', '');
+      approvalContextRows(approval.context).forEach(function (entry) {
+        var row = ui.make(document, 'p', 'pending-context-row', '');
+        row.setAttribute('data-context-field', entry.key);
+        row.appendChild(ui.make(document, 'span', 'pending-context-label', entry.label));
+        row.appendChild(ui.make(document, 'span', 'pending-context-value', ''));
+        context.appendChild(row);
+      });
+      item.appendChild(context);
       item.appendChild(ui.make(
         document, 'p', 'pending-hint',
         '这是电脑端发出的真实权限请求。只对这一次请求生效，不会改变电脑的权限设置。'
@@ -2163,6 +2208,31 @@
 
       item.appendChild(ui.make(document, 'p', 'pending-note', ''));
       return item;
+    }
+
+    function approvalContextRows(context) {
+      if (!context) return [];
+      if (context.kind === 'command') {
+        return [
+          { key: 'command', label: '命令' },
+          { key: 'cwd', label: '工作目录' }
+        ];
+      }
+      if (context.kind === 'network') {
+        var rows = [
+          { key: 'networkHost', label: '目标主机' },
+          { key: 'protocol', label: '协议' }
+        ];
+        if (typeof context.networkPort === 'number') rows.push({ key: 'networkPort', label: '端口' });
+        return rows;
+      }
+      if (context.kind === 'file-change') {
+        return [
+          { key: 'summary', label: '变更摘要' },
+          { key: 'grantRoot', label: '授权范围' }
+        ];
+      }
+      return [];
     }
 
     /**
@@ -2188,17 +2258,35 @@
         reason.textContent = approval.reason || '';
         reason.hidden = !approval.reason;
       }
+      var contextBox = item.querySelector('.pending-context');
+      if (contextBox) {
+        var rows = approvalContextRows(approval.context);
+        contextBox.hidden = rows.length === 0;
+        Array.prototype.forEach.call(contextBox.children, function (row) {
+          var field = row.getAttribute('data-context-field');
+          var rawValue = approval.context && approval.context[field];
+          var value = typeof rawValue === 'string' || typeof rawValue === 'number' ? String(rawValue) : '';
+          var valueNode = row.querySelector('.pending-context-value');
+          if (valueNode) valueNode.textContent = value;
+          row.hidden = value === '';
+        });
+      }
       var receipt = state.approvalReceipts[approvalReceiptKey(current.id, approval.id)] || null;
-      var submitted = !!(receipt && receipt.state === 'submitted');
+      var canApprove = capabilityFor('session.approve', current.tool);
+      var settled = !canApprove || !!(receipt && (receipt.state === 'submitted' || receipt.state === 'confirmed'));
       var actions = item.querySelector('.pending-actions');
+      if (actions) actions.hidden = !canApprove;
       Array.prototype.forEach.call(actions ? actions.children : [], function (button) {
-        button.disabled = submitted;
+        button.disabled = settled;
       });
       var note = item.querySelector('.pending-note');
       if (note) {
-        note.textContent = receipt
-          ? (receipt.state === 'submitted' ? APPROVAL_SENT_TEXT : (receipt.message || ''))
-          : '';
+        note.textContent = !canApprove
+          ? '此权限请求只能在电脑上处理。'
+          : (receipt
+            ? (receipt.state === 'submitted' ? APPROVAL_SENT_TEXT :
+              (receipt.state === 'confirmed' ? APPROVAL_CONFIRMED_TEXT : (receipt.message || '')))
+            : '');
         note.hidden = note.textContent === '';
       }
     }
@@ -2216,6 +2304,7 @@
         return [
           question.id,
           question.multiSelect ? 'm' : 's',
+          question.allowCustom === false ? 'no-other' : 'other',
           question.header || '',
           question.question,
           question.detail || '',
@@ -2397,7 +2486,7 @@
         }
       }
       var receipt = state.answerReceipts[answerDraftKey(current.id, batch.callId)] || null;
-      var submitted = !!(receipt && receipt.state === 'submitted');
+      var submitted = !!(receipt && (receipt.state === 'submitted' || receipt.state === 'confirmed'));
       // Deliberately a single simple selector: `.pending-actions button` is a
       // descendant combinator, which a minimal DOM may not resolve. Query the
       // container, then its own children.
@@ -2408,7 +2497,8 @@
       var note = item.querySelector('.pending-note');
       if (note) {
         note.textContent = receipt
-          ? (receipt.state === 'submitted' ? ANSWER_SENT_TEXT : (receipt.message || ''))
+          ? (receipt.state === 'submitted' ? ANSWER_SENT_TEXT :
+            (receipt.state === 'confirmed' ? ANSWER_CONFIRMED_TEXT : (receipt.message || '')))
           : '';
         note.hidden = note.textContent === '';
       }
@@ -2448,6 +2538,7 @@
       input.setAttribute('maxlength', '1000');
       input.setAttribute('placeholder', question.multiSelect ? '补充说明（可选）' : '或自己输入答案');
       input.setAttribute('data-custom-for', question.id);
+      input.hidden = question.allowCustom === false;
       if (typeof custom === 'string' && custom !== '') {
         input.value = custom;
       }
@@ -2518,6 +2609,7 @@
       paintQuestionRow(wrap, question, draft);
       var input = wrap.querySelector('.question-custom');
       if (input) {
+        input.hidden = question.allowCustom === false;
         var placeholder = question.multiSelect ? '补充说明（可选）' : '或自己输入答案';
         if (input.getAttribute('placeholder') !== placeholder) {
           input.setAttribute('placeholder', placeholder);
@@ -2525,7 +2617,7 @@
         // The LIVE value wins over the draft: it is what the user can see, and
         // a host that never fired `input` (autofill, an IME commit) must not
         // have its text quietly reverted.
-        if (typeof input.value === 'string') {
+        if (typeof input.value === 'string' && question.allowCustom !== false) {
           draft.custom[question.id] = input.value;
         } else if (typeof draft.custom[question.id] === 'string' && input.value !== draft.custom[question.id]) {
           input.value = draft.custom[question.id];
@@ -2543,6 +2635,7 @@
      */
     function reconcileDraftWithForm(draft, batch) {
       batch.questions.forEach(function (question) {
+        if (question.allowCustom === false) draft.custom[question.id] = '';
         var labels = question.options.map(function (option) { return option.label; });
         var chosen = draft.selected[question.id];
         if (labels.length === 0) {
@@ -2626,7 +2719,7 @@
       var sessionId = current.id;
       var key = answerDraftKey(sessionId, batch.callId);
       var receipt = state.answerReceipts[key];
-      if (receipt && receipt.state === 'submitted') {
+      if (receipt && (receipt.state === 'submitted' || receipt.state === 'confirmed')) {
         return; // already submitted once; only a fresh read may clear this
       }
       // Re-validate against the form the user is looking at, so an option that
@@ -2652,8 +2745,9 @@
       state.busyAnswer = false;
 
       var accepted = !!(result.ok && result.result && result.result.accepted === true);
+      var answerState = result && result.result && result.result.state === 'confirmed' ? 'confirmed' : 'submitted';
       state.answerReceipts[key] = accepted
-        ? { state: 'submitted', message: '' }
+        ? { state: answerState, message: '' }
         : { state: 'error', message: core.errorMessage(result.code, result.message) };
       if (!accepted && isUnreachable(result)) {
         handleFailure(result, 'detail');
@@ -2670,7 +2764,7 @@
       var sessionId = current.id;
       var key = approvalReceiptKey(sessionId, approval.id);
       var receipt = state.approvalReceipts[key];
-      if (receipt && receipt.state === 'submitted') {
+      if (receipt && (receipt.state === 'submitted' || receipt.state === 'confirmed')) {
         return; // exactly once per request; native first answer wins
       }
       var live = state.current;
@@ -2696,7 +2790,9 @@
         // 'submitted' means the transport took it, NOT that this phone won the
         // race: another client may have answered first. The card keeps its
         // receipt and disappears only when the desktop stops reporting it.
-        state.approvalReceipts[key] = { state: 'submitted', message: '' };
+        state.approvalReceipts[key] = {
+          state: result.result.state === 'confirmed' ? 'confirmed' : 'submitted', message: ''
+        };
       } else {
         state.approvalReceipts[key] = { state: 'error', message: core.errorMessage(result.code, result.message) };
         if (isUnreachable(result)) handleFailure(result, 'detail');
@@ -2709,7 +2805,9 @@
 
     function selectedModelOption() {
       var sessionCatalog = state.sessionCatalog;
-      if (!sessionCatalog) return null;
+      var current = state.current;
+      if (!current || !canChooseMessageModel(current.tool) ||
+          !sessionCatalog || sessionCatalog.tool !== current.tool) return null;
       return core.modelOptionByKey(core.modelOptions(sessionCatalog.catalog), sessionCatalog.key);
     }
 
@@ -2793,9 +2891,25 @@
     }
 
     function renderModelPicker() {
+      var session = state.current;
+      var canChooseModel = !!session && canChooseMessageModel(session.tool);
+      var current = session ? session.currentModel : null;
       var picker = state.sessionCatalog;
+      if (picker && session && picker.tool !== session.tool) picker = null;
       var options = picker ? core.modelOptions(picker.catalog) : [];
-      var current = state.current ? state.current.currentModel : null;
+
+      if (el.modelChipRow) el.modelChipRow.hidden = !canChooseModel;
+      if (!canChooseModel) {
+        if (el.modelPicker) el.modelPicker.hidden = true;
+        if (el.modelResetButton) el.modelResetButton.hidden = true;
+        // A catalog may still be useful to the project sheet, but a model
+        // preference is meaningful only when this exact tool may send it.
+        if (picker && session && picker.tool === session.tool) {
+          picker.key = '';
+          picker.effort = '';
+        }
+        return;
+      }
 
       // The picker's own contents are the expensive part; when nothing they
       // depend on moved, they are not repainted at all.
@@ -2897,7 +3011,8 @@
         ? (state.sessionCatalog && state.sessionCatalog.key === option.key)
         : !(state.sessionCatalog && state.sessionCatalog.key);
       var row = ui.button(document, '', 'picker-row' + (active ? ' picker-row-active' : ''), function () {
-        if (!state.sessionCatalog) return;
+        if (!state.current || !canChooseMessageModel(state.current.tool) ||
+            !state.sessionCatalog || state.sessionCatalog.tool !== state.current.tool) return;
         state.sessionCatalog.key = key;
         state.sessionCatalog.effort = '';
         renderModelPicker();
@@ -2929,7 +3044,7 @@
     }
 
     function toggleModelPicker() {
-      if (!el.modelPicker) return;
+      if (!el.modelPicker || !state.current || !canChooseMessageModel(state.current.tool)) return;
       el.modelPicker.hidden = !el.modelPicker.hidden;
       if (!el.modelPicker.hidden) {
         renderModelPicker();
@@ -3155,8 +3270,10 @@
 
       // The model override applies to THIS message only. `mode: 'inherit'`
       // (the default) emits the plain three-field body an older desktop knows.
-      var chosen = selectedModelOption();
-      var effort = state.sessionCatalog ? state.sessionCatalog.effort : '';
+      var canChooseModel = canChooseMessageModel(current.tool);
+      var chosen = canChooseModel ? selectedModelOption() : null;
+      var effort = canChooseModel && state.sessionCatalog && state.sessionCatalog.tool === current.tool
+        ? state.sessionCatalog.effort : '';
       var body = core.sessionSendBody({
         tool: current.tool,
         sessionId: current.id,
@@ -3653,18 +3770,26 @@
       }
 
       // --- first message ----------------------------------------------------
-      // Codex's native create_thread requires a prompt, so a Codex creation
-      // must carry one. We say so plainly instead of inventing a filler prompt
-      // the user never wrote.
-      var needsText = newState.tool === 'codex';
+      // Codex's native create_thread requires a prompt. WorkBuddy only
+      // persists a chat UUID after its first message is sent. Neither tool may
+      // receive an invented filler prompt; DSH retains its optional first text.
+      var needsText = newState.tool === 'codex' || newState.tool === 'workbuddy';
+      var workBuddyNeedsText = newState.tool === 'workbuddy';
+      if (el.newTextLabel) {
+        el.newTextLabel.textContent = needsText ? '首条消息（必填）' : '首条消息（可选）';
+      }
       if (el.newTextHint) {
         el.newTextHint.hidden = !needsText;
-        el.newTextHint.textContent = needsText ? 'Codex 需要首条消息才能真正开始这个会话。' : '';
+        el.newTextHint.textContent = workBuddyNeedsText
+          ? '发送第一条消息后创建聊天。'
+          : (needsText ? 'Codex 需要首条消息才能真正开始这个会话。' : '');
       }
       if (el.newText) {
         el.newText.setAttribute(
           'placeholder',
-          needsText ? 'Codex 必填：这个会话的第一条消息' : '可以留空，创建后再发'
+          workBuddyNeedsText
+            ? 'WorkBuddy 必填：这个聊天的第一条消息'
+            : (needsText ? 'Codex 必填：这个会话的第一条消息' : '可以留空，创建后再发')
         );
       }
       var textValue = el.newText ? el.newText.value : '';
@@ -3694,10 +3819,16 @@
       var selected = core.modelOptionByKey(options, newState.selectedKey);
       if (!selected) return;
 
+      var firstText = el.newText ? el.newText.value : '';
+      if (newState.tool === 'workbuddy' && firstText.trim() === '') {
+        if (el.newError) el.newError.textContent = 'WorkBuddy 要在发送第一条消息后创建聊天，请先输入首条消息。';
+        renderNewPanel();
+        return;
+      }
+
       if (!newState.requestId) {
         newState.requestId = core.newRequestId();
       }
-      var firstText = el.newText ? el.newText.value : '';
       var optional = {
         tool: newState.tool,
         text: firstText,
@@ -4022,7 +4153,8 @@
         el.newText.addEventListener('input', function () {
           // The first message is part of the creation, so editing it makes this
           // a different creation. Re-render to update the submit gate (Codex
-          // requires a first message).
+          // requires a first message; WorkBuddy does too because its session id
+          // is only persisted after the first message is sent).
           newState.requestId = '';
           renderNewPanel();
         });

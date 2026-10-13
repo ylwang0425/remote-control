@@ -80,7 +80,7 @@ https://101.43.98.18 {
 	}
 
 	# There is deliberately no file_server here. The relay serves its own site
-	# from /opt/ai-remote/web and its APK whitelist from /opt/ai-remote/downloads,
+	# from /opt/ai-remote/web and its release whitelist from /opt/ai-remote/downloads,
 	# and the two route families must never fall back into each other (R19
 	# item 1). A second file server on this host is exactly how that fallback
 	# starts.

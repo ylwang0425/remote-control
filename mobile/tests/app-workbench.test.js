@@ -46,11 +46,14 @@ const CAPS = {
   'stop:codex': true, 'stop:dsh': true,
   'models.list': true, 'session.create': true,
   'models.list:codex': true, 'models.list:dsh': true,
+  'session.send:model': true,
+  'session.send:model:codex': true, 'session.send:model:dsh': true,
   'session.create:codex': true, 'session.create:dsh': true,
   'session.answer:dsh': true, 'session.approve:dsh': true,
   'session.answer:codex': false, 'session.approve:codex': false,
   tools: ['codex', 'dsh']
 };
+const WORKBUDDY_RPC_OPTIONS = { timeoutMs: 60000, clientTimeoutMs: 65000 };
 
 const DSH_CATALOG = {
   tool: 'dsh',
@@ -152,7 +155,7 @@ function fakeApi(overrides) {
     on(name, response) { queues[name].push(response); return this; },
     health() { return next('health', []); },
     pair(code, deviceName) { return next('pair', [code, deviceName]); },
-    rpc(body) {
+    rpc(body, rpcOptions) {
       const name = {
         'sessions.list': 'list',
         'session.read': 'read',
@@ -163,14 +166,14 @@ function fakeApi(overrides) {
         'session.answer': 'answer',
         'session.approve': 'approve'
       }[body.method];
-      return next(name || ('unknown:' + body.method), [body]);
+      return next(name || ('unknown:' + body.method), [body, rpcOptions]);
     },
     logout() { return next('logout', []); },
     me() { return next('me', []); },
     adminLogin(username, password) { return next('adminLogin', [{ username, password }]); },
     adminLogout() { return next('adminLogout', []); },
     adminComputers() { return next('adminComputers', []); },
-    adminRpc(clientId, body) { return next('adminRpc', [{ clientId, body }]); },
+    adminRpc(clientId, body, rpcOptions) { return next('adminRpc', [{ clientId, body }, rpcOptions]); },
     adminEnrollmentCodes() { return next('adminEnrollmentCodes', []); },
     callsOf(name) { return calls.filter((c) => c.name === name); }
   };
@@ -586,6 +589,7 @@ test('a normal send keeps the old body; a chosen model carries provider and effo
     method: 'session.send',
     params: { tool: 'dsh', sessionId: 'b2', text: '继续' }
   });
+  assert.equal(api.callsOf('send')[0].args[1], undefined, 'ordinary DSH sends keep the default timeout');
 
   // Choose the SECOND provider of the same model id, and an effort.
   const secondKey = core.modelOptionKey(core.modelOptions(DSH_CATALOG)[1]);
@@ -615,6 +619,48 @@ test('a normal send keeps the old body; a chosen model carries provider and effo
     method: 'session.send',
     params: { tool: 'dsh', sessionId: 'b2', text: '还是原来的' }
   });
+});
+
+test('a per-tool false model-send flag hides model choice but preserves ordinary send', async () => {
+  const capabilities = Object.assign({}, CAPS, {
+    'session.send:workbuddy': true,
+    'session.send:model': true,
+    'session.send:model:workbuddy': false,
+    'models.list:workbuddy': true,
+    tools: ['workbuddy']
+  });
+  const read = {
+    id: 'wb-chat', tool: 'workbuddy', title: 'WorkBuddy chat', status: 'idle', messages: [],
+    currentModel: { model: 'Kimi-K3' }, pendingQuestions: [], pendingApprovals: []
+  };
+  const catalog = { tool: 'workbuddy', models: [{ id: 'Kimi-K3', label: 'Kimi-K3' }], projects: [] };
+  const { doc, app, api } = boot({
+    defaults: { models: ok(catalog) },
+    responses: {
+      list: ok({ sessions: [{ id: read.id, tool: 'workbuddy', title: read.title, status: 'idle' }], capabilities }),
+      read: ok(read)
+    }
+  });
+  await app.start();
+  await app.openSession(read.id);
+  await settle();
+
+  assert.equal(doc.getElementById('composer').hidden, false,
+    'session.send remains usable when only model override is denied');
+  assert.equal(doc.getElementById('model-chip-row').hidden, true,
+    'an explicit per-tool false overrides the generic model-send true');
+  assert.equal(doc.getElementById('model-picker').hidden, true);
+  const catalogCallsBeforeClick = api.callsOf('models').length;
+  doc.getElementById('model-chip-button').dispatch('click');
+  await settle();
+  assert.equal(doc.getElementById('model-picker').hidden, true);
+  assert.equal(api.callsOf('models').length, catalogCallsBeforeClick,
+    'the hidden unsupported picker cannot trigger an extra catalog request');
+
+  await app.sendMessage('继续 WorkBuddy');
+  assert.deepEqual(api.callsOf('send')[0].args[0], {
+    method: 'session.send', params: { tool: 'workbuddy', sessionId: read.id, text: '继续 WorkBuddy' }
+  }, 'plain send omits model and effort fields');
 });
 
 test('the effort selector only offers what the chosen model really supports', async () => {
@@ -742,6 +788,30 @@ test('pending questions render the desktop labels, cardinality and custom field'
   assert.match(doc.getElementById('questions-list').textContent, /请为每个问题选择答案/);
 });
 
+test('a native question with allowCustom false hides the custom-answer field', async () => {
+  const capabilities = Object.assign({}, CAPS, { 'session.answer:codex': true });
+  const codexRead = {
+    id: 'a1', tool: 'codex', title: 'Codex question', status: 'working', messages: [],
+    pendingQuestions: [{
+      callId: 'native-call', state: 'open', questions: [{
+        id: 'native-q', question: 'Choose one', options: [{ label: 'A' }, { label: 'B' }], allowCustom: false
+      }]
+    }]
+  };
+  const { doc, app } = boot({
+    responses: {
+      list: ok({ sessions: SESSIONS, capabilities }),
+      read: ok(codexRead)
+    }
+  });
+  await app.start();
+  await app.openSession('a1');
+  const custom = byAttr(doc, 'data-custom-for', 'native-q')[0];
+  assert.ok(custom);
+  assert.equal(custom.hidden, true);
+  assert.match(doc.getElementById('questions-list').textContent, /Choose one/);
+});
+
 test('a single-select question replaces its choice; a multi-select accumulates', async () => {
   const { doc, app, api } = boot();
   await app.start();
@@ -773,9 +843,11 @@ test('a single-select question replaces its choice; a multi-select accumulates',
       ]
     }
   });
-  // 'submitted' is what the transport said, and the card stays until the
-  // desktop's own state settles.
-  assert.match(doc.getElementById('questions-list').textContent, /已提交/);
+  // An old acknowledgement without a native state is only a submission
+  // receipt; it must not be shown as a confirmed answer.
+  assert.equal(app.state.answerReceipts[Object.keys(app.state.answerReceipts)[0]].state, 'submitted');
+  assert.match(doc.getElementById('questions-list').textContent, /已提交，等待原生状态确认/);
+  assert.doesNotMatch(doc.getElementById('questions-list').textContent, /电脑已确认这次回答/);
   assert.equal(byAttr(doc, 'data-answer-call', 'call-42')[0].disabled, true);
 });
 
@@ -998,7 +1070,7 @@ test('the approval panel shows the real tool and reason, and submits exactly onc
   });
   // 'submitted' is transport submission, not a won race: the card says 已提交,
   // waits, and its buttons are disabled so nothing is submitted twice.
-  assert.match(doc.getElementById('approvals-list').textContent, /已提交，等待电脑确认/);
+  assert.match(doc.getElementById('approvals-list').textContent, /已提交，等待原生状态确认/);
   clickApproval(doc, '拒绝');
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(api.callsOf('approve').length, 1);
@@ -1057,20 +1129,30 @@ test('a race where another client answered first does not become a false success
 
   const panel = doc.getElementById('approvals-panel');
   assert.equal(panel.hidden, false, 'a pending request stays visible');
-  assert.match(panel.textContent, /已提交，等待电脑确认/, 'the receipt never claims the permission was granted');
+  assert.match(panel.textContent, /已提交，等待原生状态确认/, 'the receipt never claims the permission was granted');
   assert.ok(!/已允许|授权成功/.test(panel.textContent));
 });
 
-test('a Codex session never grows an approval button', async () => {
+test('a Codex approval with an explicit false capability stays visible without decision buttons', async () => {
   const codexRead = {
     id: 'a1', tool: 'codex', title: '重构 relay 的转发层', status: 'working',
     messages: [], canStop: true,
-    pendingApprovals: DSH_READ.pendingApprovals
+    pendingApprovals: [{
+      id: APPROVAL_ID, toolName: 'commandExecution', callId: 'item-1',
+      reason: 'Codex requests permission to run this command.',
+      context: { kind: 'command', command: 'npm test\nnode scripts/check.js', cwd: 'D:\\project' }
+    }]
   };
   const { doc, app, api } = boot({ responses: { read: ok(codexRead) } });
   await app.start();
   await app.openSession('a1');
-  assert.equal(doc.getElementById('approvals-panel').hidden, true);
+  const panel = doc.getElementById('approvals-panel');
+  assert.equal(panel.hidden, false);
+  assert.match(panel.textContent, /Codex requests permission/);
+  assert.match(panel.textContent, /npm test\nnode scripts\/check.js/);
+  assert.match(panel.textContent, /只能在电脑上处理/);
+  const card = byAttr(doc, 'data-approval-id', APPROVAL_ID)[0];
+  assert.equal(card.querySelector('.pending-actions').hidden, true, 'an explicit false capability adds no decision controls');
   assert.deepEqual(api.callsOf('approve'), []);
 });
 
@@ -1365,6 +1447,10 @@ test('a new session is created against the CHOSEN tool own project id', async ()
 
   // Codex is the tool: the select must offer Codex's OWN id for that directory.
   assert.equal(app.newState.tool, 'codex');
+  assert.equal(doc.getElementById('new-text-label').textContent, '首条消息（必填）');
+  assert.match(doc.getElementById('new-text-hint').textContent, /Codex 需要首条消息/);
+  assert.equal(doc.getElementById('new-submit').disabled, true,
+    'the WorkBuddy-only gate must not weaken Codex native prompt requirements');
   const values = doc.getElementById('project-select').children.map((o) => o.getAttribute('value'));
   assert.deepEqual(values, ['', codexId], 'only this tool\'s real projects may be offered');
   assert.equal(doc.getElementById('project-select').value, codexId,
@@ -1812,6 +1898,102 @@ test('a late response from computer A cannot replace computer B detail with the 
   assert.equal(app.state.current.scopeKey, 'admin:pc-b');
 });
 
+test('message model choices do not carry across computer or tool changes', async () => {
+  const capabilities = Object.assign({}, CAPS, {
+    'session.send:dsh': true,
+    'session.send:codex': true,
+    'session.send:model:dsh': true,
+    'session.send:model:codex': false,
+    tools: ['dsh', 'codex']
+  });
+  const dshReadA = {
+    id: 'shared-session', tool: 'dsh', title: 'A session', status: 'idle', messages: [],
+    currentModel: { model: 'A current model', provider: 'A provider' }, pendingQuestions: [], pendingApprovals: []
+  };
+  const dshReadB = {
+    id: 'shared-session', tool: 'dsh', title: 'B session', status: 'idle', messages: [],
+    currentModel: { model: 'B current model', provider: 'B provider' }, pendingQuestions: [], pendingApprovals: []
+  };
+  const codexReadB = {
+    id: 'codex-session', tool: 'codex', title: 'Codex session', status: 'idle', messages: [],
+    currentModel: { model: 'Codex current model' }, pendingQuestions: [], pendingApprovals: []
+  };
+  const catalogA = { tool: 'dsh', models: [{ id: 'A-only-model', label: 'A-only-model' }], projects: [] };
+  const catalogB = { tool: 'dsh', models: [{ id: 'B-only-model', label: 'B-only-model' }], projects: [] };
+  const codexCatalog = { tool: 'codex', models: [{ id: 'Codex model', label: 'Codex model' }], projects: [] };
+  const targets = {
+    'pc-a': {
+      sessions: [{ id: 'shared-session', tool: 'dsh', title: 'A session', status: 'idle' }],
+      capabilities, reads: { 'shared-session': dshReadA }, catalogs: { dsh: catalogA }
+    },
+    'pc-b': {
+      sessions: [
+        { id: 'shared-session', tool: 'dsh', title: 'B session', status: 'idle' },
+        { id: 'codex-session', tool: 'codex', title: 'Codex session', status: 'idle' }
+      ],
+      capabilities,
+      reads: { 'shared-session': dshReadB, 'codex-session': codexReadB },
+      catalogs: { dsh: catalogB, codex: codexCatalog }
+    }
+  };
+  const computers = ['pc-a', 'pc-b'].map((clientId) => ({
+    clientId, ownerName: clientId, clientName: 'Laptop', online: true,
+    tools: [{ id: 'dsh', available: true }, { id: 'codex', available: true }]
+  }));
+  const { doc, app, api } = await enterAdmin({ defaults: {
+    adminComputers: ok({ computers }), adminRpc: adminRpcFixture(targets)
+  } });
+
+  byAttr(doc, 'data-client-id', 'pc-a')[0].dispatch('click');
+  await settle();
+  await app.openSession('shared-session');
+  doc.getElementById('model-chip-button').dispatch('click');
+  await settle();
+  const aKey = core.modelOptionKey(core.modelOptions(catalogA)[0]);
+  assert.ok(byAttr(doc, 'data-model-key', aKey)[0]);
+  byAttr(doc, 'data-model-key', aKey)[0].dispatch('click');
+  assert.match(text(doc, 'model-chip-button'), /A-only-model/);
+
+  doc.getElementById('admin-context-back').dispatch('click');
+  await settle();
+  byAttr(doc, 'data-client-id', 'pc-b')[0].dispatch('click');
+  await settle();
+  await app.openSession('shared-session');
+  assert.match(text(doc, 'model-chip-button'), /B current model/,
+    'the active chip starts from this computer native current model, not A selected preference');
+  doc.getElementById('model-chip-button').dispatch('click');
+  await settle();
+  const bKey = core.modelOptionKey(core.modelOptions(catalogB)[0]);
+  const bOption = byAttr(doc, 'data-model-key', bKey)[0];
+  assert.ok(bOption);
+  assert.equal(bOption.getAttribute('class'), 'picker-row', 'B model is not preselected from computer A');
+  assert.equal(byAttr(doc, 'data-model-key', aKey).length, 0, 'A catalog is not shown for computer B');
+  bOption.dispatch('click');
+  assert.match(text(doc, 'model-chip-button'), /B-only-model/);
+
+  await app.openSession('codex-session');
+  assert.equal(doc.getElementById('model-chip-row').hidden, true,
+    'the explicit per-tool false hides model selection after switching to Codex');
+  const codexCatalogCallsBeforeClick = api.callsOf('adminRpc').filter((call) =>
+    call.args[0].clientId === 'pc-b' && call.args[0].body.method === 'models.list' && call.args[0].body.params.tool === 'codex'
+  ).length;
+  doc.getElementById('model-chip-button').dispatch('click');
+  await settle();
+  assert.equal(doc.getElementById('model-picker').hidden, true);
+  doc.getElementById('send-input').value = 'Codex plain send';
+  await app.sendMessage();
+  const codexSend = api.callsOf('adminRpc').filter((call) =>
+    call.args[0].clientId === 'pc-b' && call.args[0].body.method === 'session.send'
+  )[0];
+  assert.ok(codexSend);
+  assert.deepEqual(codexSend.args[0].body.params, {
+    tool: 'codex', sessionId: 'codex-session', text: 'Codex plain send'
+  }, 'the previous DSH selection is never submitted after a tool change');
+  assert.equal(api.callsOf('adminRpc').filter((call) =>
+    call.args[0].clientId === 'pc-b' && call.args[0].body.method === 'models.list' && call.args[0].body.params.tool === 'codex'
+  ).length, codexCatalogCallsBeforeClick, 'the denied picker cannot trigger an additional catalog request');
+});
+
 test('WorkBuddy appears by its real tool ID and can create only from the selected target catalog', async () => {
   const capabilities = {
     'sessions.list': true,
@@ -1837,12 +2019,61 @@ test('WorkBuddy appears by its real tool ID and can create only from the selecte
   assert.equal(button.textContent, 'WorkBuddy');
   assert.equal(button.disabled, false);
   assert.match(doc.getElementById('model-select').textContent, /WorkBuddy model/);
+
+  const firstText = doc.getElementById('new-text');
+  const firstTextLabel = doc.getElementById('new-text-label');
+  const firstTextHint = doc.getElementById('new-text-hint');
+  const submit = doc.getElementById('new-submit');
+  assert.equal(firstTextLabel.textContent, '首条消息（必填）');
+  assert.equal(firstTextHint.hidden, false);
+  assert.match(firstTextHint.textContent, /发送第一条消息后创建聊天/);
+  assert.equal(submit.disabled, true, 'the empty first message disables WorkBuddy create');
+  await app.submitNewSession();
+  assert.equal(api.callsOf('adminRpc').filter((call) => call.args[0].body.method === 'session.create').length, 0,
+    'a direct submit call cannot bypass the empty-message UI gate');
+
+  firstText.value = '   \n  ';
+  firstText.dispatch('input');
+  assert.equal(submit.disabled, true, 'whitespace alone is still empty');
+  await app.submitNewSession();
+  assert.equal(api.callsOf('adminRpc').filter((call) => call.args[0].body.method === 'session.create').length, 0,
+    'whitespace-only content cannot create a native chat');
+
+  firstText.value = '请帮我检查这个项目';
+  firstText.dispatch('input');
+  assert.equal(submit.disabled, false);
   await app.submitNewSession();
   const create = api.callsOf('adminRpc').filter((call) => call.args[0].body.method === 'session.create')[0];
   assert.ok(create);
   assert.equal(create.args[0].clientId, 'workbuddy-pc');
   assert.equal(create.args[0].body.params.tool, 'workbuddy');
+  assert.equal(create.args[0].body.params.text, '请帮我检查这个项目');
   assert.equal(create.args[0].body.params.model, 'wb-model-1');
+  const modelList = api.callsOf('adminRpc').filter((call) =>
+    call.args[0].clientId === 'workbuddy-pc' && call.args[0].body.method === 'models.list'
+  )[0];
+  assert.ok(modelList);
+  assert.deepEqual(modelList.args[1], WORKBUDDY_RPC_OPTIONS,
+    'slow WorkBuddy catalog calls use the extended budget in admin mode');
+  assert.deepEqual(create.args[1], WORKBUDDY_RPC_OPTIONS,
+    'WorkBuddy create carries the same budget without changing its exact admin target');
+});
+
+test('DSH keeps its optional empty first message when the WorkBuddy create gate is active', async () => {
+  const { doc, app, api } = boot();
+  await app.start();
+  await app.openNewSession({ tool: 'dsh' });
+  await settle();
+
+  assert.equal(app.newState.tool, 'dsh');
+  assert.equal(doc.getElementById('new-text-label').textContent, '首条消息（可选）');
+  assert.equal(doc.getElementById('new-text-hint').hidden, true);
+  assert.equal(doc.getElementById('new-submit').disabled, false);
+  await app.submitNewSession();
+  await settle();
+  const create = api.callsOf('create').find((call) => call.args[0].method === 'session.create');
+  assert.ok(create);
+  assert.equal(create.args[0].params.text, undefined, 'blank optional text stays omitted for DSH');
 });
 
 test('an explicitly unavailable WorkBuddy adapter shows the backend reason and sends no model or create request', async () => {
@@ -2004,4 +2235,70 @@ test('a per-tool WorkBuddy send grant overrides a false shared default', async (
   assert.deepEqual(api.callsOf('send')[0].args[0], {
     method: 'session.send', params: { tool: 'workbuddy', sessionId: read.id, text: '续聊已获支持' }
   });
+  assert.deepEqual(api.callsOf('send')[0].args[1], WORKBUDDY_RPC_OPTIONS,
+    'slow WorkBuddy sends use the same per-call budget in paired mode');
+  assert.equal(api.callsOf('read')[0].args[1], undefined,
+    'fast history reads retain the default budget');
+  assert.equal(api.callsOf('list')[0].args[1], undefined,
+    'cross-tool session listing retains the default budget');
+});
+
+test('WorkBuddy stop, answer and approval use the per-call budget only for explicit native actions', async () => {
+  const capabilities = {
+    'sessions.list': true,
+    'session.read': true,
+    'session.stop': true,
+    'stop:workbuddy': true,
+    'session.answer': true,
+    'session.answer:workbuddy': true,
+    'session.approve': true,
+    'session.approve:workbuddy': true,
+    tools: ['workbuddy']
+  };
+  const read = {
+    id: 'wb-actions', tool: 'workbuddy', title: 'WorkBuddy actions', status: 'working', canStop: true,
+    messages: [],
+    pendingQuestions: [{
+      callId: 'wb-question-call', state: 'open',
+      questions: [{ id: 'wb-question', question: 'Continue?', options: [{ label: 'Continue' }] }]
+    }],
+    pendingApprovals: [{
+      id: APPROVAL_ID, toolName: 'commandExecution', callId: 'wb-approval-call',
+      reason: 'WorkBuddy requests permission to run this command.',
+      context: { kind: 'command', command: 'echo ready', cwd: 'D:\\work' }
+    }]
+  };
+  const { doc, app, api } = boot({
+    responses: {
+      list: ok({ sessions: [{ id: read.id, tool: 'workbuddy', title: read.title, status: 'working' }], capabilities }),
+      read: [ok(read), ok(read), ok(read), ok(read)]
+    }
+  });
+  await app.start();
+  await app.openSession(read.id);
+
+  await app.stopSession();
+  pickOption(doc, 'Continue');
+  submitQuestions(doc, 'wb-question-call');
+  await settle();
+  clickApproval(doc, '仅允许本次');
+  await settle();
+
+  for (const name of ['stop', 'answer', 'approve']) {
+    assert.equal(api.callsOf(name).length, 1, name + ' is sent once after its explicit UI action');
+    assert.deepEqual(api.callsOf(name)[0].args[1], WORKBUDDY_RPC_OPTIONS,
+      name + ' receives the same WorkBuddy per-call budget');
+    assert.equal(api.callsOf(name)[0].args[0].params.tool, 'workbuddy');
+  }
+});
+
+test('an explicit false Codex send override does not show the WorkBuddy read-only notice', async () => {
+  const capabilities = Object.assign({}, CAPS, { 'session.send:codex': false });
+  const { doc, app } = boot({
+    responses: { list: ok({ sessions: SESSIONS, capabilities }), read: ok(readFor('a1')) }
+  });
+  await app.start();
+  await app.openSession('a1');
+  assert.equal(doc.getElementById('composer').hidden, true, 'the explicit false Codex send bit remains authoritative');
+  assert.equal(doc.getElementById('workbuddy-readonly-note').hidden, true);
 });

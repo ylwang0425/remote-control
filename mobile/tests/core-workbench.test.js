@@ -416,6 +416,21 @@ test('pending questions are projected verbatim, with their own labels', () => {
   assert.equal(core.readNeedsInput({ capabilities: CAPS_DSH, tool: 'dsh', read: {} }), false);
 });
 
+test('native questions can explicitly forbid custom text answers', () => {
+  const question = { id: 'native-q', question: 'Choose one', options: [{ label: 'A' }, { label: 'B' }], allowCustom: false };
+  const batches = core.pendingQuestionsOf({
+    capabilities: { 'session.answer:codex': true }, tool: 'codex',
+    read: { pendingQuestions: [{ callId: 'native-call', state: 'open', questions: [question] }] }
+  });
+  assert.equal(batches[0].questions[0].allowCustom, false);
+  assert.equal(core.validateAnswers(batches, 'native-call', [{ id: 'native-q', selected: ['A'] }]).length, 1);
+  assert.equal(core.validateAnswers(batches, 'native-call', [{ id: 'native-q', selected: [], custom: 'not offered' }]), null);
+  assert.equal(core.pendingQuestionsState({
+    capabilities: { 'session.answer:codex': true }, tool: 'codex',
+    read: { pendingQuestions: [{ callId: 'native-call', state: 'open', questions: [{ id: 'native-q', question: 'No options', allowCustom: false }] }] }
+  }), 'unsupported', 'a form with neither options nor native other-text support cannot be answered safely');
+});
+
 test('a tool without the answer capability is unsupported, not answerable', () => {
   const input = { capabilities: CAPS_CODEX, tool: 'codex', read: { pendingQuestions: [openBatch()] } };
   // The batch is really there, so the UI must show it -- but as information.
@@ -579,6 +594,40 @@ test('pending approvals keep their real ids, tool names and reasons', () => {
   // rather than an incomplete set of buttons.
   const many = Array.from({ length: core.Q_LIMITS.approvals + 1 }, (_, i) => ({ id: 'id-' + i, toolName: 'shell' }));
   assert.deepEqual(core.pendingApprovalsOf({ capabilities: CAPS_DSH, tool: 'dsh', read: { pendingApprovals: many } }), []);
+});
+
+test('native approval context is complete, bounded, and never truncated into a phone decision', () => {
+  const id = '3f1a6f4e-2b0c-4d5e-8a91-0c2b7d6e5f40';
+  const command = {
+    id, toolName: 'commandExecution', reason: 'Codex requests approval.\nReview the full command below.',
+    context: { kind: 'command', command: 'npm test\nnode scripts/check.js', cwd: 'D:\\project' }
+  };
+  const input = { capabilities: { 'session.approve:codex': true }, tool: 'codex', read: { pendingApprovals: [command] } };
+  const projection = core.pendingApprovalsProjection(input);
+  assert.equal(projection.state, 'ready');
+  assert.deepEqual(projection.approvals[0].context, command.context, 'multiline commands remain exact');
+  assert.equal(projection.approvals[0].reason, command.reason, 'multiline reasons remain exact');
+
+  const noGrant = { capabilities: { 'session.approve:codex': false }, tool: 'codex', read: { pendingApprovals: [command] } };
+  assert.equal(core.pendingApprovalsProjection(noGrant).state, 'unsupported', 'explicit false stays false');
+  assert.deepEqual(core.pendingApprovalsProjection(noGrant).approvals, [command], 'a complete request remains visible for computer-side action');
+  assert.deepEqual(core.pendingApprovalsOf(noGrant), [], 'a false native bit creates no decision control');
+
+  const unbounded = JSON.parse(JSON.stringify(command));
+  unbounded.context.command = 'x'.repeat(core.Q_LIMITS.command + 1);
+  assert.equal(core.pendingApprovalsProjection({ ...input, read: { pendingApprovals: [unbounded] } }).state, 'incomplete',
+    'overlong context is refused rather than cut down');
+
+  const unknownScope = JSON.parse(JSON.stringify(command));
+  unknownScope.context = { kind: 'workspace-write', summary: 'change files' };
+  assert.equal(core.pendingApprovalsProjection({ ...input, read: { pendingApprovals: [unknownScope] } }).state, 'incomplete',
+    'an unmodeled permission scope is not rendered as a known one');
+
+  const badPort = {
+    ...command,
+    context: { kind: 'network', networkHost: 'api.example.com', protocol: 'https', networkPort: 65536 }
+  };
+  assert.equal(core.pendingApprovalsProjection({ ...input, read: { pendingApprovals: [badPort] } }).state, 'incomplete');
 });
 
 // ---------------------------------------------------------------------------

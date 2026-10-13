@@ -488,22 +488,22 @@ Set-Cookie: rc_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict
 
 ### 7.5 `GET /downloads/*`
 
-- **目的与边界**: 只用于把 **APK** 交给手机下载安装（公网入口是 `https://101.43.98.18/downloads/<file>.apk`）。**桌面 token、私密配置、任何非 APK 文件、任何路径穿越都必须被拒。**
-- **认证**: 无。**`Origin` 检查**: 强制（5.3）。
+- **目的与边界**: 用于交付手机 **APK** 和指定的 **Windows ZIP**。2026-10-14 的电脑端交付扩展只允许 `AI-Remote-Windows.zip` 与数字版本形式 `AI-Remote-Windows-<major>.<minor>.<patch>.zip`；任意其他 ZIP、桌面 token、私密配置及路径穿越均必须被拒。
+- **认证**: 无。下载链接允许没有 `Origin` 的 `GET`/`HEAD`；存在 `Origin` 时必须精确匹配配置。`/api/*` 与 `/bridge` 的原有规则不变。
 - **写死的白名单规则（全部满足才允许）**:
   1. 请求路径必须以 `/downloads/` 开头。
   2. 取 `/downloads/` 之后的**剩余部分**，先做一次**百分号解码**，得到候选文件名。
-  3. 候选文件名必须匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.apk$`（1–128 字符，`.apk` 结尾，不区分大小写）。
+  3. 候选文件名必须匹配 APK 的 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.apk$`，或 Windows 的 `^AI-Remote-Windows(-[0-9]+\.[0-9]+\.[0-9]+)?\.zip$`（ZIP 文件名最多 128 字符）。扩展名区分大小写。
   4. 候选文件名中**不得**出现 `/`、`\`、`..`、`:`、NUL，也不得出现额外路径段（即解码后含 `/` 一律拒绝）。
   5. 解码后不等于原始剩余部分时（存在百分号编码）→ 允许，但必须用**解码后**的名字做第 3、4 条检查（避免 `%2e%2e%2f` 之类绕过）。
   6. 最终文件路径 = **白名单根目录**（部署时固定，例如 `/opt/ai-remote/downloads/`）**拼接**校验通过的文件名；拼接后必须 `realpath`，`realpath` 结果必须仍在白名单根目录之下（挡住符号链接逃逸）。
   7. 打开前用 `O_NOFOLLOW` 语义（拒绝是符号链接的文件）。
-- **成功 200**: 直接流式返回文件。响应头：`Content-Type: application/vnd.android.package-archive`、`Content-Length: <字节数>`、`Content-Disposition: attachment; filename="<文件名>"`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。**禁止目录列表**。
+- **成功 200**: 直接流式返回文件。APK 的 `Content-Type` 为 `application/vnd.android.package-archive`，Windows ZIP 为 `application/zip`。其余响应头：`Content-Length: <字节数>`、`Content-Disposition: attachment; filename="<文件名>"`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。**禁止目录列表**，支持字节范围下载。
 - **失败**:
 
 | 场景 | 状态码 | `code` |
 | --- | --- | --- |
-| 文件不在白名单（扩展名不是 `.apk`、名字非法、含路径段） | 404 | `not_found` |
+| 文件不在白名单（不是 APK 或指定 Windows ZIP、名字非法、含路径段） | 404 | `not_found` |
 | 路径穿越尝试（含 `..`、含 `/`、编码绕过） | 404 | `not_found` |
 | 符号链接逃逸白名单根目录 | 404 | `not_found` |
 | 文件不存在 | 404 | `not_found` |
@@ -514,8 +514,8 @@ Set-Cookie: rc_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict
 
 - **一切拒绝都必须返回同一句** `not found`，**不得**区分"不该给你"和"没有这个文件"——否则本端点会变成文件系统探测器。
 - **`HEAD` 允许**（返回同样的头，无 body）。**`POST`/`PUT`/`DELETE` 一律 405。**
-- **手机端 APK 与网页端**（T-relay 的 DoD R12 同时提到"静态托管 `relay/web/`"）：`relay/web/` 的静态文件**不属于**本端点；它由单独的静态托管路径提供（PM 决定路径）。本端点**只**服务 APK 白名单。两者的路由不得互相回退。
-- **禁止**在本端点下放任何 `.json`、`.db`、`.log`、`.yml`、`.pem`、`.key`、`.txt` 文件——即使它们恰好放在白名单根目录里，也必须 404（规则 3 已经保证：只放 `.apk` 能过）。
+- **安装包与网页端**: `relay/web/` 的静态文件**不属于**本端点；本端点只服务 APK 和上述指定 Windows ZIP。两者的路由不得互相回退。
+- **禁止**在本端点下放任何 `.json`、`.db`、`.log`、`.yml`、`.pem`、`.key`、`.txt` 文件或其他 ZIP——即使它们恰好放在白名单根目录里，也必须 404。
 
 ---
 

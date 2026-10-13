@@ -937,8 +937,8 @@ func TestBridgePingPong(t *testing.T) {
 
 // ---- R12/R19: downloads and the static site --------------------------------
 
-// TestDownloadsWhitelist covers R12, R19 item 1 and §7.5: only .apk files from
-// the whitelist root are served, and every refusal is the same 404 so the
+// TestDownloadsWhitelist covers the APK branch of R12, R19 item 1 and §7.5:
+// APK files use the whitelist root, and every refusal is the same 404 so the
 // endpoint cannot be used as a filesystem probe.
 func TestDownloadsWhitelist(t *testing.T) {
 	e := newEnv(t)

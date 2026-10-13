@@ -77,6 +77,7 @@ test('hello carries version 1, the client name and the capability object', () =>
     'session.send:model:codex': false,
     'session.send:model:dsh': false,
     'session.send:model:workbuddy': false,
+    'session.send:codex': false,
     'session.send:workbuddy': false,
     'session.answer:codex': false,
     'session.answer:dsh': false,
@@ -118,6 +119,9 @@ test('capabilities never claim a tool twice, and never claim nothing', () => {
   assert.deepEqual(only.tools, ['codex']);
   assert.equal(only['stop:codex'], true);
   assert.equal(only['stop:dsh'], false);
+  assert.equal(only['session.send:codex'], false, 'an unmeasured per-tool send bit stays false');
+  const canSend = buildCapabilities(['codex'], { sendCodex: true });
+  assert.equal(canSend['session.send:codex'], true);
 });
 
 test('toolStatus reports installed-but-unavailable software without claiming a session tool', () => {
@@ -383,6 +387,15 @@ test('session.read carries canStop, and gives activeTurnId only while working', 
   assert.equal('activeTurnId' in idle, false, 'activeTurnId is omitted, not null, when not working');
 });
 
+test('WorkBuddy UIA may report working without fabricating a native turn id', () => {
+  const read = { id:'native-wb-chat', tool:'workbuddy', title:'native chat', status:'working', messages:[], canStop:true };
+  const result = buildSessionReadResult(read);
+  assert.equal(result.canStop,true);
+  assert.equal(Object.hasOwn(result,'activeTurnId'),false);
+  assert.throws(()=>buildSessionReadResult({...read,activeTurnId:null}));
+  assert.throws(()=>buildSessionReadResult({...read,tool:'codex'}));
+});
+
 test('canStop needs both a working session and the tool stop capability', () => {
   const capabilities = buildCapabilities(['codex', 'dsh']);
   assert.equal(canStop({ status: 'working', tool: 'dsh', capabilities }), true);
@@ -469,10 +482,14 @@ test('one answer per question, exactly once, and only bounded fields', () => {
   assert.equal(parseRequest({ ...base, params: { tool: 'codex', sessionId: 't-1', callId: 'call-1', answers: [{ id: 'q-1', selected: [] }] } }).params.tool, 'codex');
 });
 
-test('the answer result echoes both identities, and refuses a bad one', () => {
-  assert.deepEqual(buildSessionAnswerResult('session-1', 'call-1'), { accepted: true, sessionId: 'session-1', callId: 'call-1' });
+test('the answer result echoes both identities and distinguishes submission from confirmation', () => {
+  assert.deepEqual(buildSessionAnswerResult('session-1', 'call-1'), {
+    accepted: true, sessionId: 'session-1', callId: 'call-1', state: 'submitted'
+  });
+  assert.equal(buildSessionAnswerResult('session-1', 'call-1', 'confirmed').state, 'confirmed');
   assert.throws(() => buildSessionAnswerResult('bad id', 'call-1'), (e) => e.code === 'bridge_error');
   assert.throws(() => buildSessionAnswerResult('session-1', ''), (e) => e.code === 'bridge_error');
+  assert.throws(() => buildSessionAnswerResult('session-1', 'call-1', 'resolved'), (e) => e.code === 'bridge_error');
 });
 
 const PENDING_BATCH = {
@@ -498,6 +515,18 @@ test('a pending question travels whole, with its real state and choices', () => 
   // No batch means no field at all: "nothing was read" is never "nothing waits".
   assert.equal(buildSessionReadResult({ ...READ_BASE }).pendingQuestions, undefined);
   assert.equal(buildSessionReadResult({ ...READ_BASE, pendingQuestions: [] }).pendingQuestions, undefined);
+});
+
+test('a native question preserves an explicit custom-answer prohibition', () => {
+  const question = { id: 'native-q', question: 'Choose one', options: [{ label: 'A' }], allowCustom: false };
+  const input = { callId: 'native-call', state: 'open', questions: [question] };
+  assert.deepEqual(
+    buildSessionReadResult({ ...READ_BASE, tool: 'codex', pendingQuestions: [input] }).pendingQuestions,
+    [input],
+  );
+  assert.throws(() => buildSessionReadResult({
+    ...READ_BASE, tool: 'codex', pendingQuestions: [{ ...input, questions: [{ ...question, allowCustom: 'false' }] }],
+  }), (error) => error.code === 'bridge_error');
 });
 
 test('a question form this bridge cannot present in full is refused, never trimmed', () => {
@@ -597,6 +626,63 @@ test('a pending approval travels whole, and a list this bridge cannot show is re
     );
   }
   assert.throws(() => buildSessionReadResult({ ...READ_BASE, pendingApprovals: 'nope' }), (e) => e.code === 'bridge_error');
+});
+
+test('Codex and WorkBuddy approvals require complete native action context', () => {
+  const command = {
+    ...APPROVAL,
+    context: { kind: 'command', command: 'npm test', cwd: 'D:\\project' },
+  };
+  const result = buildSessionReadResult({ ...READ_BASE, tool: 'codex', pendingApprovals: [command] });
+  assert.deepEqual(result.pendingApprovals, [command]);
+
+  const network = {
+    ...APPROVAL,
+    context: { kind: 'network', networkHost: 'api.example.com', protocol: 'https', networkPort: 443 },
+  };
+  assert.deepEqual(
+    buildSessionReadResult({ ...READ_BASE, tool: 'workbuddy', pendingApprovals: [network] }).pendingApprovals,
+    [network],
+  );
+  const files = {
+    ...APPROVAL,
+    context: { kind: 'file-change', summary: 'Modify src/index.js', grantRoot: 'D:\\project' },
+  };
+  assert.deepEqual(
+    buildSessionReadResult({ ...READ_BASE, tool: 'workbuddy', pendingApprovals: [files] }).pendingApprovals,
+    [files],
+  );
+
+  for (const pendingApproval of [
+    { ...APPROVAL, context: undefined },
+    { ...command, reason: '' },
+    { ...command, context: { kind: 'command', command: 'npm test' } },
+    { ...command, context: { kind: 'network', networkHost: 'https://user@example.com', protocol: 'https' } },
+    { ...command, context: { kind: 'network', networkHost: 'api.example.com', protocol: 'https/evil' } },
+    { ...command, context: { kind: 'network', networkHost: 'api.example.com', protocol: 'https', networkPort: 65536 } },
+    { ...command, context: { kind: 'network', networkHost: 'api.example.com', protocol: 'https', networkPort: 443.5 } },
+    { ...command, context: { kind: 'file-change', summary: 'Change', grantRoot: 'D:\\project', raw: {} } },
+    { ...command, context: { kind: 'command', command: 'x'.repeat(MAX_APPROVAL_REASON + 1), cwd: 'D:\\project' } },
+  ]) {
+    assert.throws(
+      () => buildSessionReadResult({ ...READ_BASE, tool: 'codex', pendingApprovals: [pendingApproval] }),
+      (error) => error.code === 'bridge_error',
+    );
+  }
+  const multiline = {
+    ...command,
+    reason: 'Codex requests approval.\nReview the full command below.',
+    context: { kind: 'command', command: 'npm test\nnode scripts/check.js', cwd: 'D:\\project' },
+  };
+  assert.deepEqual(
+    buildSessionReadResult({ ...READ_BASE, tool: 'codex', pendingApprovals: [multiline] }).pendingApprovals,
+    [multiline],
+    'newlines in displayed command context are preserved without truncation',
+  );
+  // Existing DSH native approvals keep their established, less structured
+  // projection because that app does not expose an ACP-style action context.
+  const legacyDsh = { id: APPROVAL.id, toolName: 'shell.exec', reason: 'run a command' };
+  assert.deepEqual(buildSessionReadResult({ ...READ_BASE, pendingApprovals: [legacyDsh] }).pendingApprovals, [legacyDsh]);
 });
 
 test('the approve capabilities are per tool and are never on by default', () => {

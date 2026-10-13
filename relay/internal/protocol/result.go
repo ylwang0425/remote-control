@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // The wire shapes of §9. The relay decodes a bridge result into these only to
@@ -129,6 +130,9 @@ type answerAcceptedResult struct {
 	Accepted  *bool   `json:"accepted"`
 	SessionID *string `json:"sessionId"`
 	CallID    *string `json:"callId"`
+	// State is optional for older desktops. When present, it distinguishes
+	// transport submission from native proof of this exact answer.
+	State json.RawMessage `json:"state"`
 }
 
 type approveAcceptedResult struct {
@@ -162,6 +166,7 @@ type pendingQuestion struct {
 	Detail      *string           `json:"detail"`
 	Options     *[]questionOption `json:"options"`
 	MultiSelect *bool             `json:"multiSelect"`
+	AllowCustom json.RawMessage   `json:"allowCustom"`
 }
 
 type pendingQuestionBatch struct {
@@ -173,10 +178,22 @@ type pendingQuestionBatch struct {
 // The pendingApprovals projection.
 
 type pendingApproval struct {
-	ID       *string `json:"id"`
-	ToolName *string `json:"toolName"`
-	CallID   *string `json:"callId"`
-	Reason   *string `json:"reason"`
+	ID       *string         `json:"id"`
+	ToolName *string         `json:"toolName"`
+	CallID   *string         `json:"callId"`
+	Reason   *string         `json:"reason"`
+	Context  json.RawMessage `json:"context"`
+}
+
+type approvalContext struct {
+	Kind        *string         `json:"kind"`
+	Command     *string         `json:"command"`
+	Cwd         *string         `json:"cwd"`
+	NetworkHost *string         `json:"networkHost"`
+	Protocol    *string         `json:"protocol"`
+	NetworkPort json.RawMessage `json:"networkPort"`
+	Summary     *string         `json:"summary"`
+	GrantRoot   *string         `json:"grantRoot"`
 }
 
 // The two shapes CRD 0006 adds.
@@ -379,7 +396,7 @@ func ValidateResult(method string, result json.RawMessage) (Code, bool) {
 			}
 		}
 		if len(r.PendingApprovals) > 0 {
-			if !validPendingApprovals(r.PendingApprovals) {
+			if !validPendingApprovals(r.PendingApprovals, *r.Tool) {
 				return CodeBridgeBadResponse, false
 			}
 		}
@@ -416,6 +433,18 @@ func ValidateResult(method string, result json.RawMessage) (Code, bool) {
 		if r.CallID == nil || !printableField(*r.CallID, maxCallIDRunes) {
 			return CodeBridgeBadResponse, false
 		}
+		if len(r.State) > 0 {
+			if isJSONNull(r.State) {
+				return CodeBridgeBadResponse, false
+			}
+			var state string
+			if err := json.Unmarshal(r.State, &state); err != nil {
+				return CodeBridgeBadResponse, false
+			}
+			if state != approvalStateSubmitted && state != approvalStateConfirmed {
+				return CodeBridgeBadResponse, false
+			}
+		}
 		return "", true
 
 	case "session.approve":
@@ -429,7 +458,7 @@ func ValidateResult(method string, result json.RawMessage) (Code, bool) {
 		if r.SessionID == nil || !SessionIDPattern.MatchString(*r.SessionID) {
 			return CodeBridgeBadResponse, false
 		}
-		if r.ApprovalID == nil || !IsUUID(*r.ApprovalID) {
+		if r.ApprovalID == nil || !IsUUIDv4(*r.ApprovalID) {
 			return CodeBridgeBadResponse, false
 		}
 		// Only the two states the contract defines. In particular "confirmed"
@@ -713,6 +742,15 @@ func validPendingQuestions(raw json.RawMessage) bool {
 			if !optionalSanitizedText(question.Detail, maxOptionDetailRunes) {
 				return false
 			}
+			if len(question.AllowCustom) > 0 {
+				if isJSONNull(question.AllowCustom) {
+					return false
+				}
+				var allowCustom bool
+				if err := json.Unmarshal(question.AllowCustom, &allowCustom); err != nil {
+					return false
+				}
+			}
 			if question.Options != nil {
 				if len(*question.Options) > maxOptionsPerQuestion {
 					return false
@@ -750,7 +788,7 @@ func questionStateKnown(state string) bool {
 // toolName is what the person is being asked to permit, so it must be present
 // and readable; a request whose tool name cannot be shown must not be turned
 // into a button.
-func validPendingApprovals(raw json.RawMessage) bool {
+func validPendingApprovals(raw json.RawMessage, tool string) bool {
 	if isJSONNull(raw) || len(raw) > maxProjectionBytes {
 		return false
 	}
@@ -769,7 +807,7 @@ func validPendingApprovals(raw json.RawMessage) bool {
 		return false
 	}
 	for _, approval := range approvals {
-		if approval.ID == nil || !IsUUID(*approval.ID) {
+		if approval.ID == nil || !IsUUIDv4(*approval.ID) {
 			return false
 		}
 		if !sanitizedText(approval.ToolName, maxApprovalToolRunes) {
@@ -781,8 +819,135 @@ func validPendingApprovals(raw json.RawMessage) bool {
 		if !optionalSanitizedText(approval.Reason, maxApprovalReasonRunes) {
 			return false
 		}
+		if len(approval.Context) > 0 {
+			if !validApprovalContext(approval.Context) || !sanitizedApprovalReason(approval.Reason) {
+				return false
+			}
+		} else if tool == "codex" || tool == "workbuddy" {
+			// ACP approvals must be complete enough to show the operation and
+			// scope before the phone exposes either decision.
+			return false
+		}
+		if (tool == "codex" || tool == "workbuddy") && !sanitizedApprovalReason(approval.Reason) {
+			return false
+		}
 	}
 	return true
+}
+
+func sanitizedApprovalReason(reason *string) bool {
+	if !boundedApprovalDisplayText(reason, maxApprovalReasonRunes, true) {
+		return false
+	}
+	for _, r := range *reason {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+// validApprovalContext accepts only the complete display shape for one kind of
+// native operation. It rejects unknown fields too: an unrendered context value
+// could be important to the decision, and silently omitting it would be unsafe.
+func validApprovalContext(raw json.RawMessage) bool {
+	if isJSONNull(raw) || len(raw) > maxApprovalContextBytes {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return false
+	}
+	var context approvalContext
+	if err := json.Unmarshal(raw, &context); err != nil || context.Kind == nil {
+		return false
+	}
+	allowed := map[string]bool{"kind": true}
+	switch *context.Kind {
+	case "command":
+		allowed["command"] = true
+		allowed["cwd"] = true
+		if !boundedApprovalDisplayText(context.Command, maxApprovalCommandRunes, true) ||
+			!boundedApprovalContextText(context.Cwd, maxApprovalContextPathRunes) {
+			return false
+		}
+	case "network":
+		allowed["networkHost"] = true
+		allowed["protocol"] = true
+		allowed["networkPort"] = true
+		if !boundedApprovalContextText(context.NetworkHost, maxApprovalNetworkHostRunes) ||
+			!validApprovalProtocol(context.Protocol) || !validApprovalNetworkPort(context.NetworkPort) {
+			return false
+		}
+		host := *context.NetworkHost
+		if strings.ContainsAny(host, "/@?#") || strings.ContainsAny(host, " \t\r\n") {
+			return false
+		}
+	case "file-change":
+		allowed["summary"] = true
+		allowed["grantRoot"] = true
+		if !boundedApprovalDisplayText(context.Summary, maxApprovalFileSummaryRunes, true) ||
+			!boundedApprovalContextText(context.GrantRoot, maxApprovalContextPathRunes) {
+			return false
+		}
+	default:
+		return false
+	}
+	for name := range fields {
+		if !allowed[name] {
+			return false
+		}
+	}
+	return true
+}
+
+func boundedApprovalContextText(value *string, maxRunes int) bool {
+	return boundedApprovalDisplayText(value, maxRunes, false)
+}
+
+func boundedApprovalDisplayText(value *string, maxRunes int, multiline bool) bool {
+	if value == nil || len([]rune(*value)) > maxRunes || strings.TrimSpace(*value) == "" {
+		return false
+	}
+	for _, r := range *value {
+		if unicode.IsControl(r) && !(multiline && (r == '\n' || r == '\r' || r == '\t')) {
+			return false
+		}
+	}
+	return true
+}
+
+func validApprovalProtocol(value *string) bool {
+	if !boundedApprovalContextText(value, maxApprovalNetworkProtocolRunes) {
+		return false
+	}
+	for index, r := range *value {
+		letter := r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z'
+		if index == 0 {
+			if !letter {
+				return false
+			}
+			continue
+		}
+		if !letter && !(r >= '0' && r <= '9') && r != '+' && r != '.' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validApprovalNetworkPort(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	if isJSONNull(raw) {
+		return false
+	}
+	var port int
+	if err := json.Unmarshal(raw, &port); err != nil {
+		return false
+	}
+	return port >= 1 && port <= 65535
 }
 
 // maxPendingQuestionBatches bounds the projection: at most four live forms.
@@ -793,6 +958,15 @@ const maxPendingQuestionBatches = 4
 // than present a partial list, because a partial list of permission requests is
 // one that silently omits a request somebody is waiting on.
 const maxPendingApprovalsSeen = 8
+
+const (
+	maxApprovalCommandRunes         = 4000
+	maxApprovalContextPathRunes     = 1024
+	maxApprovalNetworkHostRunes     = 253
+	maxApprovalNetworkProtocolRunes = 32
+	maxApprovalFileSummaryRunes     = 4000
+	maxApprovalContextBytes         = 16 * 1024
+)
 
 // maxProjectionBytes is a coarse outer bound on each projection. The frame
 // ceiling (256 KiB) already caps the whole result; this keeps one projection

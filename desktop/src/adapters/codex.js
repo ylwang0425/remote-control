@@ -16,9 +16,10 @@
  * `read_thread` returning turns and items. The tool answer arrives as JSON inside
  * a JSON string (`contentItems[0].text`), so every answer is parsed twice.
  *
- * What is deliberately absent: any stop path. The live catalog has no
- * interrupt/cancel/stop tool, so `stopSession` answers `not_capable` instead of
- * pretending, and the capability goes out as false.
+ * The ordinary app-tools channel remains the source of history, sends, models
+ * and project-backed creation. Stop/questions/approvals are available only in
+ * the explicit native stdio-proxy opt-in, which taps the exact app-server child
+ * Desktop already launched and never starts a separate session.
  */
 
 const fs = require('node:fs');
@@ -29,6 +30,7 @@ const { FrameDecoder, encodeFrame } = require('../framing');
 const { BridgeError, safeMessage } = require('../errors');
 const { toRfc3339 } = require('../protocol');
 const { resolveCodexContext } = require('../codex-context');
+const { CodexNativeControlRegistry } = require('../codex-native-control');
 
 /** server.mjs `MAX_FRAME_BYTES`: the app-tools pipe allows 8 MiB frames. */
 const PIPE_MAX_FRAME_BYTES = 8 * 1024 * 1024;
@@ -680,7 +682,18 @@ async function openCodexAdapter(options) {
         client.close();
         continue;
       }
-      return new CodexAdapter({ client, contextThreadId, tools, pipePath, probes: failures });
+      let nativeControlRegistry = null;
+      if (options.nativeControl !== undefined && options.nativeControl !== null) {
+        try {
+          nativeControlRegistry = new CodexNativeControlRegistry(options.nativeControl);
+          await nativeControlRegistry.refresh();
+        } catch (error) {
+          nativeControlRegistry?.close();
+          client.close();
+          throw error;
+        }
+      }
+      return new CodexAdapter({ client, contextThreadId, tools, pipePath, probes: failures, nativeControlRegistry });
     } catch (error) {
       failures.push(`${pipePath}: ${safeMessage(error)}`);
       client.close();
@@ -748,19 +761,20 @@ function localProjects(value) {
 
 /** The Codex Desktop side of the bridge, on top of one pipe connection. */
 class CodexAdapter {
-  /** @param {{client: CodexPipeClient, contextThreadId: string, tools: object[], pipePath?: string, probes?: string[]}} options */
-  constructor({ client, contextThreadId, tools, pipePath = client.pipePath, probes = [] }) {
+  /** @param {{client: CodexPipeClient, contextThreadId: string, tools: object[], pipePath?: string, probes?: string[], nativeControlRegistry?: CodexNativeControlRegistry|null}} options */
+  constructor({ client, contextThreadId, tools, pipePath = client.pipePath, probes = [], nativeControlRegistry = null }) {
     this.client = client;
     this.contextThreadId = contextThreadId;
     this.tools = tools;
     this.pipePath = pipePath;
     this.probes = probes;
+    this.nativeControlRegistry = nativeControlRegistry;
     this.toolNames = new Set(tools.filter((tool) => tool.namespace === CODEX_NAMESPACE).map((tool) => tool.name));
   }
 
   /**
    * Open the adapter on the app the user already has running.
-   * @param {{pipePath?: string, contextThreadId?: string}} options
+   * @param {{pipePath?: string, contextThreadId?: string, nativeControl?: {registryDir:string,runId:string}}} options
    */
   static async open(options) {
     return openCodexAdapter(options);
@@ -814,26 +828,16 @@ class CodexAdapter {
     return this.canSend() && catalogOfTool(this.sendTool()).length > 0;
   }
 
-  /**
-   * There is no answer path on this channel: the live catalog has no tool that
-   * hands a structured answer batch back to a native question call, and
-   * `send_message_to_thread` would send words without naming the callId. So
-   * `session.answer:codex` is reported false and the call refuses, instead of
-   * typing something that only looks like an answer.
-   */
   canAnswer() {
-    return false;
+    return this.nativeControlRegistry?.ready === true;
   }
 
-  /**
-   * There is no stop interface on this channel today: the live catalog has no
-   * interrupt/cancel/stop tool, so stopping stays unavailable. The `app.asar`
-   * search for a real IPC stop path was **not** performed (see
-   * `DELIVERY_REPORT.md`, item 5 of the unverified list); `stop:codex` is
-   * reported false because the app-tools catalog has no such tool.
-   */
   canStop() {
-    return false;
+    return this.nativeControlRegistry?.ready === true;
+  }
+
+  canApprove() {
+    return this.nativeControlRegistry?.ready === true;
   }
 
   capabilityFlags() {
@@ -1028,6 +1032,7 @@ class CodexAdapter {
    *   merged, up to `extraLimit` (default 5), so one call stays bounded.
    */
   async listSessions(options = {}) {
+    if (this.nativeControlRegistry !== null) await this.nativeControlRegistry.refresh();
     if (!this.canList()) {
       throw new BridgeError('not_capable', 'the Codex app does not offer list_threads');
     }
@@ -1086,8 +1091,14 @@ class CodexAdapter {
     // The page is a window of the N most recent turns, so it is the **first**
     // returned turn - not the last - that reports the newest one, whatever
     // direction the page order runs in.
-    const status = mapThreadStatus(thread?.status ?? turns[0]?.status);
     const activeTurn = turns.find((turn) => mapThreadStatus(turn?.status) === 'working');
+    const controlSnapshots = this.nativeControlRegistry === null ? [] : await this.nativeControlRegistry.snapshots(sessionId);
+    const liveControlOwners = controlSnapshots.filter(({ snapshot }) => snapshot.observed &&
+      (snapshot.activeTurnId !== null || snapshot.requests.length > 0));
+    const unambiguousControlOwner = liveControlOwners.length === 1 ? liveControlOwners[0] : null;
+    const nativeActiveTurnId = unambiguousControlOwner?.snapshot.activeTurnId ?? null;
+    const status = nativeActiveTurnId !== null ? 'working' : mapThreadStatus(thread?.status ?? turns[0]?.status);
+    const requests = unambiguousControlOwner?.snapshot.requests ?? [];
     const result = {
       id: sessionId,
       tool: 'codex',
@@ -1096,11 +1107,29 @@ class CodexAdapter {
       // The page order decides the direction; the turns are emitted oldest-first
       // either way.
       messages: itemsToMessages(turns, { pageOrder: value?.page?.order ?? null }),
-      canStop: status === 'working' && this.canStop(),
+      canStop: status === 'working' && nativeActiveTurnId !== null,
     };
     if (status === 'working') {
-      result.activeTurnId = String(activeTurn?.id ?? turns[0]?.id ?? 'active-turn');
+      const currentTurnId = nativeActiveTurnId ?? activeTurn?.id ?? (this.nativeControlRegistry === null ? thread?.activeTurnId : undefined);
+      if (typeof currentTurnId !== 'string' || currentTurnId.length === 0) {
+        throw new BridgeError('bridge_error', 'Codex reports a working thread without its real turn id');
+      }
+      result.activeTurnId = currentTurnId;
     }
+    const pendingQuestions = requests.filter((request) => request.kind === 'question').map((request) => ({
+      callId: request.id,
+      state: 'open',
+      questions: request.questions,
+    }));
+    if (pendingQuestions.length > 0) result.pendingQuestions = pendingQuestions;
+    const pendingApprovals = requests.filter((request) => request.kind !== 'question').map((request) => ({
+      id: request.id,
+      toolName: request.toolName,
+      callId: request.callId ?? request.itemId,
+      reason: request.reason,
+      context: request.context,
+    }));
+    if (pendingApprovals.length > 0) result.pendingApprovals = pendingApprovals;
     return result;
   }
 
@@ -1155,21 +1184,77 @@ class CodexAdapter {
     return { accepted: true, sessionId };
   }
 
-  /** §9.4-adjacent: answering a native question is not possible on this channel. */
-  async answerQuestion() {
-    throw new BridgeError('not_capable', 'this Codex session cannot answer a native question through the app-tools pipe');
+  /** Answer one live serverRequest on the exact Desktop child that raised it. */
+  async answerQuestion(sessionId, callId, answers) {
+    if (this.nativeControlRegistry === null || !this.canAnswer()) {
+      throw new BridgeError('not_capable', 'Codex native questions require the explicit Desktop stdio-control opt-in');
+    }
+    const owner = await this.findUniqueNativeRequest(sessionId, callId, 'question');
+    const result = await owner.client.respond({
+      bridgeRequestId: callId,
+      threadId: sessionId,
+      itemId: owner.request.itemId,
+      answer: { answers },
+    });
+    return { accepted: true, sessionId, callId, state: result.state };
   }
 
-  /** §9.4: no stop interface exists on this channel, so this must not pretend. */
+  /** Stop only the unique live turn this exact app-server child owns. */
   async stopSession(sessionId) {
     if (!this.canStop()) {
-      throw new BridgeError('not_capable', 'this Codex session cannot be stopped through the app-tools pipe');
+      throw new BridgeError('not_capable', 'Codex stop requires the explicit Desktop stdio-control opt-in');
     }
-    return { accepted: true, sessionId };
+    const snapshots = await this.nativeControlRegistry.snapshots(sessionId);
+    const owners = snapshots.filter(({ snapshot }) => snapshot.observed && snapshot.activeTurnId !== null);
+    if (owners.length !== 1) {
+      throw new BridgeError('session_not_found', owners.length === 0
+        ? 'no live Codex app-server turn owns this thread'
+        : 'more than one Codex app-server child reports a live turn for this thread');
+    }
+    return owners[0].client.interrupt(sessionId, owners[0].snapshot.activeTurnId);
+  }
+
+  /** Decide a native permission request with an explicit one-time outcome. */
+  async approveRequest(sessionId, approvalId, decision) {
+    if (this.nativeControlRegistry === null || !this.canApprove()) {
+      throw new BridgeError('not_capable', 'Codex approvals require the explicit Desktop stdio-control opt-in');
+    }
+    if (decision !== 'allow-once' && decision !== 'reject') {
+      throw new BridgeError('invalid_params', 'Codex supports only allow-once or reject decisions');
+    }
+    const owner = await this.findUniqueNativeRequest(sessionId, approvalId, 'approval');
+    const result = await owner.client.respond({
+      bridgeRequestId: approvalId,
+      threadId: sessionId,
+      itemId: owner.request.itemId,
+      answer: { decision: decision === 'allow-once' ? 'accept' : 'decline' },
+    });
+    return { accepted: true, sessionId, approvalId, state: result.state };
+  }
+
+  async findUniqueNativeRequest(sessionId, requestId, expectedKind) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0 || typeof requestId !== 'string' || requestId.length === 0) {
+      throw new BridgeError('invalid_params', 'a Codex thread and live request id are required');
+    }
+    const snapshots = await this.nativeControlRegistry.snapshots(sessionId);
+    const liveOwners = snapshots.filter(({ snapshot }) => snapshot.observed &&
+      (snapshot.activeTurnId !== null || snapshot.requests.length > 0));
+    const matches = snapshots.flatMap((owner) => owner.snapshot.observed
+      ? owner.snapshot.requests.filter((request) => request.id === requestId &&
+        (expectedKind === 'question' ? request.kind === 'question' : request.kind !== 'question')
+        ).map((request) => ({ ...owner, request }))
+      : []);
+    if (matches.length !== 1 || liveOwners.length !== 1) {
+      throw new BridgeError('session_not_found', matches.length === 0
+        ? 'that Codex request is no longer waiting in this thread'
+        : 'more than one Codex app-server child may own this request');
+    }
+    return matches[0];
   }
 
   close() {
     this.client.close();
+    void this.nativeControlRegistry?.close();
   }
 }
 

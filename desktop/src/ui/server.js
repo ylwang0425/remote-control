@@ -46,6 +46,7 @@ class LocalUiServer {
    * @param {() => Promise<{code: string, url: string, expiresAt: string}>} [options.onPairCreate]
    * @param {(identity: {ownerName: string}) => Promise<object>} [options.onIdentityUpdate]
    * @param {(enrollment: {code: string, ownerName: string, relayUrl: string}) => Promise<object>} [options.onEnroll]
+   * @param {(settings: {enabled: boolean, executablePath?: string}) => Promise<object>} [options.onWorkBuddyUiAutomationUpdate]
    * @param {string} [options.htmlPath]
    */
   constructor(options) {
@@ -54,6 +55,7 @@ class LocalUiServer {
     this.onPairCreate = options.onPairCreate ?? null;
     this.onIdentityUpdate = options.onIdentityUpdate ?? null;
     this.onEnroll = options.onEnroll ?? null;
+    this.onWorkBuddyUiAutomationUpdate = options.onWorkBuddyUiAutomationUpdate ?? null;
     this.htmlPath = options.htmlPath ?? path.join(__dirname, '..', '..', 'ui', 'index.html');
     this.csrfToken = crypto.randomBytes(32).toString('base64url');
     this.address = null;
@@ -159,6 +161,10 @@ class LocalUiServer {
       await this.handleIdentity(req, res);
       return;
     }
+    if (req.method === 'POST' && url.pathname === '/api/workbuddy-ui-automation') {
+      await this.handleWorkBuddyUiAutomation(req, res);
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/enroll') {
       await this.handleEnroll(req, res);
       return;
@@ -219,6 +225,45 @@ class LocalUiServer {
       });
     } catch (error) {
       this.actionFailure(res, error, 'Could not save the computer name.');
+    }
+  }
+
+  async handleWorkBuddyUiAutomation(req, res) {
+    if (!this.hasCsrf(req)) {
+      json(res, 403, { ok: false, error: { code: 'csrf_required', message: 'a CSRF token is required for writes' } });
+      return;
+    }
+    const body = await this.readJsonBody(req, res);
+    if (body === null) return;
+    const allowedKeys = new Set(['enabled', 'executablePath']);
+    if (Object.keys(body).some((key) => !allowedKeys.has(key)) || typeof body.enabled !== 'boolean' ||
+        (Object.hasOwn(body, 'executablePath') &&
+          (typeof body.executablePath !== 'string' || body.executablePath.length === 0 || body.executablePath.length > 2048))) {
+      json(res, 400, { ok: false, error: { code: 'invalid_params', message: 'enabled and an optional absolute WorkBuddy.exe path are required' } });
+      return;
+    }
+    if (this.onWorkBuddyUiAutomationUpdate === null) {
+      json(res, 503, { ok: false, error: { code: 'workbuddy_settings_unavailable', message: 'local WorkBuddy settings are not available' } });
+      return;
+    }
+    try {
+      const updated = await this.onWorkBuddyUiAutomationUpdate({
+        enabled: body.enabled,
+        ...(Object.hasOwn(body, 'executablePath') ? { executablePath: body.executablePath } : {}),
+      });
+      json(res, 200, {
+        ok: true,
+        uiAutomation: {
+          enabled: updated?.uiAutomation?.enabled === true,
+          executablePathConfigured: updated?.uiAutomation?.executablePathConfigured === true,
+          configurationValid: updated?.uiAutomation?.configurationValid === true,
+        },
+        workbuddyAvailable: updated?.workbuddyAvailable === true,
+          readOnly: typeof updated?.readOnly === 'boolean' ? updated.readOnly : null,
+        capabilitiesUpdated: updated?.capabilitiesUpdated === true,
+      });
+    } catch (error) {
+      this.actionFailure(res, error, 'Could not save the local WorkBuddy settings.');
     }
   }
 

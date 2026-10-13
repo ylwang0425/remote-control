@@ -538,7 +538,7 @@ test('stopSession refuses with not_capable while no stop interface exists', asyn
   t.after(() => adapter.close());
   const err = await adapter.stopSession('01a1197c-37b6-7b40-8f81-269595d36edf').catch((e) => e);
   assert.equal(err.code, 'not_capable');
-  assert.match(err.message, /cannot be stopped/i);
+  assert.match(err.message, /requires.*Desktop.*opt-in/i);
   assert.equal(
     server.calls.some((entry) => entry.params?.tool === 'stop' || entry.params?.tool === 'interrupt'),
     false,

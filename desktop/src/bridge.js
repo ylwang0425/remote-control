@@ -24,10 +24,19 @@ const { Backoff } = require('./backoff');
 const { PendingRegistry, MAX_PENDING } = require('./pending');
 const { BridgeError, errorResponse, mapError, safeMessage } = require('./errors');
 const { parseFrame, parseRequest, buildHello, buildPairCreate, buildPing, buildPong, buildResponse, newId, envelopeBytes, fitSessionReadResult, RESPONSE_BYTE_BUDGET, MAX_RESPONSE_BYTES } = require('./protocol');
+const { performance } = require('node:perf_hooks');
 
 const HELLO_TIMEOUT_MS = 10000;
 const PAIR_TIMEOUT_MS = 20000;
 const ANSWERED_IDS_LIMIT = 256;
+
+function requestDeadlineError() {
+  const error = new Error('the request deadline expired');
+  // Internal-only: once this fires the pending id has been retired, so the
+  // late dispatch result is dropped instead of sending an out-of-budget reply.
+  error.code = 'bridge_timeout';
+  return error;
+}
 
 class BridgeClient {
   /**
@@ -244,6 +253,23 @@ class BridgeClient {
     return false; // the next handshake carries the current identity
   }
 
+  /**
+   * Replace only the measured capability advertisement on the current
+   * authenticated client. Identity and credentials remain unchanged; when the
+   * socket is offline, the next ordinary handshake carries the new snapshot.
+   */
+  updateCapabilities(capabilities) {
+    const frame = buildHello({
+      clientId: this.clientId,
+      ownerName: this.ownerName,
+      clientName: this.clientName,
+      capabilities,
+    });
+    this.capabilities = capabilities;
+    if (this.connected) return this.sendFrame(frame);
+    return false;
+  }
+
   /** Replace relay credentials and reconnect only this bridge transport. */
   updateConnection({ url = this.url, token = this.token, clientId = this.clientId, ownerName = this.ownerName, clientName = this.clientName } = {}) {
     if (typeof url !== 'string' || url.length === 0 || typeof token !== 'string' || token.length === 0) {
@@ -376,6 +402,7 @@ class BridgeClient {
   }
 
   async onRequest(frame) {
+    const receivedAt = performance.now();
     const id = typeof frame.id === 'string' ? frame.id : null;
     if (id === null) {
       this.emit('protocol.error', new Error('request without an id'));
@@ -394,7 +421,9 @@ class BridgeClient {
       this.answer(id, error);
       return;
     }
-    const promise = this.pending.add(id, { method: request.method, timeoutMs: request.timeoutMs });
+    const deadlineAt = receivedAt + request.timeoutMs;
+    const timeoutMs = Math.max(0, deadlineAt - performance.now());
+    const promise = this.pending.add(id, { method: request.method, timeoutMs });
     if (promise === null) {
       this.answer(id, new BridgeError('bridge_error', 'too many requests are already in flight'));
       return;
@@ -402,8 +431,11 @@ class BridgeClient {
     this.emit('request.received', request);
     // The registry owns the deadline: if it fires, this id is gone and the late
     // answer below is dropped instead of being sent out of time.
-    promise.catch((error) => this.emit('request.timeout', { id, code: error.code }));
-    void this.executeRequest(id, request);
+    promise.catch((error) => {
+      if (request.params?.tool === 'workbuddy') this.rememberAnsweredId(id);
+      this.emit('request.timeout', { id, code: error.code });
+    });
+    void this.executeRequest(id, request, deadlineAt);
   }
 
   /**
@@ -413,10 +445,35 @@ class BridgeClient {
    * retry lives on this path, because a duplicate message is worse than a
    * failure the user can see.
    */
-  async executeRequest(id, request) {
+  async executeRequest(id, request, deadlineAt = performance.now() + request.timeoutMs) {
     let result;
     try {
-      result = await this.dispatch({ method: request.method, params: request.params });
+      const dispatchRequest = { method: request.method, params: request.params };
+      if (request.params?.tool === 'workbuddy') {
+        const checkActive = () => {
+          if (performance.now() >= deadlineAt) {
+            const error = requestDeadlineError();
+            this.rememberAnsweredId(id);
+            this.pending.fail(id, error);
+            throw error;
+          }
+          if (!this.pending.has(id)) {
+            throw new BridgeError('bridge_error', 'the request is no longer active');
+          }
+          if (!this.connected) {
+            const error = new BridgeError('bridge_error', 'the relay connection was lost');
+            this.pending.fail(id, error);
+            throw error;
+          }
+        };
+        dispatchRequest.internal = {
+          workbuddyHooks: Object.freeze({
+            checkActive,
+            remainingBudgetMs: () => Math.min(60000, Math.max(0, deadlineAt - performance.now())),
+          }),
+        };
+      }
+      result = await this.dispatch(dispatchRequest);
     } catch (error) {
       if (!this.pending.has(id)) {
         return; // already timed out: the relay would discard this answer anyway
@@ -451,11 +508,7 @@ class BridgeClient {
         frame = errorResponse(id, 'bridge_error', 'the answer was too large to send');
       }
     }
-    this.answeredIds.add(id);
-    if (this.answeredIds.size > ANSWERED_IDS_LIMIT) {
-      const oldest = this.answeredIds.values().next().value;
-      this.answeredIds.delete(oldest);
-    }
+    this.rememberAnsweredId(id);
     this.pending.settle(id, result);
     const sent = this.sendFrame(frame);
     if (!sent) {
@@ -465,6 +518,14 @@ class BridgeClient {
       this.sendFrame(errorResponse(id, 'bridge_error', 'the answer could not be sent'));
     }
     return frame;
+  }
+
+  rememberAnsweredId(id) {
+    this.answeredIds.add(id);
+    if (this.answeredIds.size > ANSWERED_IDS_LIMIT) {
+      const oldest = this.answeredIds.values().next().value;
+      this.answeredIds.delete(oldest);
+    }
   }
 
   /**

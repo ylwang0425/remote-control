@@ -67,7 +67,7 @@ func TestSessionReadPendingQuestions(t *testing.T) {
 	batch := func(state, questions string) string {
 		return `,"pendingQuestions":[{"callId":"call-1","state":"` + state + `","questions":[` + questions + `]}]`
 	}
-	oneQuestion := `{"id":"q1","question":"用哪个模型?","header":"模型","options":[{"label":"沿用当前模型","description":"发完这条再说"},{"label":"换一个"}],"multiSelect":false}`
+	oneQuestion := `{"id":"q1","question":"用哪个模型?","header":"模型","options":[{"label":"沿用当前模型","description":"发完这条再说"},{"label":"换一个"}],"multiSelect":false,"allowCustom":false}`
 
 	accepted := []struct {
 		name   string
@@ -105,6 +105,8 @@ func TestSessionReadPendingQuestions(t *testing.T) {
 		// A state the relay does not understand is not answerable, so it is not
 		// handed to a person as something to answer.
 		{"unknown state", readHead + `,"pendingQuestions":[{"callId":"c1","state":"maybe","questions":[{"id":"q1","question":"q?"}]}]}`},
+		{"allowCustom is not boolean", readHead + `,"pendingQuestions":[{"callId":"c1","state":"open","questions":[{"id":"q1","question":"q?","allowCustom":"false"}]}]}`},
+		{"allowCustom is not nullable", readHead + `,"pendingQuestions":[{"callId":"c1","state":"open","questions":[{"id":"q1","question":"q?","allowCustom":null}]}]}`},
 		{"batch has no questions", readHead + `,"pendingQuestions":[{"callId":"c1","state":"open"}]}`},
 		{"empty question list", readHead + batch("open", ``) + `}`},
 		{"question has no id", readHead + batch("open", `{"question":"q?"}`) + `}`},
@@ -220,6 +222,44 @@ func TestSessionReadPendingApprovals(t *testing.T) {
 	}
 }
 
+func TestSessionReadNativeApprovalContext(t *testing.T) {
+	for _, tool := range []string{"codex", "workbuddy"} {
+		head := strings.Replace(readHead, `"tool":"dsh"`, `"tool":"`+tool+`"`, 1)
+		accepted := []string{
+			head + `,"pendingApprovals":[{"id":"` + testApprovalID + `","toolName":"commandExecution","reason":"Request execution.\nReview the full command.","context":{"kind":"command","command":"npm test\nnode scripts/check.js","cwd":"D:\\project"}}]}`,
+			head + `,"pendingApprovals":[{"id":"` + testApprovalID + `","toolName":"networkRequest","reason":"Connect to the service.","context":{"kind":"network","networkHost":"api.example.com","protocol":"https","networkPort":443}}]}`,
+			head + `,"pendingApprovals":[{"id":"` + testApprovalID + `","toolName":"fileChange","reason":"Review the requested file changes.","context":{"kind":"file-change","summary":"Modify a file.\nCreate another file.","grantRoot":"D:\\project"}}]}`,
+		}
+		for _, result := range accepted {
+			if code, ok := ValidateResult("session.read", json.RawMessage(result)); !ok {
+				t.Errorf("%s native approval context was refused: %s", tool, code)
+			}
+		}
+
+		command := `{"id":"` + testApprovalID + `","toolName":"commandExecution","reason":"Run this command.","context":{"kind":"command","command":"npm test","cwd":"D:\\project"}}`
+		network := `{"id":"` + testApprovalID + `","toolName":"networkRequest","reason":"Connect to the service.","context":{"kind":"network","networkHost":"api.example.com","protocol":"https"}}`
+		rejectedProjections := []string{
+			`{"id":"` + testApprovalID + `","toolName":"commandExecution","reason":"Run this command."}`,
+			strings.Replace(command, `"reason":"Run this command."`, `"reason":""`, 1),
+			strings.Replace(command, `"reason":"Run this command."`, `"reason":"   "`, 1),
+			strings.Replace(command, `"kind":"command"`, `"kind":"workspace-write"`, 1),
+			strings.Replace(command, `"cwd":"D:\\project"`, `"cwd":"D:\\project","unshownScope":"workspace"`, 1),
+			strings.Replace(command, `"command":"npm test"`, `"command":"`+strings.Repeat("x", maxApprovalCommandRunes+1)+`"`, 1),
+			strings.Replace(command, `"command":"npm test"`, `"command":"npm test\u0001"`, 1),
+			strings.Replace(network, `"protocol":"https"`, `"protocol":"https","networkPort":0`, 1),
+			strings.Replace(network, `"protocol":"https"`, `"protocol":"https","networkPort":65536`, 1),
+			strings.Replace(network, `"protocol":"https"`, `"protocol":"https","networkPort":443.5`, 1),
+			strings.Replace(network, `"protocol":"https"`, `"protocol":"https","networkPort":null`, 1),
+		}
+		for _, approval := range rejectedProjections {
+			result := head + `,"pendingApprovals":[` + approval + `]}`
+			if code, ok := ValidateResult("session.read", json.RawMessage(result)); ok || code != CodeBridgeBadResponse {
+				t.Errorf("%s incomplete/unknown approval %s = %s, accepted=%v; want bridge_bad_response", tool, approval, code, ok)
+			}
+		}
+	}
+}
+
 // approvalList builds n synthetic-but-well-formed approvals for the cardinality
 // boundary. The ids are real UUID shapes; nothing here is a claim about a live
 // request.
@@ -238,6 +278,8 @@ func TestSessionAnswerResultShape(t *testing.T) {
 	accepted := []string{
 		`{"accepted":true,"sessionId":"s1","callId":"call-1"}`,
 		`{"accepted":true,"sessionId":"` + testSessionID + `","callId":"` + testApprovalID + `"}`,
+		`{"accepted":true,"sessionId":"s1","callId":"call-1","state":"submitted"}`,
+		`{"accepted":true,"sessionId":"s1","callId":"call-1","state":"confirmed"}`,
 		`{"accepted":true,"sessionId":"s1","callId":"call-1","futureField":1}`,
 	}
 	for _, result := range accepted {
@@ -255,6 +297,8 @@ func TestSessionAnswerResultShape(t *testing.T) {
 		`{"accepted":true,"callId":"call-1"}`,
 		`{"accepted":true,"sessionId":"s1","callId":""}`,
 		`{"accepted":true,"sessionId":"s1","callId":null}`,
+		`{"accepted":true,"sessionId":"s1","callId":"call-1","state":"resolved"}`,
+		`{"accepted":true,"sessionId":"s1","callId":"call-1","state":null}`,
 		`{"accepted":true,"sessionId":"has space","callId":"call-1"}`,
 		`{"sessionId":"s1","callId":"call-1"}`,
 		`[]`,
