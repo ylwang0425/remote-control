@@ -1,4 +1,22 @@
-# Completed background acceptance — Windows bridge 1.1.4
+# Completed background acceptance — Windows bridge 1.1.5
+
+## 1.1.5 startup regression
+
+The live administrator's `models.list` request failed because the installed WorkBuddy distribution contains
+`codebuddy-lite-wb.mjs`, while the bridge did not select the vendor's dedicated lite bundle. The bootstrap
+fell through to an absent general-purpose bundle and exited before returning any protocol frames.
+The resulting process failure was also incorrectly labeled `session_gone`.
+
+The bridge now sets `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1` on its owned child processes and uses `bridge_error`
+for a closed CLI channel. After restarting the actual local bridge, the public administrator API returned
+18 authenticated models and eight existing projects. All 514 desktop tests passed, including regressions
+for model discovery with a lite-only distribution and an early process exit that must not mark the chat ended.
+
+Page acceptance also found that a paired user's background list poll could close the administrator login
+form. Polling now pauses while that form is open, and an already-running list response is ignored there.
+All 195 mobile tests passed, including delayed-response and typed-password preservation regressions.
+
+## Background operation acceptance
 
 The final path uses WorkBuddy 5.7.7's bundled CLI 2.156.0, the official SDK `external` login, and
 the same desktop account. SDK credentials stay in a restricted local file. No desktop credential

@@ -14,6 +14,9 @@ permissions. It never opens a desktop debug port or decrypts the desktop account
 are saved only in this Windows user's private configuration, with a user-and-SYSTEM file ACL. They are
 not uploaded to the relay or included in the Windows package.
 
+Bridge 1.1.5 selects the installed WorkBuddy lite bundle explicitly, including distributions that contain
+no general-purpose CLI bundle. The vendor bootstrap retains its fallback behavior for older installs.
+
 Background mode supports new chats, existing projects, continuation of original desktop UUIDs,
 per-message model selection, native questions, single-use Allow once/Reject, and Stop of its owned tasks.
 CLI-created chats are saved in WorkBuddy's canonical local archive and indexed by this workbench;

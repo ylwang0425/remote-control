@@ -1790,6 +1790,43 @@ test('admin login from settings clears the password and never stores credentials
   assert.equal(doc.getElementById('admin-password-input').value, '');
 });
 
+test('background polling preserves the paired user administrator login form and typed fields', async () => {
+  const { doc, app, api, host } = boot();
+  await app.start();
+  await app.selectTab('settings');
+  doc.getElementById('settings-admin-login').dispatch('click');
+  doc.getElementById('admin-username-input').value = 'operator';
+  doc.getElementById('admin-password-input').value = 'admin-test-secret';
+  const listCalls = api.callsOf('list').length;
+  host.advance(5000);
+  await app.tick();
+  assert.equal(api.callsOf('list').length, listCalls);
+  assert.equal(app.state.screen, 'pair');
+  assert.equal(doc.getElementById('admin-login-panel').hidden, false);
+  assert.equal(doc.getElementById('admin-password-input').value, 'admin-test-secret');
+  doc.getElementById('admin-login-submit').dispatch('click');
+  await settle();
+  assert.equal(app.state.screen, 'admin-roster');
+  assert.equal(doc.getElementById('admin-password-input').value, '');
+});
+
+test('a list response already in flight cannot navigate away from administrator login', async () => {
+  const { doc, app, api } = boot();
+  await app.start();
+  await app.selectTab('settings');
+  let release;
+  api.on('list', () => new Promise(resolve => { release = resolve; }));
+  const pending = app.refreshList();
+  assert.equal(typeof release, 'function');
+  doc.getElementById('settings-admin-login').dispatch('click');
+  doc.getElementById('admin-password-input').value = 'admin-test-secret';
+  release(ok({ sessions: SESSIONS, capabilities: CAPS }));
+  await pending;
+  assert.equal(app.state.screen, 'pair');
+  assert.equal(doc.getElementById('admin-login-panel').hidden, false);
+  assert.equal(doc.getElementById('admin-password-input').value, 'admin-test-secret');
+});
+
 test('same session and pending IDs stay isolated by computer; answers and approvals target the selected computer', async () => {
   const capabilities = Object.assign({}, CAPS, {
     'session.answer:dsh': true,

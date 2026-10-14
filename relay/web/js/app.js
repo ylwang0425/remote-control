@@ -695,6 +695,10 @@
       else show('pair');
     }
 
+    function adminLoginIsOpen() {
+      return state.screen === 'pair' && el.adminLoginPanel && !el.adminLoginPanel.hidden;
+    }
+
     async function submitAdminLogin() {
       if (state.adminLoginBusy || typeof apiClient.adminLogin !== 'function') return;
       var username = el.adminUsername ? el.adminUsername.value.trim() : '';
@@ -1226,6 +1230,8 @@
       var result = await rpc(core.listBody(), context);
       endRequest(context.scope);
       if (!result || result.stale) return;
+      // A list request started before the login form opened must not close it.
+      if (adminLoginIsOpen()) return;
 
       if (!result.ok) {
         if (core.isAuthFailure(result.code)) {
@@ -3407,6 +3413,10 @@
     }
 
     async function tick() {
+      if (adminLoginIsOpen()) {
+        scheduleTick();
+        return;
+      }
       if (state.admin && !state.selectedComputer) {
         if (state.screen === 'admin-roster' && !document.hidden && !state.adminRosterLoading &&
             now() - state.lastRosterMs >= core.LIST_INTERVAL_MS) {

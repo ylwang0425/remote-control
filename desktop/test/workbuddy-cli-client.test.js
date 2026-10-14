@@ -7,18 +7,22 @@ const { WorkBuddyCliClient } = require('../src/workbuddy-native/cli-client');
 const ID = '2044490a-c920-43cc-868f-1e470bb3f567';
 const OTHER = '987d1cef-9634-4acf-b738-6d28fbcbe22e';
 
-function fixture({ account = 'same-owner', timeout = 1000, reply = true } = {}) {
+function fixture({ account = 'same-owner', timeout = 1000, reply = true, authOnly = false, requiresLiteBundle = false } = {}) {
   const frames = []; const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
   child.exitCode = null; child.kill = () => { child.exitCode = 0; child.emit('exit', 0); };
   child.stdin = new Writable({ write(bytes, _encoding, callback) {
     const frame = JSON.parse(bytes.toString()); frames.push(frame); callback();
+    if (requiresLiteBundle && spawnOptions.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE !== '1') {
+      queueMicrotask(() => { child.exitCode = 1; child.emit('exit', 1); });
+      return;
+    }
     if (reply && frame.type === 'control_request') queueMicrotask(() => child.stdout.write(JSON.stringify({ type: 'control_response', response: {
       subtype: 'success', request_id: frame.request_id, response: frame.request.subtype === 'initialize'
         ? { account: { userId: account, token: 'private-fixture-token' }, models: [{ id: 'glm-5.1', name: 'GLM-5.1' }], currentModelId: 'glm-5.1' } : {} } }) + '\n'));
   } });
   let spawnOptions; let args;
   const client = new WorkBuddyCliClient({ executablePath: 'installed-WorkBuddy.exe', entry: 'installed-cli', configDir: 'local-data', cwd: 'local-project',
-    sessionId: ID, accountId: 'same-owner', token: 'private-fixture-token', requestTimeoutMs: timeout,
+    sessionId: ID, accountId: 'same-owner', token: 'private-fixture-token', requestTimeoutMs: timeout, authOnly,
     spawnProcess: (_exe, argv, options) => { args = argv; spawnOptions = options; return child; } });
   const failures = []; client.on('failure', error => failures.push(error));
   const emit = frame => child.stdout.write(JSON.stringify(frame) + '\n');
@@ -38,6 +42,27 @@ test('background CLI uses default permissions, hidden argv spawning, and keeps c
   assert.equal(f.args.some(arg => /bypass|skip-permissions/.test(arg)), false);
   await f.client.send('a real fixture message', 'glm-5.1');
   assert.equal(f.frames.at(-1).session_id, ID);
+});
+
+test('model discovery initializes a WorkBuddy install containing only the lite bundle', async t => {
+  const f = fixture({ authOnly: true, requiresLiteBundle: true }); t.after(() => f.client.close());
+  const result = await f.client.initialize();
+  assert.equal(result.accountMatches, true);
+  assert.equal(result.models.length, 1);
+  assert.equal(f.args.includes('--no-session-persistence'), true);
+  assert.equal(f.frames.some(frame => frame.type === 'user'), false);
+});
+
+test('CLI startup failure reports a bridge failure without claiming the native chat ended', async () => {
+  const f = fixture({ reply: false });
+  const initialized = f.client.initialize();
+  f.child.stderr.write('vendor failure private-fixture-token');
+  f.child.exitCode = 1; f.child.emit('exit', 1);
+  await assert.rejects(initialized, { code: 'bridge_error', message: 'WorkBuddy background process ended' });
+  assert.equal(f.client.closed, true);
+  assert.equal(f.failures.length, 1);
+  assert.equal(f.failures[0].message.includes('private-fixture-token'), false);
+  assert.throws(() => f.client.write({ type: 'user' }), { code: 'bridge_error' });
 });
 
 test('a different authenticated account cannot send to the native conversation', async () => {

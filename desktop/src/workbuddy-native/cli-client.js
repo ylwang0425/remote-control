@@ -51,7 +51,9 @@ class WorkBuddyCliClient extends EventEmitter {
     if (model) args.push('--model', model);
     const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', CODEBUDDY_CONFIG_DIR: configDir,
       WORKBUDDY_CONFIG_DIR: configDir, CODEBUDDY_CODE_ENTRYPOINT: 'sdk-ts', DISABLE_AUTOUPDATER: '1',
-      CODEBUDDY_DISABLE_AUTO_MEMORY: '1' };
+      // WorkBuddy distributions may contain only the lite bundle. Let the vendor
+      // bootstrap select it first and use its own fallback on older installs.
+      CODEBUDDY_FORCE_LITE_WB_BUNDLE: '1', CODEBUDDY_DISABLE_AUTO_MEMORY: '1' };
     // Use the official SDK login result; never read/decrypt another application's credentials.
     delete env.CODEBUDDY_AUTH_TOKEN;
     if (token) env.CODEBUDDY_AUTH_TOKEN = token;
@@ -67,7 +69,7 @@ class WorkBuddyCliClient extends EventEmitter {
   }
 
   write(frame) {
-    if (this.closed || this.child.stdin.destroyed) throw new BridgeError('session_gone', 'WorkBuddy background process has ended');
+    if (this.closed || this.child.stdin.destroyed) throw new BridgeError('bridge_error', 'WorkBuddy background process has ended');
     this.child.stdin.write(JSON.stringify(frame) + '\n');
   }
 
@@ -222,7 +224,7 @@ class WorkBuddyCliClient extends EventEmitter {
     if (this.closed) return;
     this.closed = true;
     this.permissions.clear();
-    for (const item of this.requests.values()) { clearTimeout(item.timer); item.reject(new BridgeError('session_gone', 'WorkBuddy background process ended')); }
+    for (const item of this.requests.values()) { clearTimeout(item.timer); item.reject(new BridgeError('bridge_error', 'WorkBuddy background process ended')); }
     this.requests.clear(); this.child.stdin.end();
     const timer = setTimeout(() => { if (this.child.exitCode === null) this.child.kill(); }, 1500);
     timer.unref();
