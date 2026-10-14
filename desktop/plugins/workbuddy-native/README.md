@@ -17,6 +17,10 @@ not uploaded to the relay or included in the Windows package.
 Bridge 1.1.5 selects the installed WorkBuddy lite bundle explicitly, including distributions that contain
 no general-purpose CLI bundle. The vendor bootstrap retains its fallback behavior for older installs.
 
+Bridge 1.1.6 includes native recent workspaces and the current account's selected new-task workspace,
+even when no chat has been created in that folder. Workspace metadata is read-only; only existing
+directories can be selected, and the project list is checked again before starting a background chat.
+
 Background mode supports new chats, existing projects, continuation of original desktop UUIDs,
 per-message model selection, native questions, single-use Allow once/Reject, and Stop of its owned tasks.
 CLI-created chats are saved in WorkBuddy's canonical local archive and indexed by this workbench;

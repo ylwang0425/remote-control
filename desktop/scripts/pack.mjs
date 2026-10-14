@@ -58,6 +58,7 @@ const SOURCE_RUNTIME_FILES = Object.freeze([
   'src/workbuddy-native/cli-client.js',
   'src/workbuddy-native/credentials.js',
   'src/workbuddy-native/background.js',
+  'src/workbuddy-native/workspace-catalog.js',
   'src/workbuddy-native/login.js',
   'src/ws.js',
 ]);

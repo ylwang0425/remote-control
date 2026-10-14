@@ -2031,6 +2031,23 @@ test('message model choices do not carry across computer or tool changes', async
   ).length, codexCatalogCallsBeforeClick, 'the denied picker cannot trigger an additional catalog request');
 });
 
+test('reopening WorkBuddy creation refreshes desktop workspaces even when models were previously cached', async () => {
+  const capabilities = Object.assign({}, CAPS, {
+    'models.list:workbuddy': true, 'session.create:workbuddy': true, tools: ['workbuddy']
+  });
+  const catalog = { tool: 'workbuddy', models: [{ id: 'wb-model', label: 'WB model' }], projects: [] };
+  const { doc, app, api } = boot({ defaults: { list: ok({ sessions: [], capabilities }), models: ok(catalog) } });
+  await app.start();
+  await app.openNewSession({ tool: 'workbuddy' });
+  assert.equal(app.newState.catalog.projects.length, 0);
+  const before = api.callsOf('models').length;
+  api.on('models', ok(Object.assign({}, catalog, { projects: [{ id: 'native-lifebot', name: 'lifebot', cwd: '/registered/lifebot' }] })));
+  await app.openNewSession({ tool: 'workbuddy' });
+  assert.equal(api.callsOf('models').length, before + 1);
+  assert.match(doc.getElementById('project-select').textContent, /lifebot/);
+  assert.equal(app.newState.catalog.projects[0].id, 'native-lifebot');
+});
+
 test('WorkBuddy appears by its real tool ID and can create only from the selected target catalog', async () => {
   const capabilities = {
     'sessions.list': true,

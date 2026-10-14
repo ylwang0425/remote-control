@@ -1,4 +1,21 @@
-# Completed background acceptance — Windows bridge 1.1.5
+# Completed background acceptance — Windows bridge 1.1.6
+
+## 1.1.6 native workspace discovery
+
+The previous project catalog inferred directories from chat records and missed the desktop-selected
+`lifebot` workspace, which had no local conversation. That selection is stored separately in
+`storage/device/scoped/<scope>/newTaskWorkspace.json`, under the current account's home key.
+The native `workspaces` table also retains recent workspace paths without requiring a chat.
+
+The catalog now merges those read-only sources with existing chat directories, canonicalizes existing
+folders, deduplicates them, and retains stable project IDs. Home keys from other accounts or unsupported
+organization scopes are excluded. Malformed, oversized or linked metadata is not followed. Newer workspace
+schemas with an account column are filtered by the current account.
+
+After restarting the actual bridge, the public administrator API returned nine projects including
+`lifebot` with its real folder path. All 519 desktop tests and 196 mobile tests passed. The regression
+checks cover selecting a folder without any conversation, owner isolation, corrupt metadata, and
+refreshing WorkBuddy projects when reopening the creation panel.
 
 ## 1.1.5 startup regression
 

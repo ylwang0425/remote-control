@@ -3531,7 +3531,9 @@
         return;
       }
       var catalogs = newCatalogMap();
-      if (catalogs[tool]) {
+      // WorkBuddy's selected workspace can change without creating any chat.
+      // Re-read its projects whenever this panel opens; the bridge caches models.
+      if (catalogs[tool] && tool !== 'workbuddy') {
         newState.catalog = catalogs[tool];
         renderNewPanel();
         return;

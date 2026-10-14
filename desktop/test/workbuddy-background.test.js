@@ -53,6 +53,19 @@ test('a different desktop owner or a native running turn cannot be resumed', asy
   assert.equal(f.clients.length, 0);
 });
 
+test('a desktop-selected workspace with no session can be selected for a new background chat', async t => {
+  const f = fixture(t); const cwd = path.join(f.root, 'lifebot'); fs.mkdirSync(cwd);
+  const metadata = path.join(f.root, 'storage', 'device', 'scoped', 'c7389fe09fa872c0');
+  fs.mkdirSync(metadata, { recursive: true });
+  fs.writeFileSync(path.join(metadata, 'newTaskWorkspace.json'), JSON.stringify({ '__home__:same-owner:anonymous': { cwd } }));
+  const catalog = await f.background.listModels();
+  const project = catalog.projects.find(item => item.cwd === cwd);
+  assert.ok(project);
+  const created = await f.background.create({ model: 'fixture-model', text: 'test', projectId: project.id }, {}, {});
+  assert.equal(f.background.row(created.sessionId).cwd, cwd);
+  assert.equal(f.clients.at(-1).options.cwd, cwd);
+});
+
 test('one live writer per project, even when two different conversation IDs are requested', async t => {
   const f = fixture(t); const catalog = await f.background.listModels();
   const input = { model: 'fixture-model', text: 'first', projectId: catalog.projects[0].id };

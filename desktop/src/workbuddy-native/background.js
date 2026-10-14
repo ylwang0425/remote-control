@@ -5,6 +5,7 @@ const os = require('node:os');
 const { createHash, randomUUID } = require('node:crypto');
 const { WorkBuddyCliClient, installedCli } = require('./cli-client');
 const { desktopAccountId, loadCredentials, boundedJson } = require('./credentials');
+const { readNativeWorkspacePaths } = require('./workspace-catalog');
 const { BridgeError } = require('../errors');
 const { buildSessionReadResult, assertAnswerBatch } = require('../protocol');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -51,7 +52,8 @@ class WorkBuddyBackground {
   projects() {
     const accountId = this.identity(); const seen = new Set(); const projects = [];
     const rows = this.adapter.db.prepare('SELECT cwd FROM sessions WHERE user_id = ? AND transport = ? AND deleted_at IS NULL LIMIT 2000').all(accountId, 'local');
-    for (const row of [...rows, ...this.rows()]) {
+    const workspaces = readNativeWorkspacePaths({ configDir: this.adapter.configDir, db: this.adapter.db, accountId });
+    for (const row of [...workspaces.map(cwd => ({ cwd })), ...rows, ...this.rows()]) {
       if (typeof row.cwd !== 'string' || !path.isAbsolute(row.cwd)) continue;
       let cwd; try { cwd = fs.realpathSync(row.cwd); if (!fs.statSync(cwd).isDirectory()) continue; } catch { continue; }
       const key = process.platform === 'win32' ? cwd.toLowerCase() : cwd;
