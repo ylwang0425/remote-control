@@ -91,7 +91,15 @@
     </table>
   </div>
 
-  <h2>WorkBuddy 本机 UI Automation（可选）</h2>
+  <h2>WorkBuddy 后台连接</h2>
+  <div class="box">
+    <p class="note">后台 CLI 可新建、续聊、切换模型，并处理它当前任务的提问、授权和停止。新建聊天保存在本机，在手机工作台管理；WorkBuddy 桌面侧边栏不会自动收录。续聊已有桌面聊天会使用原会话记录。</p>
+    <p id="workbuddyBackgroundStatus" class="note" role="status" aria-live="polite">检查后台连接…</p>
+    <div class="actions"><button id="loginWorkbuddyBackground">官方登录并启用</button><button id="enableWorkbuddyBackground">启用已有 CLI 登录</button><button id="disableWorkbuddyBackground">关闭后台模式</button></div>
+    <p id="workbuddyBackgroundResult" class="note" role="status" aria-live="polite"></p>
+  </div>
+
+  <h2>WorkBuddy 本机界面控制（可选）</h2>
   <div class="box">
     <label class="field"><span><input id="workbuddyUiAutomationEnabled" type="checkbox" style="width:auto"> 在这台电脑启用 WorkBuddy UIA 适配器</span></label>
     <label class="field" for="workbuddyExecutablePath">WorkBuddy.exe 绝对路径（可选）
@@ -295,6 +303,11 @@
       const workbuddy = describeWorkbuddy(state.workbuddy);
       set('workbuddy', workbuddy.text, workbuddy.className);
       describeWorkbuddyUiAutomation(state.workbuddy);
+      var wb = state.workbuddy || {};
+      document.getElementById('workbuddyBackgroundStatus').textContent =
+        (wb.background && wb.background.enabled ? '后台 CLI 已开启；调用时会检查同一桌面账号。' : '后台 CLI 未开启。') +
+        (wb.login && wb.login.state === 'awaiting-login' ? ' 正在等待官方页面登录。' : '') +
+        (wb.login && (wb.login.state === 'failed' || wb.login.state === 'expired') ? ' 上次登录失败或已过期，请重新登录。' : '');
       const nameField = document.getElementById('ownerName');
       if (nameField.dataset.initialized !== 'true') {
         nameField.value = identity.ownerName || '';
@@ -333,6 +346,23 @@
     } finally {
       button.disabled = false;
     }
+  });
+
+  ['login', 'enable', 'disable'].forEach(function (action) {
+    var id = action === 'login' ? 'loginWorkbuddyBackground' : action === 'enable' ? 'enableWorkbuddyBackground' : 'disableWorkbuddyBackground';
+    document.getElementById(id).addEventListener('click', async function (event) {
+      var button = event.currentTarget; var output = document.getElementById('workbuddyBackgroundResult');
+      button.disabled = true;
+      try {
+        var settings = { action: action }; var exe = document.getElementById('workbuddyExecutablePath').value.trim();
+        if (exe) settings.executablePath = exe;
+        var result = await postLocal('/api/workbuddy-background', settings);
+        if (result.authUrl) { window.location.assign(result.authUrl); return; }
+        output.textContent = result.enabled ? '同一账号的 CLI 登录已验证，后台模式已启用。' : '后台模式已关闭。';
+        output.className = 'note ok'; await refresh();
+      } catch (error) { output.textContent = String(error.message || error); output.className = 'note bad'; }
+      finally { button.disabled = false; }
+    });
   });
 
   document.getElementById('saveWorkbuddyUiAutomation').addEventListener('click', async (event) => {

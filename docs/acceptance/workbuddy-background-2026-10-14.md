@@ -1,3 +1,49 @@
+# Completed background acceptance — Windows bridge 1.1.4
+
+The final path uses WorkBuddy 5.7.7's bundled CLI 2.156.0, the official SDK `external` login, and
+the same desktop account. SDK credentials stay in a restricted local file. No desktop credential
+decryption, process-memory extraction, private gateway ticket, remote debug port, or permission bypass
+is used. The earlier compatibility findings below are retained as history and superseded by this result.
+
+Real acceptance through the public authenticated relay confirmed:
+
+- 18 authenticated model options and seven existing local projects.
+- Background creation in a selected existing project, with the exact first message and actual AI reply.
+- Resumption after a fresh CLI process, correct recall of the previous test number, and an actual model
+  change from `glm-5.1` to `glm-5.3-flash`.
+- Continuation of original desktop UUID `9e59e62e-0d77-4652-bf52-b40746ba76da`; the original archive
+  contained both the new user message and the actual AI response.
+- A real `AskUserQuestion` request, the phone API answer, exact AI reply `已选择：蓝色`, and rejection
+  of the stale question handle.
+- Stop of an owned active generation, return to idle, and retirement of pending controls.
+- Real PowerShell permission requests: Allow once wrote precisely the approved temporary test file;
+  Reject left the other target absent and produced `APPROVAL-REJECTED`. No persistent permission
+  suggestion was applied. WorkBuddy's independent Bash-to-PowerShell security rejection was preserved;
+  the correct native PowerShell tool was used instead.
+
+These background operations completed without starting a WorkBuddy desktop GUI. The desktop main
+window was absent throughout the captured checks; its absence was preserved before and after public
+creation, reading, and original-chat continuation. This is distinct from verifying a minimized open window.
+
+The user approved background CLI creation managed by the phone workbench. CLI-created chats use the
+canonical local archive and a separate workbench index; they do not automatically appear in the WorkBuddy
+desktop sidebar. `workbuddy.db` remains read-only. Existing desktop chats retain their original UUID.
+The project selector accepts only projects from this account's actual local catalog. The bridge permits
+one active task per project and at most four active background tasks.
+
+The native UIA path remains optional for tasks already owned by the desktop app. Background Stop,
+questions and approvals apply to the bridge's own CLI tasks; finish a desktop turn before continuing
+that same chat. New chats and subsequent turns from this workbench use background CLI when enabled.
+Unsupported or incomplete permission contexts are denied. Supported contexts cover Bash, PowerShell,
+Write, Edit, MultiEdit and WebFetch. Physical Android installation was not repeated in this acceptance;
+the existing Android shell loads the hosted workbench.
+
+Private acceptance records are excluded from source and delivery archives. Public source tests cover
+account mismatch, original UUID checks, stale/cancelled handles, exact question choices, scoped
+single-use decisions, project writer locks, local CSRF/origin checks, and UTF-8 stream boundaries.
+
+## Earlier investigation history
+
 # WorkBuddy background operations — 2026-10-14
 
 Desktop bridge 1.1.2 moves verified read operations away from desktop input. Native writes retain

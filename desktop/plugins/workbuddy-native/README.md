@@ -5,6 +5,33 @@ WorkBuddy plugin, modify application files or saved preferences, change permissi
 The UI Automation setting is local to this computer. Saving it only updates this bridge's configuration and
 reopens its WorkBuddy adapter; it does not start, stop, or reconfigure WorkBuddy by itself.
 
+## Background CLI mode (1.1.4)
+
+The local settings page offers **Official login and enable** and **Enable existing CLI login**.
+Fill in the installed `WorkBuddy.exe` path if it is not already configured, and use the same account as
+the desktop application. The bridge uses WorkBuddy's installed CLI in a hidden process with default
+permissions. It never opens a desktop debug port or decrypts the desktop account store. SDK credentials
+are saved only in this Windows user's private configuration, with a user-and-SYSTEM file ACL. They are
+not uploaded to the relay or included in the Windows package.
+
+Background mode supports new chats, existing projects, continuation of original desktop UUIDs,
+per-message model selection, native questions, single-use Allow once/Reject, and Stop of its owned tasks.
+CLI-created chats are saved in WorkBuddy's canonical local archive and indexed by this workbench;
+WorkBuddy's desktop sidebar does not automatically list them. The bridge never writes `workbuddy.db`.
+Ordinary reads and all operations on these background tasks do not require an unlocked desktop or UIA.
+One task per project may run at a time, with at most four active tasks on this computer.
+
+Real public-relay acceptance verified context recall, a model change, the actual AI question answer,
+Stop, and native PowerShell Allow once/Reject. Allow once wrote exactly one test file; Reject left the
+other file absent. Bash cannot invoke PowerShell under WorkBuddy's own security policy; the bridge
+supports the native PowerShell tool instead. Supported permission contexts are Bash, PowerShell,
+Write, Edit, MultiEdit and WebFetch. A request without a complete supported context is denied.
+
+The interface automation described below remains an optional path for desktop-owned operations.
+Permissions or Stop for a task already running inside the desktop app need that original UIA path;
+the background bridge only controls its own CLI processes. Finish a desktop turn before continuing
+that same chat from the phone. See `docs/acceptance/workbuddy-background-2026-10-14.md`.
+
 ## Start in accessibility mode
 
 1. Exit WorkBuddy normally from its own menu or tray. The launcher refuses to start when the selected
@@ -46,10 +73,9 @@ merged by display name. The cache is bounded to 1 MiB and 24 hours; it does not 
 model. Every native model change still selects and verifies the actual desktop option. A missing or invalid cache
 never causes an ordinary background model read to restore a minimized window or switch to a New Task page.
 
-The installed CLI supports `--resume` and a local HTTP service, but this computer's standalone CLI does not reuse
-its desktop login. Its desktop-owned HTTP worker requires separate gateway authentication. Background native
-continuation has not passed acceptance, so writes remain on the existing explicit UI Automation path. See
-`docs/acceptance/workbuddy-background-2026-10-14.md` in the source repository for the compatibility evidence.
+Background mode uses a separate official SDK login for the same desktop account. It does not attach
+to the desktop-owned HTTP worker or copy its gateway secret. The current authenticated CLI catalog
+was 18 models during acceptance; the optional UIA cache and desktop picker remain separate sources.
 
 Message typing uses standard focused Windows keyboard input so WorkBuddy's React/Slate editor receives
 its normal input events. It preserves unrelated drafts, checks the selected conversation before input,
@@ -62,7 +88,7 @@ were automatically allowed by WorkBuddy and therefore did not verify real approv
 have protocol and C# fixture coverage but still need a genuine native approval card for real-app acceptance.
 
 This installed version does not expose a verified workspace picker in its New Task accessibility view.
-WorkBuddy new chats currently use the workspace selected by the desktop app. Existing native workspace
+UIA new chats use the workspace selected by the desktop app. Background mode can select existing native projects. Existing native workspace
 paths remain available for history filtering, and unsupported project IDs fail before a message is written.
 The integration never falls back to a different AI tool.
 

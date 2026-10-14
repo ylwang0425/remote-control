@@ -16,6 +16,21 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+test('a long multiline native title cannot break the shared list or split an emoji', async t => {
+  const originalTitle = 'Native title\n' + '🟢'.repeat(150);
+  const id = '01a11a8c-9512-79c3-ae04-a47584282b0b';
+  const server = await startPipe({ listThreads: { schemaVersion: 1, threads: [{ id, kind: 'projectless', hostId: 'local',
+    status: 'idle', cwd: null, updatedAt: '2026-10-14T05:00:00.000Z', title: originalTitle }], pinnedThreads: [] } });
+  t.after(() => server.close());
+  const adapter = await CodexAdapter.open({ pipePath: server.pipePath, contextThreadId: 'ctx-1' }); t.after(() => adapter.close());
+  const sessions = await adapter.listSessions();
+  assert.equal(sessions[0].id, id); assert.equal(sessions[0].title.length <= 200, true);
+  assert.equal(/[\r\n]/.test(sessions[0].title), false); assert.equal(/[\uD800-\uDBFF]$/u.test(sessions[0].title), false);
+  const { buildSessionsListResult } = require('../src/protocol');
+  assert.doesNotThrow(() => buildSessionsListResult({ sessions, capabilities: { tools: ['codex'] } }));
+  assert.equal(originalTitle.includes('\n'), true);
+});
+
 const { PipeServer, inner, CODEX_APP_TOOLS, LIST_PROJECTS_TOOL, SEND_WITH_MODEL_TOOL } = require('./helpers/codex-pipe-server');
 const {
   discoverCodexPipes,

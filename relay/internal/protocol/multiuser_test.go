@@ -6,6 +6,20 @@ import (
 	"testing"
 )
 
+func TestWorkBuddyBackgroundCapabilitySurvivesHello(t *testing.T) {
+	var caps Capabilities
+	if err := json.Unmarshal([]byte(`{"tools":["workbuddy"],"workbuddy.background":true}`), &caps); err != nil {
+		t.Fatal(err)
+	}
+	if caps.BackgroundWorkBuddy == nil || !*caps.BackgroundWorkBuddy {
+		t.Fatal("the background mode was lost")
+	}
+	encoded, err := json.Marshal(caps)
+	if err != nil || !strings.Contains(string(encoded), `"workbuddy.background":true`) {
+		t.Fatal("the background mode must travel to the roster and phone")
+	}
+}
+
 func TestWorkBuddyIsAnExplicitToolIDForParamsAndResults(t *testing.T) {
 	validParams := []struct {
 		method string

@@ -586,6 +586,7 @@ function buildCapabilities(tools, options = {}) {
     tools: [...tools],
   };
   const toolStatus = normalizeToolStatus(options.toolStatus);
+  if (has('workbuddy') && options.backgroundWorkbuddy === true) capabilities['workbuddy.background'] = true;
   if (toolStatus !== undefined) capabilities.toolStatus = toolStatus;
   return capabilities;
 }
@@ -1178,6 +1179,7 @@ module.exports = {
   isCallId,
   isApprovalId,
   buildPendingApprovals,
+  assertAnswerBatch,
   toRfc3339,
   nowRfc3339,
   newId,

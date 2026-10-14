@@ -22,6 +22,7 @@ const { isSessionId, MAX_MESSAGES, toRfc3339 } = require('../protocol');
 const { createWindowsUiaInspector } = require('../workbuddy-native/windows-uia');
 const { WorkBuddyNativeWriter } = require('../workbuddy-native/writer');
 const { WorkBuddyPendingService } = require('../workbuddy-native/pending-service');
+const { WorkBuddyBackground } = require('../workbuddy-native/background');
 
 const MAX_LIST = 200;
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
@@ -431,7 +432,7 @@ function historyPath(configDir, row) {
 }
 
 class WorkBuddyAdapter {
-  constructor({ db, configDir, columns, uiAutomation = {} }) {
+  constructor({ db, configDir, columns, uiAutomation = {}, background = {} }) {
     this.db = db;
     this.configDir = configDir;
     this.columns = new Set(columns);
@@ -462,6 +463,7 @@ class WorkBuddyAdapter {
     this.nativeTitleCountStatement = db.prepare(`SELECT COUNT(*) AS count FROM sessions WHERE transport = 'local' AND deleted_at IS NULL`);
     this.nativeTitleRowsStatement = db.prepare(`SELECT id, title, custom_title, cwd, created_at, updated_at, last_activity_at, deleted_at, transport FROM sessions WHERE transport = 'local' AND deleted_at IS NULL ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, id LIMIT ?`);
     this.nativeSessionIdsStatement = db.prepare(`SELECT id FROM sessions WHERE transport = 'local' AND deleted_at IS NULL LIMIT ?`);
+    this.background = background.enabled === true ? new WorkBuddyBackground({ adapter: this, executablePath: this.workbuddyExecutablePath }) : null;
   }
 
   static open(options = {}) {
@@ -484,7 +486,7 @@ class WorkBuddyAdapter {
       try {
         const columns = db.prepare('PRAGMA table_info("sessions")').all().map((row) => row.name);
         if (!REQUIRED_SESSION_COLUMNS.every((column) => columns.includes(column))) throw new Error('unsupported WorkBuddy history schema');
-        return new WorkBuddyAdapter({ db, configDir, columns, uiAutomation });
+        return new WorkBuddyAdapter({ db, configDir, columns, uiAutomation, background: options.background });
       } catch (error) {
         db.close();
         throw error;
@@ -494,16 +496,17 @@ class WorkBuddyAdapter {
     }
   }
 
-  availableTools() { return this.uiAutomationEnabled ? ['local-history-read', 'native-ui-automation'] : ['local-history-read']; }
-  canModelsList() { return this.uiAutomationEnabled; }
-  canCreate() { return this.uiAutomationEnabled; }
-  canSend() { return this.uiAutomationEnabled; }
-  canStop() { return this.uiAutomationEnabled && this.pendingService != null && typeof this.uiAutomationInspector?.executeNativePendingAction === 'function'; }
-  canSendWithModel() { return this.uiAutomationEnabled && typeof this.uiAutomationInspector?.selectNativeModel === 'function'; }
+  availableTools() { return ['local-history-read', ...(this.background ? ['background-cli'] : []), ...(this.uiAutomationEnabled ? ['native-ui-automation'] : [])]; }
+  canModelsList() { return this.background !== null || this.uiAutomationEnabled; }
+  canCreate() { return this.background !== null || this.uiAutomationEnabled; }
+  canSend() { return this.background !== null || this.uiAutomationEnabled; }
+  canStop() { return this.background !== null || this.uiAutomationEnabled && this.pendingService != null && typeof this.uiAutomationInspector?.executeNativePendingAction === 'function'; }
+  canSendWithModel() { return this.background !== null || this.uiAutomationEnabled && typeof this.uiAutomationInspector?.selectNativeModel === 'function'; }
   canAnswer() { return this.canStop(); }
   canApprove() { return this.canStop(); }
   describe() {
     return {
+      background: { enabled: this.background !== null, newSessionsInDesktopSidebar: false },
       uiAutomation: {
         enabled: this.uiAutomationEnabled,
         ready: false,
@@ -519,6 +522,7 @@ class WorkBuddyAdapter {
 
   close() {
     if (this.closePromise !== null) return this.closePromise;
+    this.background?.close();
     this.pendingService?.retire();
     const drained = this.nativeWriter.close();
     if (this.nativeWriter.inFlight === 0 && this.lifecycleOperations.size === 0) {
@@ -794,6 +798,7 @@ class WorkBuddyAdapter {
         [...input.text].length > MAX_TEXT_CHARS || typeof input.model !== 'string' || !SAFE_MODEL_LABEL.test(input.model)) {
       throw new BridgeError('invalid_params', 'a WorkBuddy new chat needs a model and a non-empty first message');
     }
+    if (this.background !== null) return this.nativeWriter.run(nativeHooks => this.background.create(input, hooks, nativeHooks), workbuddyHooks);
     if ((typeof input.projectId === 'string' && input.projectId.length > 0) ||
         (typeof input.cwd === 'string' && input.cwd.length > 0)) {
       throw new BridgeError('not_capable', 'WorkBuddy has no verified project picker in the current native UI; choose its desktop workspace first');
@@ -847,6 +852,7 @@ class WorkBuddyAdapter {
     if (options.model !== undefined && (typeof options.model !== 'string' || !SAFE_MODEL_LABEL.test(options.model))) {
       throw new BridgeError('invalid_params', 'invalid WorkBuddy model');
     }
+    if (this.background !== null) return this.nativeWriter.run(nativeHooks => this.background.send(sessionId, text, options, nativeHooks), hooks);
     if (typeof options.provider === 'string' && options.provider.length > 0 ||
         typeof options.reasoningEffort === 'string' && options.reasoningEffort.length > 0) {
       throw new BridgeError('not_capable', 'WorkBuddy does not expose a verified provider or reasoning-effort selector');
@@ -928,6 +934,9 @@ class WorkBuddyAdapter {
   }
 
   async readSessionLive(sessionId, hooks) {
+    if (this.background !== null && (this.background.entries.has(sessionId) || this.background.row(sessionId))) {
+      hooks?.checkActive?.(); return this.background.snapshot(sessionId, this.readSession(sessionId));
+    }
     if (!this.uiAutomationEnabled || this.pendingService === null) return this.readSession(sessionId);
     return this.nativeWriter.run(async nativeHooks => {
       try { return await this.pendingService.read(sessionId, nativeHooks); }
@@ -940,18 +949,24 @@ class WorkBuddyAdapter {
   }
 
   answerQuestion(sessionId, callId, answers, hooks) {
+    if (this.background?.entries.has(sessionId)) return this.background.answer(sessionId, callId, answers, hooks);
+    if (this.pendingService === null) throw new BridgeError('not_capable', 'This question is not owned by a live WorkBuddy background task');
     if (!this.canAnswer()) throw new BridgeError('not_capable', 'WorkBuddy native questions are disabled');
     return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, callId, { answers },
       { ...nativeHooks, allowWindowActivation: true }), hooks);
   }
 
   approveRequest(sessionId, approvalId, decision, hooks) {
+    if (this.background?.entries.has(sessionId)) return this.background.approve(sessionId, approvalId, decision, hooks);
+    if (this.pendingService === null) throw new BridgeError('not_capable', 'This permission is not owned by a live WorkBuddy background task');
     if (!this.canApprove()) throw new BridgeError('not_capable', 'WorkBuddy native permissions are disabled');
     return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, approvalId, { decision },
       { ...nativeHooks, allowWindowActivation: true }), hooks);
   }
 
   stopSession(sessionId, hooks) {
+    if (this.background?.entries.has(sessionId)) return this.background.stop(sessionId, hooks);
+    if (this.pendingService === null) throw new BridgeError('not_capable', 'There is no live WorkBuddy background task to stop');
     if (!this.canStop()) throw new BridgeError('not_capable', 'WorkBuddy native Stop is disabled');
     return this.nativeWriter.run(nativeHooks => this.pendingService.stop(sessionId,
       { ...nativeHooks, allowWindowActivation: true }), hooks);
@@ -1036,6 +1051,7 @@ class WorkBuddyAdapter {
   }
 
   async listModels(hooks) {
+    if (this.background !== null) return this.background.listModels(hooks);
     if (!this.canModelsList()) throw new BridgeError('not_capable', 'WorkBuddy native model listing is not enabled');
     return this.nativeWriter.run(async (nativeHooks) => {
       nativeHooks?.checkActive?.();
@@ -1088,11 +1104,16 @@ class WorkBuddyAdapter {
   }
 
   listSessions() {
-    const rows = this.listStatement.all(MAX_LIST);
+    const nativeRows = this.listStatement.all(MAX_LIST);
+    const nativeIds = new Set(nativeRows.map(row => row.id));
+    const rows = [...nativeRows, ...(this.background?.rows() || []).filter(row => !nativeIds.has(row.id))];
     const result = [];
     for (const row of rows) {
       if (typeof row.id !== 'string' || !SAFE_SESSION_FILE_ID.test(row.id) || typeof row.cwd !== 'string' || !path.isAbsolute(row.cwd)) continue;
-      const updatedAt = timestamp(row.last_activity_at) ?? timestamp(row.updated_at) ?? timestamp(row.created_at);
+      const backgroundRow = !nativeIds.has(row.id);
+      const archive = this.background !== null ? historyPath(this.configDir, row) : null;
+      if (backgroundRow && archive === null) continue;
+      const updatedAt = archive !== null ? timestamp(fs.statSync(archive.file).mtimeMs) : timestamp(row.last_activity_at) ?? timestamp(row.updated_at) ?? timestamp(row.created_at);
       if (updatedAt === null) continue;
       const title = typeof row.custom_title === 'string' && row.custom_title.trim() !== ''
         ? row.custom_title
@@ -1100,18 +1121,21 @@ class WorkBuddyAdapter {
       result.push({
         id: row.id,
         tool: 'workbuddy',
-        title: sessionTitle(row),
+        title: backgroundRow ? `后台 CLI · ${sessionTitle(row)}`.slice(0, 200) : sessionTitle(row),
         status: 'unknown',
         updatedAt,
         cwd: row.cwd,
       });
     }
-    return result;
+    return result.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, MAX_LIST);
   }
+
+  redactCliTitle(value, limit = 180) { return redactSensitiveText(String(value)).slice(0, limit); }
 
   readSession(sessionId, options = {}) {
     if (typeof sessionId !== 'string' || !SAFE_SESSION_FILE_ID.test(sessionId)) throw new BridgeError('invalid_params', 'invalid WorkBuddy session id');
-    const row = this.readStatement.get(sessionId);
+    const nativeRow = this.readStatement.get(sessionId);
+    const row = nativeRow || this.background?.row(sessionId);
     if (!row) throw new BridgeError('session_not_found', 'WorkBuddy local session not found');
     const located = historyPath(this.configDir, row);
     if (located === null) throw new BridgeError('session_gone', HISTORY_UNAVAILABLE);
@@ -1157,7 +1181,7 @@ class WorkBuddyAdapter {
     const session = {
       id: row.id,
       tool: 'workbuddy',
-      title: sessionTitle(row),
+      title: nativeRow ? sessionTitle(row) : `后台 CLI · ${sessionTitle(row)}`.slice(0, 200),
       status: 'unknown',
       messages,
       canStop: false,

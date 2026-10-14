@@ -293,6 +293,7 @@ function createDispatcher(config, log, factories = {}) {
     const configuredUiAutomation = config.workbuddy?.uiAutomation ?? {};
     const options = {
       configDir: config.workbuddy?.configDir,
+      ...(config.workbuddy?.background?.enabled === true ? { background: { enabled: true } } : {}),
       uiAutomation: {
         enabled: configuredUiAutomation.enabled === true,
         ...(typeof configuredUiAutomation.executablePath === 'string'
@@ -302,7 +303,7 @@ function createDispatcher(config, log, factories = {}) {
     };
     // This in-memory key detects a settings change without returning local
     // paths from status or persisting an additional version field.
-    return { options, key: JSON.stringify([options.configDir ?? null, options.uiAutomation.enabled, options.uiAutomation.executablePath ?? null]) };
+    return { options, key: JSON.stringify([options.configDir ?? null, options.uiAutomation.enabled, options.uiAutomation.executablePath ?? null, options.background?.enabled === true]) };
   }
 
   async function closeWorkBuddyAdapter(adapter) {
@@ -402,6 +403,7 @@ function createDispatcher(config, log, factories = {}) {
       modelsList: codexAdapter !== null || dshAdapter !== null || modelsListWorkbuddy,
       sessionCreate: codexAdapter !== null || dshAdapter !== null || sessionCreateWorkbuddy,
       modelsListWorkbuddy,
+      backgroundWorkbuddy: workbuddyAdapter?.background != null,
       sessionCreateWorkbuddy,
       sendCodex: adapterAbility(codexAdapter, 'canSend', 'sendMessage'),
       sendModelCodex: adapterAbility(codexAdapter, 'canSendWithModel', 'sendMessage'),
@@ -879,6 +881,7 @@ function createDispatcher(config, log, factories = {}) {
           ? state.lastError.workbuddy ?? WORKBUDDY_UNAVAILABLE_REASON
           : capabilityToolStatus(state.codex, state.dsh, state.workbuddy).workbuddy.reason ?? null,
         uiAutomation: describeWorkBuddyUiAutomation(state.workbuddy, config.workbuddy?.uiAutomation),
+        background: state.workbuddy?.describe?.().background ?? { enabled: config.workbuddy?.background?.enabled === true },
       },
     }),
   };
@@ -987,6 +990,17 @@ async function run(config, args, log) {
     log(connected ? 'connected to the relay' : 'the relay link is not up yet; the bridge keeps retrying');
   }
 
+  const { WorkBuddyLogin } = require('./workbuddy-native/login');
+  const workbuddyLogin = new WorkBuddyLogin();
+  async function setWorkBuddyBackground(enabled) {
+    saveConfig(config.configFile, { workbuddy: { background: { enabled } } });
+    config.workbuddy = { ...config.workbuddy, background: { enabled } };
+    const capabilities = await dispatcher.refreshWorkBuddy();
+    updateStatusFromAdapters(); status.bridge.capabilities = capabilities;
+    bridge?.updateCapabilities?.(capabilities);
+    return { enabled, state: enabled ? 'ready' : 'idle' };
+  }
+
   const ui = new LocalUiServer({
     port: config.uiPort,
     state: () => {
@@ -998,7 +1012,7 @@ async function run(config, args, log) {
         bridge: { ...status.bridge, connected: bridge === null ? false : bridge.connected },
         codex: { ...described.codex },
         dsh: { ...described.dsh },
-        workbuddy: { ...described.workbuddy },
+        workbuddy: { ...described.workbuddy, login: workbuddyLogin.describe() },
       };
     },
     onPairCreate: async () => {
@@ -1032,6 +1046,19 @@ async function run(config, args, log) {
         helloSent = bridge?.connected === true;
       }
       return { identity: { clientId, ownerName }, helloUpdated: helloSent };
+    },
+    onWorkBuddyBackgroundUpdate: async ({ action, executablePath }) => {
+      if (action === 'disable') { workbuddyLogin.close(); return setWorkBuddyBackground(false); }
+      if (executablePath !== undefined) {
+        const normalized = normalizeWorkBuddyExecutablePath(executablePath);
+        const uiAutomation = { ...config.workbuddy?.uiAutomation, executablePath: normalized, configurationValid: true };
+        saveConfig(config.configFile, { workbuddy: { uiAutomation } });
+        config.workbuddy = { ...config.workbuddy, uiAutomation };
+      }
+      const options = { executablePath: config.workbuddy?.uiAutomation?.executablePath, configDir: config.workbuddy?.configDir };
+      if (action === 'login') return workbuddyLogin.start(options, () => setWorkBuddyBackground(true));
+      await workbuddyLogin.verify(options);
+      return setWorkBuddyBackground(true);
     },
     onWorkBuddyUiAutomationUpdate: async ({ enabled, executablePath }) => {
       let normalizedExecutablePath = config.workbuddy?.uiAutomation?.executablePath ?? null;
@@ -1157,7 +1184,7 @@ async function run(config, args, log) {
     return {
       ui, get bridge() { return bridge; }, clientName,
       stopAcceptingRequests: () => dispatcher.stopAccepting(),
-      closeAdapters: () => dispatcher.close(),
+      closeAdapters: () => { workbuddyLogin.close(); return dispatcher.close(); },
     };
   }
   if (token === null) {
@@ -1166,7 +1193,7 @@ async function run(config, args, log) {
     return {
       ui, get bridge() { return bridge; }, clientName,
       stopAcceptingRequests: () => dispatcher.stopAccepting(),
-      closeAdapters: () => dispatcher.close(),
+      closeAdapters: () => { workbuddyLogin.close(); return dispatcher.close(); },
     };
   }
 
@@ -1174,7 +1201,7 @@ async function run(config, args, log) {
   return {
     ui, get bridge() { return bridge; }, clientName,
     stopAcceptingRequests: () => dispatcher.stopAccepting(),
-    closeAdapters: () => dispatcher.close(),
+    closeAdapters: () => { workbuddyLogin.close(); return dispatcher.close(); },
   };
 }
 

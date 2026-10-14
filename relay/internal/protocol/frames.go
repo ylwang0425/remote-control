@@ -67,6 +67,7 @@ type Capabilities struct {
 	SendModelWorkBuddy     *bool `json:"session.send:model:workbuddy,omitempty"`
 	ModelsListWorkBuddy    *bool `json:"models.list:workbuddy,omitempty"`
 	SessionCreateWorkBuddy *bool `json:"session.create:workbuddy,omitempty"`
+	BackgroundWorkBuddy    *bool `json:"workbuddy.background,omitempty"`
 	// session.answer can answer a real pending question on the named tool.
 	AnswerCodex     bool  `json:"session.answer:codex"`
 	AnswerDSH       bool  `json:"session.answer:dsh"`

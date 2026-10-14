@@ -17,6 +17,32 @@ const { LocalUiServer, ALLOWED_ORIGIN_PREFIX } = require('../src/ui/server');
 const { loadConfig, configPath, redactedConfig } = require('../src/config');
 const { EnrollmentError } = require('../src/enrollment');
 
+test('WorkBuddy background login stays loopback and CSRF protected and returns only an official URL', async t => {
+  let calls = 0;
+  const { port, csrfToken } = await startUi(t, { onWorkBuddyBackgroundUpdate: async () => {
+    calls++; return { authUrl: 'https://www.workbuddy.cn/login?state=fixture', state: 'awaiting-login', token: 'must-not-leave', userId: 'private-account' };
+  } });
+  const options = { method: 'POST', path: '/api/workbuddy-background', body: JSON.stringify({ action: 'login' }),
+    headers: { 'Content-Type': 'application/json', Origin: `http://127.0.0.1:${port}`, 'X-CSRF-Token': csrfToken } };
+  const missing = await request(port, { ...options, headers: { ...options.headers, 'X-CSRF-Token': '' } });
+  assert.equal(missing.status, 403); assert.equal(calls, 0);
+  const foreign = await request(port, { ...options, headers: { ...options.headers, Origin: 'https://foreign.example' } });
+  assert.equal(foreign.status, 403); assert.equal(calls, 0);
+  const arbitrary = await request(port, { ...options, body: JSON.stringify({ action: 'login', command: 'unapproved' }) });
+  assert.equal(arbitrary.status, 400); assert.equal(calls, 0);
+  const good = await request(port, options);
+  assert.equal(good.status, 200); assert.equal(calls, 1);
+  assert.equal(good.body.includes('must-not-leave'), false); assert.equal(good.body.includes('private-account'), false);
+  assert.equal(JSON.parse(good.body).authUrl.startsWith('https://www.workbuddy.cn/'), true);
+});
+
+test('WorkBuddy background login refuses a foreign authentication URL', async t => {
+  const { port, csrfToken } = await startUi(t, { onWorkBuddyBackgroundUpdate: async () => ({ authUrl: 'https://evil.example/login' }) });
+  const result = await request(port, { method: 'POST', path: '/api/workbuddy-background', body: JSON.stringify({ action: 'login' }),
+    headers: { 'Content-Type': 'application/json', Origin: `http://127.0.0.1:${port}`, 'X-CSRF-Token': csrfToken } });
+  assert.notEqual(result.status, 200); assert.equal(result.body.includes('evil.example'), false);
+});
+
 function request(port, options) {
   return new Promise((resolve, reject) => {
     const req = http.request(

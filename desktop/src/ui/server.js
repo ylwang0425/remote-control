@@ -56,6 +56,7 @@ class LocalUiServer {
     this.onIdentityUpdate = options.onIdentityUpdate ?? null;
     this.onEnroll = options.onEnroll ?? null;
     this.onWorkBuddyUiAutomationUpdate = options.onWorkBuddyUiAutomationUpdate ?? null;
+    this.onWorkBuddyBackgroundUpdate = options.onWorkBuddyBackgroundUpdate ?? null;
     this.htmlPath = options.htmlPath ?? path.join(__dirname, '..', '..', 'ui', 'index.html');
     this.csrfToken = crypto.randomBytes(32).toString('base64url');
     this.address = null;
@@ -165,6 +166,10 @@ class LocalUiServer {
       await this.handleWorkBuddyUiAutomation(req, res);
       return;
     }
+    if (req.method === 'POST' && url.pathname === '/api/workbuddy-background') {
+      await this.handleWorkBuddyBackground(req, res);
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/enroll') {
       await this.handleEnroll(req, res);
       return;
@@ -265,6 +270,27 @@ class LocalUiServer {
     } catch (error) {
       this.actionFailure(res, error, 'Could not save the local WorkBuddy settings.');
     }
+  }
+
+  async handleWorkBuddyBackground(req, res) {
+    if (!this.hasCsrf(req)) { json(res, 403, { ok: false, error: { code: 'csrf_required', message: 'a CSRF token is required for writes' } }); return; }
+    const body = await this.readJsonBody(req, res);
+    if (body === null) return;
+    if (Object.keys(body).some(key => !['action', 'executablePath'].includes(key)) || !['login', 'enable', 'disable'].includes(body.action) ||
+        (Object.hasOwn(body, 'executablePath') && typeof body.executablePath !== 'string')) {
+      json(res, 400, { ok: false, error: { code: 'invalid_params', message: 'Choose login, enable or disable for the local WorkBuddy background adapter' } }); return;
+    }
+    if (this.onWorkBuddyBackgroundUpdate === null) { json(res, 503, { ok: false, error: { code: 'workbuddy_settings_unavailable', message: 'WorkBuddy background settings are not available' } }); return; }
+    try {
+      const value = await this.onWorkBuddyBackgroundUpdate(body);
+      let authUrl;
+      if (value?.authUrl) {
+        const url = new URL(value.authUrl);
+        if (url.protocol !== 'https:' || url.hostname !== 'www.workbuddy.cn' || url.username || url.password) throw new Error();
+        authUrl = url.href;
+      }
+      json(res, 200, { ok: true, enabled: value?.enabled === true, state: typeof value?.state === 'string' ? value.state : 'idle', ...(authUrl ? { authUrl } : {}) });
+    } catch (error) { this.actionFailure(res, error, 'Could not update WorkBuddy background settings.'); }
   }
 
   async handleEnroll(req, res) {

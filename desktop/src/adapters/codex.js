@@ -1,4 +1,13 @@
 'use strict';
+
+// Desktop-generated titles can contain pasted paragraphs. Present a bounded
+// label while keeping the native thread and its original title untouched.
+function displayThreadTitle(value, id) {
+  const text = String(value ?? '').replace(/[\p{Cc}\p{Z}]+/gu, ' ').trim();
+  let title = '';
+  for (const point of text) { if (title.length + point.length > 200) break; title += point; }
+  return title || `Codex thread ${String(id).slice(0, 8)}`;
+}
 /**
  * Codex Desktop adapter: take over the chats in the Codex Desktop app that is
  * already open.
@@ -1006,7 +1015,7 @@ class CodexAdapter {
       return {
         id: sessionId,
         tool: 'codex',
-        title: String(thread.title ?? '').trim() || `Codex thread ${String(sessionId).slice(0, 8)}`,
+        title: displayThreadTitle(thread.title, sessionId),
         status: mapThreadStatus(thread.status),
         updatedAt: toTimestamp(thread.updatedAt ?? thread.createdAt ?? null),
         cwd: typeof thread.cwd === 'string' && thread.cwd.length > 0 ? thread.cwd : null,
@@ -1046,7 +1055,7 @@ class CodexAdapter {
       sessions.push({
         id: thread.id,
         tool: 'codex',
-        title: String(thread.title ?? '').trim() || `Codex thread ${thread.id.slice(0, 8)}`,
+        title: displayThreadTitle(thread.title, thread.id),
         status: mapThreadStatus(thread.status),
         updatedAt: toTimestamp(thread.updatedAt),
         cwd: typeof thread.cwd === 'string' && thread.cwd.length > 0 ? thread.cwd : null,
@@ -1102,7 +1111,7 @@ class CodexAdapter {
     const result = {
       id: sessionId,
       tool: 'codex',
-      title: String(thread?.title ?? '').trim() || `Codex thread ${sessionId.slice(0, 8)}`,
+      title: displayThreadTitle(thread?.title, sessionId),
       status,
       // The page order decides the direction; the turns are emitted oldest-first
       // either way.

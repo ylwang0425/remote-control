@@ -55,6 +55,10 @@ const SOURCE_RUNTIME_FILES = Object.freeze([
   'src/workbuddy-native/history-state.js',
   'src/workbuddy-native/windows-uia.js',
   'src/workbuddy-native/writer.js',
+  'src/workbuddy-native/cli-client.js',
+  'src/workbuddy-native/credentials.js',
+  'src/workbuddy-native/background.js',
+  'src/workbuddy-native/login.js',
   'src/ws.js',
 ]);
 const FORBIDDEN_PACKAGE_ENTRY = /(?:^|\/)(?:test|tests|private|\.private|\.native-src|\.native-asar|native-asar)(?:\/|$)|(?:^|\/)[^/]*\.test\.[^/]+$|\.asar(?:$|\/)/i;
@@ -163,6 +167,12 @@ ScrollIntoView。发送使用 Windows 原生键盘输入，保护已有草稿，
 由 WorkBuddy 自动放行，真实审批点击尚未实测；审批路径已通过协议与 C# 夹具检查。
 本机版本的新建页未暴露可验证的工作目录选择控件，因此新聊天沿用桌面选定的目录；手机可以
 按已有会话的真实目录筛选。未经支持的 projectId/cwd 会在写入消息前被拒绝。
+
+后台 CLI：在本机状态页填写已安装 WorkBuddy.exe 的路径，然后选择“官方登录并启用”，
+或“启用已有 CLI 登录”。使用与 WorkBuddy 桌面相同的账号。后台可新建、续聊、切换模型、
+回答 AI 提问、仅本次授权/拒绝和停止任务；它不操作电脑窗口。后台新聊天保存在本机并
+由手机工作台管理，WorkBuddy 桌面侧边栏不会自动收录。登录凭据只保存在本机私密配置中。
+已有桌面会话继续使用原 UUID 和原始记录。当前项目有任务执行时，请等它完成后再提交。
 
 你可以在本机状态页面显式启用 \`workbuddy.uiAutomation.enabled\`，并可选填写绝对
 \`WorkBuddy.exe\` 路径。状态页面只保存这台电脑的设置、重新打开本机适配器并更新能力；它不会

@@ -28,6 +28,7 @@ const DEFAULTS = Object.freeze({
   dsh: { port: null },
   workbuddy: {
     configDir: null,
+    background: { enabled: false },
     uiAutomation: { enabled: false, executablePath: null, configurationValid: true },
   },
   tools: ['codex', 'dsh'],
@@ -155,6 +156,7 @@ function loadConfig(options = {}) {
     },
     workbuddy: {
       configDir: (env.WORKBUDDY_CONFIG_DIR ?? fromFile.workbuddy?.configDir ?? path.join(os.homedir(), '.workbuddy')),
+      background: { enabled: fromFile.workbuddy?.background?.enabled === true && workbuddyUiConfigurationValid },
       uiAutomation: {
         enabled: workbuddyUiConfig?.enabled === true && workbuddyUiConfigurationValid,
         executablePath: workbuddyExecutablePath,
@@ -243,6 +245,7 @@ function redactedConfig(config) {
     },
     workbuddy: {
       configured: typeof config.workbuddy?.configDir === 'string',
+      background: { enabled: config.workbuddy?.background?.enabled === true },
       uiAutomation: {
         enabled: config.workbuddy?.uiAutomation?.enabled === true,
         executablePathConfigured: typeof config.workbuddy?.uiAutomation?.executablePath === 'string',

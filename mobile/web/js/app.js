@@ -3781,7 +3781,9 @@
       if (el.newTextHint) {
         el.newTextHint.hidden = !needsText;
         el.newTextHint.textContent = workBuddyNeedsText
-          ? '发送第一条消息后创建聊天。'
+          ? (capabilityFor('workbuddy.background', 'workbuddy')
+            ? '后台 CLI 新建，不弹电脑窗口。聊天保存在本机并在此工作台管理，不会自动加入 WorkBuddy 桌面侧边栏。'
+            : '发送第一条消息后创建聊天。')
           : (needsText ? 'Codex 需要首条消息才能真正开始这个会话。' : '');
       }
       if (el.newText) {
