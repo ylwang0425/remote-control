@@ -14,7 +14,7 @@ An Android workbench for the Codex Desktop and DSH Desktop chats running on your
 - Stable drafts, focus and cursor position while polling; mobile layouts keep controls reachable in shorter viewports.
 - Named computers with persistent IDs and independent, one-use desktop enrollment invitations.
 - Separate administrator login and a roster of online/offline computers and their available tools. Administrators explicitly select a target; ordinary phones remain bound to their paired computer.
-- WorkBuddy local conversations and messages share the same workbench viewer, including Markdown and folded tool activity. Optional native Windows UI Automation supports creation, continuation, model selection, questions and Stop.
+- WorkBuddy local conversations and messages share the same workbench viewer, including Markdown and folded tool activity. History reads preserve the desktop's current chat and minimized state. Its own local product cache supplies model options without opening the desktop selector. Optional native Windows UI Automation supports creation, continuation, model selection, questions and Stop.
 
 ## Architecture
 
@@ -138,7 +138,7 @@ The delivered workbench was checked against real desktop chats: Codex project cr
 - WorkBuddy reads the current Windows user's `.workbuddy/workbuddy.db` local session metadata and project JSONL transcripts. `WORKBUDDY_CONFIG_DIR` or private `workbuddy.configDir` can select the operator's data root. The native database is never modified; cloud records and unknown account runtime buckets are not substituted. Byte, message and frame limits report truncation honestly.
 - WorkBuddy 5.7.7 native creation, continuation, next-message model selection, single/two-page/custom-text answers and Stop have been verified against its own saved messages through the public relay. Its actual model catalog contains 19 options. The opt-in launcher uses standard Windows accessibility and keyboard input, preserving unrelated drafts and checking the exact native chat before each action.
 - WorkBuddy native command cards support Allow once and Reject; benign tests were auto-allowed by the app, so real approval clicks are still unverified. Its installed New Task view exposes no verified workspace picker; new chats use the desktop-selected workspace. Existing native directories remain available for filtering.
-- Desktop bridge 1.1.1 ships the current native helpers; Android shell 1.1.0 loads the hosted UI independently. See the [native acceptance record](docs/acceptance/native-control-2026-10-14.md) for verified operations and remaining limits.
+- Desktop bridge 1.1.2 ships quiet WorkBuddy history/model reads and the current native helpers; Android shell 1.1.0 loads the hosted UI independently. See the [native acceptance record](docs/acceptance/native-control-2026-10-14.md) and [background compatibility record](docs/acceptance/workbuddy-background-2026-10-14.md) for verified operations and remaining limits.
 - Physical Android installation, the real keyboard and device safe areas remain unverified.
 
 Credentials, native tool extracts, logs, deployment records, binaries and signing keys are excluded from this source repository. Bundled browser-library notices are in [mobile/web/vendor](mobile/web/vendor/README.md).

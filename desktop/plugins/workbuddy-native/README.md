@@ -35,6 +35,22 @@ single-question answers, two-page answers, custom-text answers and Stop have bee
 The model catalog contains the 19 actual native options, including options that require ScrollIntoView.
 A submission receipt is not a final AI result; the bridge continues to read the original native archive.
 
+Phone history polling never restores a minimized WorkBuddy window or navigates its sidebar. A visible matching
+chat can still provide passive pending-control observations; otherwise the bridge returns that chat's actual local
+archive without claiming fresh native permissions or questions. Explicit answer, approval and Stop requests
+retain their exact conversation checks and may restore/navigate the window when necessary.
+
+Model listing first reads the current Windows user's `cache/acc-product-config-v3.json` under the selected
+WorkBuddy data root. Only this WorkBuddy product's configured CLI model subset is returned, with native aliases
+merged by display name. The cache is bounded to 1 MiB and 24 hours; it does not establish the current selected
+model. Every native model change still selects and verifies the actual desktop option. A missing or invalid cache
+never causes an ordinary background model read to restore a minimized window or switch to a New Task page.
+
+The installed CLI supports `--resume` and a local HTTP service, but this computer's standalone CLI does not reuse
+its desktop login. Its desktop-owned HTTP worker requires separate gateway authentication. Background native
+continuation has not passed acceptance, so writes remain on the existing explicit UI Automation path. See
+`docs/acceptance/workbuddy-background-2026-10-14.md` in the source repository for the compatibility evidence.
+
 Message typing uses standard focused Windows keyboard input so WorkBuddy's React/Slate editor receives
 its normal input events. It preserves unrelated drafts, checks the selected conversation before input,
 and sends only after the exact intended draft and enabled native Send control are observed. The exact

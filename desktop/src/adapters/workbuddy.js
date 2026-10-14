@@ -7,8 +7,8 @@
  * canonical transcript in projects/<native cwd key>/<session id>.jsonl. The
  * bridge opens the database explicitly read-only and never uses WorkBuddy's
  * account/runtime owner-bucket fallback. Standard UI Automation is used for
- * the verified current-model read and native create/send operations; stop,
- * question, and approval actions remain unsupported.
+ * native create/send, stop, question, and approval operations. The installed
+ * app's bounded product cache can supply model labels without native input.
  */
 
 const fs = require('node:fs');
@@ -31,6 +31,8 @@ const MAX_TEXT_CHARS = 65536;
 const MAX_NATIVE_IDENTITY_CANDIDATES = 64;
 const MAX_NATIVE_TASK_TITLES = 200;
 const MAX_NATIVE_SESSION_IDS = 20000;
+const MAX_PRODUCT_CACHE_BYTES = 1024 * 1024;
+const PRODUCT_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const NATIVE_CREATE_CONFIRM_MS = 8000;
 const EMPTY_DRAFT_FINGERPRINT = 'e3b0c44298fc1c14';
 const GLOBAL_NON_CHAT_TABS = new Map([
@@ -157,6 +159,68 @@ function checkedProjectDir(projectsRoot, key) {
   } catch {
     return null;
   }
+}
+
+function cachedProductModelCatalog(configDir, now = Date.now()) {
+  try {
+    const root = fs.realpathSync(configDir);
+    const cache = checkedProjectDir(root, 'cache');
+    if (cache === null) return null;
+    const file = checkedRegularFile(path.join(cache, 'acc-product-config-v3.json'), cache);
+    if (file === null) return null;
+    const descriptor = fs.openSync(file, 'r');
+    let stat;
+    let bytes;
+    try {
+      stat = fs.fstatSync(descriptor);
+      const age = now - stat.mtimeMs;
+      if (!stat.isFile() || stat.size < 2 || stat.size > MAX_PRODUCT_CACHE_BYTES ||
+          age < -300000 || age > PRODUCT_CACHE_MAX_AGE_MS) return null;
+      const buffer = Buffer.alloc(stat.size + 1);
+      let count = 0;
+      while (count < buffer.length) {
+        const read = fs.readSync(descriptor, buffer, count, buffer.length - count, count);
+        if (read === 0) break;
+        count += read;
+      }
+      const after = fs.fstatSync(descriptor);
+      if (count !== stat.size || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) return null;
+      bytes = buffer.subarray(0, count);
+    } finally { fs.closeSync(descriptor); }
+    const product = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    if (product?.productName !== 'WorkBuddy' || product.dataFolderName !== '.workbuddy' ||
+        product.authentication?.id !== 'workbuddy-desktop' || !Array.isArray(product.agents) ||
+        product.agents.length > 256 || !Array.isArray(product.models) || product.models.length > 256) return null;
+    const agents = product.agents.filter(agent => agent?.name === 'cli');
+    if (agents.length !== 1 || !Array.isArray(agents[0].models) ||
+        agents[0].models.length < 1 || agents[0].models.length > 128) return null;
+    const definitions = new Map();
+    for (const model of product.models) {
+      if (typeof model?.id !== 'string' || !/^[A-Za-z0-9._:/+-]{1,128}$/.test(model.id) ||
+          definitions.has(model.id) || typeof model.name !== 'string' || !SAFE_MODEL_LABEL.test(model.name) ||
+          model.name.trim() !== model.name || redactSensitiveText(model.name) !== model.name) return null;
+      definitions.set(model.id, model);
+    }
+    const labels = [];
+    const nativeIds = new Set();
+    const seenLabels = new Set();
+    for (const id of agents[0].models) {
+      if (typeof id !== 'string' || nativeIds.has(id) || !definitions.has(id)) return null;
+      nativeIds.add(id);
+      const label = definitions.get(id).name;
+      // The desktop picker merges native aliases with the same display name.
+      // UIA selects and rechecks this exact display name before each send.
+      if (seenLabels.has(label)) continue;
+      seenLabels.add(label);
+      labels.push(label);
+    }
+    return {
+      models: labels.map(label => ({ id: label, label, isDefault: false })),
+      projects: [], currentModel: null,
+      catalogSource: 'WorkBuddy local product cache (configured CLI model options; current selection unobserved)',
+      observedAt: new Date(stat.mtimeMs).toISOString(),
+    };
+  } catch { return null; }
 }
 
 function timestamp(value) {
@@ -841,18 +905,24 @@ class WorkBuddyAdapter {
   async readNativePendingContext(sessionId, hooks, analysis) {
     const identity = this.nativeConversationIdentityCandidates(sessionId);
     const target = await this.discoverNativeWindow(hooks);
-    if (target.minimized === true) this.assertNativeTargetSnapshot(
-      await this.freshNativeSnapshot(target, { activate: true }, hooks), target);
+    const activationAllowed = hooks?.allowWindowActivation === true;
+    if (target.minimized === true) {
+      if (!activationAllowed) throw new BridgeError('not_capable', 'Background history observation will not restore the WorkBuddy window');
+      this.assertNativeTargetSnapshot(await this.freshNativeSnapshot(target, { activate: true }, hooks), target);
+    }
     const pendingOptions = { expectedExePath: this.workbuddyExecutablePath,
       expectedProcessId: target.processId, expectedHandle: target.handle, maxControls: 160,
       identityTitle: identity.title, anchorCandidates: identity.anchorCandidates, expectedCandidateIndex: identity.expectedCandidateIndex,
       ...(analysis?.complete === true ? { questionMetadata: analysis.questionCandidates.filter(c=>c.complete===true).map(c=>c.questions) } : {}) };
     let observed = await this.uiAutomationInspector.readNativePending(pendingOptions, hooks);
-    if (!observed.pendingForms.conversationIdentityVerified && typeof this.uiAutomationInspector.navigateConversation === 'function') {
+    if (!observed.pendingForms.conversationIdentityVerified && activationAllowed && typeof this.uiAutomationInspector.navigateConversation === 'function') {
       const route = await this.uiAutomationInspector.navigateConversation({ ...pendingOptions, sessionId }, hooks);
       if (route.outcome !== 'confirmed') throw new BridgeError(route.outcome === 'submitted' ? 'bridge_error' : 'not_capable',
         'WorkBuddy could not verify the requested native conversation; no answer or permission was submitted');
       observed = await this.uiAutomationInspector.readNativePending(pendingOptions, hooks);
+    }
+    if (!observed.pendingForms.conversationIdentityVerified) {
+      throw new BridgeError('not_capable', 'Background history observation will not switch the desktop conversation');
     }
     return { ...observed, target, identity };
   }
@@ -871,17 +941,20 @@ class WorkBuddyAdapter {
 
   answerQuestion(sessionId, callId, answers, hooks) {
     if (!this.canAnswer()) throw new BridgeError('not_capable', 'WorkBuddy native questions are disabled');
-    return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, callId, { answers }, nativeHooks), hooks);
+    return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, callId, { answers },
+      { ...nativeHooks, allowWindowActivation: true }), hooks);
   }
 
   approveRequest(sessionId, approvalId, decision, hooks) {
     if (!this.canApprove()) throw new BridgeError('not_capable', 'WorkBuddy native permissions are disabled');
-    return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, approvalId, { decision }, nativeHooks), hooks);
+    return this.nativeWriter.run(nativeHooks => this.pendingService.decide(sessionId, approvalId, { decision },
+      { ...nativeHooks, allowWindowActivation: true }), hooks);
   }
 
   stopSession(sessionId, hooks) {
     if (!this.canStop()) throw new BridgeError('not_capable', 'WorkBuddy native Stop is disabled');
-    return this.nativeWriter.run(nativeHooks => this.pendingService.stop(sessionId, nativeHooks), hooks);
+    return this.nativeWriter.run(nativeHooks => this.pendingService.stop(sessionId,
+      { ...nativeHooks, allowWindowActivation: true }), hooks);
   }
 
   async executeNativeControl(target, control, action, extra = {}, hooks) {
@@ -965,6 +1038,13 @@ class WorkBuddyAdapter {
   async listModels(hooks) {
     if (!this.canModelsList()) throw new BridgeError('not_capable', 'WorkBuddy native model listing is not enabled');
     return this.nativeWriter.run(async (nativeHooks) => {
+      nativeHooks?.checkActive?.();
+      const cached = cachedProductModelCatalog(this.configDir);
+      nativeHooks?.checkActive?.();
+      if (cached !== null) return cached;
+      if (nativeHooks?.allowWindowActivation !== true) {
+        throw new BridgeError('not_capable', 'WorkBuddy has no fresh local model cache; background model reads will not operate its window');
+      }
       const knownConversationTitles = this.readNativeTaskTitles();
       const target = await this.discoverNativeWindow(nativeHooks);
       const initial = await this.freshNativeSnapshot(target, { knownConversationTitles }, nativeHooks);
@@ -1088,6 +1168,7 @@ class WorkBuddyAdapter {
 }
 
 module.exports = {
+  cachedProductModelCatalog,
   WorkBuddyAdapter,
   nativeConfigDir,
   nativeWorkspaceKey,

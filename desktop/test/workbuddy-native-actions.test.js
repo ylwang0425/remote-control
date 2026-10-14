@@ -72,10 +72,10 @@ test('model labels normalize only the native selector prefix and reject ambiguou
   assert.deepEqual(uniqueModelOptions([{ accessibleName: 'access_token=should-not-show' }]), []);
 });
 
-test('models.list reports only the live native model options and marks the selected model', async () => {
+test('an explicit native catalog read reports real model options and marks the selected model', async () => {
   const { adapter, calls } = adapterWithModelUi();
   assert.equal(adapter.canModelsList(), true);
-  const listed = await adapter.listModels();
+  const listed = await adapter.listModels({ allowWindowActivation: true });
   assert.deepEqual(listed.models, [
     { id: 'Kimi-K3', label: 'Kimi-K3', isDefault: true },
     { id: 'Deepseek-V4.1-Flash', label: 'Deepseek-V4.1-Flash', isDefault: false },
@@ -86,7 +86,7 @@ test('models.list reports only the live native model options and marks the selec
   await adapter.close();
 });
 
-test('a minimized exact native target is restored and reobserved before model access', async () => {
+test('an explicit create may restore its exact native target before model access', async () => {
   const { adapter, calls } = adapterWithModelUi();
   const discover = adapter.uiAutomationInspector.discoverMainWindows;
   adapter.uiAutomationInspector.discoverMainWindows = async () => {
@@ -96,7 +96,7 @@ test('a minimized exact native target is restored and reobserved before model ac
   adapter.uiAutomationInspector.activateSemanticSnapshot = async (...args) => {
     calls.push('restore'); return observe(...args);
   };
-  const listed = await adapter.listModels();
+  const listed = await adapter.listModels({ allowWindowActivation: true });
   assert.equal(listed.models.length, 2);
   assert.deepEqual(calls, ['restore', 'snapshot', 'catalog']);
   await adapter.close();
@@ -104,13 +104,13 @@ test('a minimized exact native target is restored and reobserved before model ac
 
 test('model listing falls back only to a verified current model and rejects an incomplete native frame', async () => {
   const { adapter, calls } = adapterWithModelUi();
-  const listed = await adapter.listModels();
+  const listed = await adapter.listModels({ allowWindowActivation: true });
   assert.equal(listed.models.length, 2);
   assert.deepEqual(calls, ['snapshot', 'catalog']);
   adapter.uiAutomationInspector.readNativeModelCatalog = async () => ({ outcome: 'blocked', targetContextVerified: true,
     catalog: { currentModel: '', models: [], targetContextVerified: true, composerVerified: false,
       initialDraftFingerprint: '', finalDraftFingerprint: '' } });
-  await assert.rejects(adapter.listModels(), /native model selector and unchanged composer/);
+  await assert.rejects(adapter.listModels({ allowWindowActivation: true }), /native model selector and unchanged composer/);
   await adapter.close();
 });
 
@@ -361,13 +361,13 @@ test('create from the global Skills page selects New Task without treating its s
   await adapter.close();
 });
 
-test('models.list navigates from a verified Skills page to read the native New Task model selector', async () => {
+test('an explicit create can navigate from a verified Skills page to read the native New Task model selector', async () => {
   const { adapter, actions } = adapterWithNativeWriter({ newTaskSelected: false, startOnSkillsPage: true });
   adapter.uiAutomationInspector.readNativeModelCatalog = async () => ({ outcome: 'confirmed', targetContextVerified: true,
     catalog: { targetContextVerified: true, composerVerified: true, currentModel: 'Kimi-K3',
       models: ['Kimi-K3', 'Deepseek-V4.1-Flash'], initialDraftFingerprint: 'e3b0c44298fc1c14',
       finalDraftFingerprint: 'e3b0c44298fc1c14' } });
-  const listed = await adapter.listModels();
+  const listed = await adapter.listModels({ allowWindowActivation: true });
   assert.equal(listed.currentModel, 'Kimi-K3');
   assert.equal(listed.models.length, 2);
   assert.equal(actions.length, 1);

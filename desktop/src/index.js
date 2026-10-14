@@ -556,7 +556,7 @@ function createDispatcher(config, log, factories = {}) {
       }
       if (params.tool === 'workbuddy') workbuddyHooks?.checkActive?.();
       const listed = params.tool === 'workbuddy'
-        ? await adapter.listModels(workbuddyHooks).catch(() => ({ models: [], projects: [] }))
+        ? await adapter.listModels({ ...workbuddyHooks, allowWindowActivation: true }).catch(() => ({ models: [], projects: [] }))
         : await adapter.listModels().catch(() => ({ models: [], projects: [] }));
       // The create path intentionally treats an unavailable model catalog as
       // empty, but a caller whose deadline elapsed while reading it must not
