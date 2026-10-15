@@ -15,7 +15,7 @@ import (
 func TestWindowsReleaseDownloads(t *testing.T) {
 	e := newEnv(t)
 	const contents = "PK\x03\x04 reviewed Windows release"
-	for _, name := range []string{"AI-Remote-Windows.zip", "AI-Remote-Windows-1.1.1.zip"} {
+	for _, name := range []string{"AI-Remote-Windows.zip", "AI-Remote-Windows-1.1.1.zip", "AI-Remote-Dispatch-Skill.zip", "AI-Remote-Dispatch-Skill-1.0.0.zip"} {
 		if err := os.WriteFile(filepath.Join(e.download, name), []byte(contents), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -71,6 +71,8 @@ func TestWindowsDownloadsRefuseOtherFiles(t *testing.T) {
 		"AI-Remote-Windows-1.1.1-debug.zip", "AI-Remote-Windows-1.1.1.zip.bak",
 		"AI-Remote-Windows.zip.json", "AI-Remote-Windows-1.1.1.ZIP",
 		"AI-Remote-Windows-" + strings.Repeat("1", 128) + ".1.1.zip",
+		"AI-Remote-Dispatch-Skill-debug.zip", "AI-Remote-Dispatch-Skill-1.0.0.zip.json",
+		"AI-Remote-Dispatch-Skill-1.0.zip", "AI-Remote-Dispatch-Skill-1.0.0.zip.bak",
 	} {
 		if err := os.WriteFile(filepath.Join(e.download, name), []byte("private fixture"), 0o600); err != nil {
 			t.Fatal(err)

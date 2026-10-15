@@ -19,6 +19,10 @@ var apkNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.apk$
 // versioned form. Other ZIP files in DownloadsDir remain private.
 var windowsZipNamePattern = regexp.MustCompile(`^AI-Remote-Windows(-[0-9]+\.[0-9]+\.[0-9]+)?\.zip$`)
 
+// The separately distributed skill contains reviewed code and instructions,
+// never a person's registration, task records or an administrator credential.
+var skillZipNamePattern = regexp.MustCompile(`^AI-Remote-Dispatch-Skill(-[0-9]+\.[0-9]+\.[0-9]+)?\.zip$`)
+
 // handleDownload serves public APKs and the named Windows releases.
 //
 // Every refusal is the same 404 with the same message, so this endpoint cannot
@@ -95,7 +99,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Minute))
 
 	contentType := "application/vnd.android.package-archive"
-	if windowsZipNamePattern.MatchString(name) {
+	if windowsZipNamePattern.MatchString(name) || skillZipNamePattern.MatchString(name) {
 		contentType = "application/zip"
 	}
 	w.Header().Set("Content-Type", contentType)
@@ -129,7 +133,7 @@ func downloadFromPath(rawPath string) (string, bool) {
 	// Only an APK or the exact Windows release naming convention can pass.
 	// Arbitrary ZIPs, JSON, logs, keys and databases cannot satisfy this rule.
 	if !apkNamePattern.MatchString(decoded) &&
-		!(len(decoded) <= 128 && windowsZipNamePattern.MatchString(decoded)) {
+		!(len(decoded) <= 128 && (windowsZipNamePattern.MatchString(decoded) || skillZipNamePattern.MatchString(decoded))) {
 		return "", false
 	}
 	if path.Base(decoded) != decoded {

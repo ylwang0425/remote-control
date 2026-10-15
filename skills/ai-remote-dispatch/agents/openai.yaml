@@ -1,0 +1,6 @@
+interface:
+  display_name: "共享 AI 工具调度"
+  short_description: "发现所有登记用户的 AI 工具，跨电脑提问、派任务并收取真实回答"
+  default_prompt: "使用 $ai-remote-dispatch 查找服务器上所有人的可用 AI 工具，选择合适的工具回答我的问题并说明结果来源。"
+policy:
+  allow_implicit_invocation: true

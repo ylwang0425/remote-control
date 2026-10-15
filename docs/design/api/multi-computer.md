@@ -80,6 +80,29 @@ Ordinary phones see only their paired computer. SQLite migrations preserve
 existing pairings and audit data. Audit records include actor, target, method
 and outcome metadata; they never include chats, passwords or tokens.
 
+## Opt-in mutual AI access
+
+`sharedTools` defaults to false. Setting it to true grants **all registered
+desktops and paired users** full mutual access to all registered computers,
+including history, project selection, task writes and native decisions. This
+is an explicit server-wide sharing policy, not an administrator impersonation.
+
+`POST /api/fleet/computers {}` returns the same secret-free roster projection as
+the admin roster. `POST /api/fleet/rpc {clientId,method,params,timeoutMs?}` uses the
+same allowlisted native methods, exact-target routing and bounded deadlines.
+Both preserve the exact-Origin requirement and share a rate-limit bucket.
+Authentication accepts either a registered desktop's own `Authorization: Bearer`
+credential or a live `rc_session` paired-phone cookie whose originating computer
+is registered. A supplied invalid bearer never falls back to a cookie. A bare
+admin cookie is insufficient; admin invitations and settings remain admin-only.
+The bootstrap credential must already be pinned by a successful bridge hello.
+
+`fleet.rpc` audit rows attribute the caller as `desktop:<clientId>` or
+`device:<deviceId>:<clientId>`, plus target, method, outcome and time. They exclude
+questions, message bodies and credential material. Offline targets never route
+to another computer. The `ai-remote-dispatch` Skill uses this surface with each
+user's own enrollment, no shared administrator credential.
+
 ## Phone state and native decisions
 
 Phone caches, drafts, model/project catalogs, expanded tools and pending native

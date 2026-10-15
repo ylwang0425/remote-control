@@ -28,6 +28,9 @@ type Config struct {
 	AllowedOrigins []string `json:"allowedOrigins"`
 	BridgeToken    string   `json:"bridgeToken"`
 	Admin          *Admin   `json:"admin,omitempty"`
+	// SharedTools explicitly grants registered desktops and paired users access
+	// to every registered computer through /api/fleet/* (including native writes).
+	SharedTools bool `json:"sharedTools"`
 
 	DBPath       string `json:"dbPath"`
 	WebDir       string `json:"webDir"`

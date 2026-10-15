@@ -254,10 +254,20 @@ func (s *Server) handleAdminComputers(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
-	computers, err := s.st.ListComputers()
+	result, err := s.computerViews()
 	if err != nil {
 		s.fail(w, protocol.CodeInternal)
 		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"computers": result}})
+}
+
+// computerViews is the shared, secret-free projection for both authenticated
+// rosters. Never serialize the stored Computer: it contains credential hashes.
+func (s *Server) computerViews() ([]computerView, error) {
+	computers, err := s.st.ListComputers()
+	if err != nil {
+		return nil, err
 	}
 	result := make([]computerView, 0, len(computers))
 	for _, computer := range computers {
@@ -319,7 +329,7 @@ func (s *Server) handleAdminComputers(w http.ResponseWriter, r *http.Request) {
 			Capabilities: rosterCaps, Tools: tools,
 		})
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"computers": result}})
+	return result, nil
 }
 
 func (s *Server) handleAdminEnrollmentCode(w http.ResponseWriter, r *http.Request) {

@@ -76,6 +76,14 @@ node desktop/src/index.js
 
 配对码绑定生成它的电脑。管理员操作必须带目标电脑编号，目标离线时明确失败。会话、草稿、模型目录、提问与授权状态按电脑隔离。审计保存操作人、目标、方法和结果，不保存聊天内容。协议见 [multi-computer.md](docs/design/api/multi-computer.md)。
 
+## 所有人共享 AI 工具 Skill
+
+服务器配置显式设置 `"sharedTools": true` 并重启中转后，每个已登记电脑用户或有效配对用户都能通过 `/api/fleet/computers` 和 `/api/fleet/rpc` 发现并调用所有人的 AI 工具，包括查看历史、选择项目、发送任务、停止、回答提问和仅本次授权／拒绝。默认关闭；开启代表允许互相操作电脑上的项目和文件。邀请登记、管理员配置仍需要管理员权限，原手机 `/api/rpc` 保留配对绑定。
+
+下载 [AI Remote Dispatch Skill](https://101.43.98.18/downloads/AI-Remote-Dispatch-Skill-1.0.0.zip)，将压缩包中的 `ai-remote-dispatch` 文件夹放进 `%USERPROFILE%\.codex\skills\`。在新聊天中使用：`$ai-remote-dispatch 找到所有人的可用 AI 工具，选择合适的工具回答……`；要多工具对比可说“让所有可用工具分别回答并汇总”。源码和完整用法见 [SKILL.md](skills/ai-remote-dispatch/SKILL.md)。
+
+Skill 自动读取每个人自己的 `%USERPROFILE%\.dsh\ai-remote-desktop.json` 登记凭据，不需要管理员密码。运行时使用 Node 22+；电脑端便携包中的 `node.exe` 可直接使用，无需 npm/Python。模型、项目和可执行能力取自目标电脑的实时目录；新任务默认独立聊天，保留任务编号以续查，写入请求不自动重试。调用审计记录发起电脑、目标、方法与结果，不记录聊天正文。
+
 ## 测试
 
 在仓库根目录执行，需要 Node.js 22+ 和 Go 1.27：
@@ -83,6 +91,7 @@ node desktop/src/index.js
 ```powershell
 node --test desktop/test
 node --test "mobile/tests/*.test.js"
+node --test skills/test/remote-ai.test.cjs
 Push-Location relay
 go test ./... -count=1
 Pop-Location

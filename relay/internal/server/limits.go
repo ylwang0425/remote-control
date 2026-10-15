@@ -96,6 +96,8 @@ func specFor(name string) bucket {
 		return bucketPair
 	case "rpc":
 		return bucketRPC
+	case "fleet":
+		return bucketRPC
 	case "logout":
 		return bucketLogout
 	case "downloads":

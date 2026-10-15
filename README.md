@@ -76,6 +76,12 @@ Choose administrator login on the mobile login screen. The roster groups compute
 
 Phone pairing binds to the originating computer. Administrator RPCs require the exact target ID and fail when it is offline. Chat state, drafts, model catalogs, questions and approvals are isolated by computer. Audits record actor, target, method and outcome without transcript content. See [the protocol extension](docs/design/api/multi-computer.md).
 
+## Shared AI dispatch Skill
+
+Explicitly enable `"sharedTools": true` in the relay configuration and restart it to grant every registered desktop and valid paired user mutual access through `POST /api/fleet/computers {}` and `POST /api/fleet/rpc {clientId,method,params}`. This covers histories, projects, new tasks, messages, native questions, one-time approvals and stopping. It is disabled by default. Invitations and administrator settings still require admin access; the original phone `/api/rpc` remains computer-bound.
+
+The [AI Remote Dispatch Skill](https://101.43.98.18/downloads/AI-Remote-Dispatch-Skill-1.0.0.zip) installs as `~/.codex/skills/ai-remote-dispatch`. Invoke `$ai-remote-dispatch` with a question or a request to compare answers across available tools. See [the skill instructions](skills/ai-remote-dispatch/SKILL.md). It uses each person's own existing `~/.dsh/ai-remote-desktop.json` registration, never an administrator password. Node 22+ is the only runtime; the Windows bridge already bundles it. Run `python skills/pack.py` to reproduce the public ZIP. It contains no credentials or local task records.
+
 ## Tests
 
 From the repository root, with Node.js 22+ and Go 1.27:

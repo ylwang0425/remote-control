@@ -122,6 +122,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/admin/enrollment-codes", s.handleAdminEnrollmentCode)
 	mux.HandleFunc("/api/admin/rpc", s.handleAdminRPC)
 	mux.HandleFunc("/api/desktop/enroll", s.handleDesktopEnroll)
+	mux.HandleFunc("/api/fleet/computers", s.handleFleetComputers)
+	mux.HandleFunc("/api/fleet/rpc", s.handleFleetRPC)
 	mux.HandleFunc("/bridge", s.handleBridge)
 	mux.HandleFunc("/downloads/", s.handleDownload)
 	mux.HandleFunc("/downloads", s.handleDownload)
